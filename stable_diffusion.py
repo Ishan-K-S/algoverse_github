@@ -80,9 +80,6 @@ class StableDiffusion(BaseModel):
     """
     Concrete class for Stable Diffusion CLIP image encoder.
 
-    Specifically, we use the CLIP ViT-L/14 model from OpenAI, which is used
-    in Stable Diffusion 1.x and 2.x models. See https://github.com/openai/CLIP
-
     Parameters
     ----------
     use_half : bool, optional
