@@ -41,7 +41,7 @@ class TimestepModulation(nn.Module):
         # Normalize timestep to [0, 1] range
         if timestep.dim() == 1:
             timestep = timestep.unsqueeze(-1)  # (B, 1)
-        timestep_normalized = timestep.float() / 1000.0  # Assuming max timestep ~1000
+        timestep_normalized = timestep / self.scheduler.config.num_train_timesteps
         
         # Compute scale and shift
         scale = self.scale_net(timestep_normalized).unsqueeze(1)  # (B, 1, D)
