@@ -91,6 +91,26 @@ class SD3TransformerWrapper(nn.Module):
         self.timestep_modulation = TimestepModulation(hidden_dim).to(device)
         if use_half:
             self.timestep_modulation = self.timestep_modulation.half()
+    
+    def sample_latent_positions(self, latents):
+        """
+        Sample spatial positions from latents based on sampling_ratio.
+        Returns sampled latents and the indices used for sampling.
+        """
+        B, C, H, W = latents.shape
+        
+        # Calculate number of positions to sample in each dimension
+        num_h = max(1, int(H * (self.sampling_ratio ** 0.5)))
+        num_w = max(1, int(W * (self.sampling_ratio ** 0.5)))
+        
+        # Randomly sample indices
+        h_indices = torch.randperm(H, device=latents.device)[:num_h]
+        w_indices = torch.randperm(W, device=latents.device)[:num_w]
+        
+        # Sample latents at these positions
+        sampled_latents = latents[:, :, h_indices, :][:, :, :, w_indices]
+        
+        return sampled_latents, (h_indices, w_indices)
         
     def encode_prompt(self, batch_size):
         """
@@ -150,8 +170,8 @@ class SD3TransformerWrapper(nn.Module):
         2. Sample spatial positions (1/16) - EARLY for efficiency!
         3. Add noise along straight-line path
         4. Get text embeddings
-        5. Run flow matching through MMDiT (on subsampled latents)
-        6. Extract intermediate activations
+        5. Set up flow matching
+        6. Run through transformer and extract features
         7. Apply timestep modulation
         """
         batch_size = x.shape[0]
@@ -173,9 +193,6 @@ class SD3TransformerWrapper(nn.Module):
         # SD3 uses sigma values from 0 to 1
         sigma = 0.5  # Middle of the flow path
         noisy_latents = (1 - sigma) * latents_sampled + sigma * noise
-        
-        # Step 4: Get text embeddings
-        prompt_embeds, pooled_prompt_embeds = self.encode_prompt(batch_size)
         
         # Step 4: Get text embeddings
         prompt_embeds, pooled_prompt_embeds = self.encode_prompt(batch_size)
@@ -230,31 +247,23 @@ class SD3TransformerWrapper(nn.Module):
         if hook_handle:
             hook_handle.remove()
         
-        # Step 6: Extract features
+        # Extract features
         if 'last_block' in activations:
             features = activations['last_block']
         else:
             features = latents_flow
         
-        # Convert to (B, N, D) format
+        # Convert to (B, N, D) format if needed
         if features.dim() == 4:
             B, C, H, W = features.shape
             features = features.reshape(B, C, H * W).transpose(1, 2)  # (B, H*W, C)
         
-        # Step 7: Sample 1/16 of tokens
-        B, N, D = features.shape
-        num_samples = max(1, int(N * self.sampling_ratio))
-        indices = torch.randperm(N, device=features.device)[:num_samples]
-        sampled_features = features[:, indices, :]  # (B, num_samples, D)
-        
-        # Step 8: Apply timestep modulation
+        # Step 7: Apply timestep modulation
         if current_timestep is not None:
-            sampled_features = self.timestep_modulation(features, current_timestep.unsqueeze(0))
-        else:
-            sampled_features = features
+            features = self.timestep_modulation(features, current_timestep.unsqueeze(0))
         
         return {
-            'sampled_features': sampled_features,
+            'sampled_features': features,
             'current_timestep': current_timestep
         }
     
