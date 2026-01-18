@@ -1,25 +1,23 @@
 """
-Stable Diffusion 3 DiT Transformer for feature extraction.
+Stable Diffusion 3 MMDiT (Multimodal Diffusion Transformer) for feature extraction.
 
-This module extracts features from the diffusion transformer during the 
-denoising process, implementing TIDE-inspired improvements:
-- Token sampling (1/16 of spatial tokens)
-- Timestep-dependent modulation
+SD3 uses rectified flow (straight-line paths between data and noise) instead of 
+traditional diffusion. This module extracts raw transformer activations for 
+training Sparse Autoencoders (SAEs).
 """
 
 import torch
 from torch import nn
 from torchvision import transforms
-from diffusers import StableDiffusion3Pipeline, DDPMScheduler
-import torch.nn.functional as F
+from diffusers import StableDiffusion3Pipeline, FlowMatchEulerDiscreteScheduler
 
 from overcomplete.models import BaseModel
 
 
 class TimestepModulation(nn.Module):
     """
-    Timestep-dependent modulation operation inspired by TIDE.
-    Uses adaptive layer normalization conditioned on timestep.
+    Timestep-dependent modulation operation.
+    Uses adaptive normalization conditioned on timestep.
     """
     
     def __init__(self, hidden_dim):
@@ -41,7 +39,7 @@ class TimestepModulation(nn.Module):
         # Normalize timestep to [0, 1] range
         if timestep.dim() == 1:
             timestep = timestep.unsqueeze(-1)  # (B, 1)
-        timestep_normalized = timestep / self.scheduler.config.num_train_timesteps
+        timestep_normalized = timestep.float() / 1000.0  # Assuming max timestep ~1000
         
         # Compute scale and shift
         scale = self.scale_net(timestep_normalized).unsqueeze(1)  # (B, 1, D)
@@ -53,72 +51,108 @@ class TimestepModulation(nn.Module):
 
 class SD3TransformerWrapper(nn.Module):
     """
-    Wrapper around SD3's DiT transformer to extract features during denoising.
-    Implements TIDE-inspired improvements for better feature quality.
+    Wrapper around SD3's MMDiT transformer to extract features during rectified flow.
     """
     
-    def __init__(self, transformer, vae, scheduler, text_encoder, tokenizer, 
+    def __init__(self, transformer, vae, scheduler, text_encoder, text_encoder_2, 
+                 text_encoder_3, tokenizer, tokenizer_2, tokenizer_3,
                  use_half=False, device='cpu', sampling_ratio=1/16):
         super().__init__()
         self.transformer = transformer
         self.vae = vae
         self.scheduler = scheduler
+        
+        # SD3 uses 3 text encoders: CLIP-L, CLIP-G, T5
         self.text_encoder = text_encoder
+        self.text_encoder_2 = text_encoder_2
+        self.text_encoder_3 = text_encoder_3
         self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
+        self.tokenizer_3 = tokenizer_3
+        
         self.use_half = use_half
         self.device = device
-        self.sampling_ratio = sampling_ratio  # Sample 1/16 of tokens
+        self.sampling_ratio = sampling_ratio
         
-        # Denoising parameters
+        # Flow matching parameters
         self.num_inference_steps = 5
         self.timestep_to_extract = 2
         
-        # Get hidden dimension from transformer config
-        if hasattr(transformer.config, 'hidden_size'):
-            hidden_dim = transformer.config.hidden_size
+        # Get hidden dimension from transformer
+        # SD3 uses joint_attention_dim for the hidden dimension
+        if hasattr(transformer.config, 'joint_attention_dim'):
+            hidden_dim = transformer.config.joint_attention_dim
         elif hasattr(transformer.config, 'in_channels'):
             hidden_dim = transformer.config.in_channels
         else:
-            hidden_dim = 1024  # Default for SD3
+            hidden_dim = 4096  # Default for SD3 Medium
         
         # Timestep modulation module
         self.timestep_modulation = TimestepModulation(hidden_dim).to(device)
         if use_half:
             self.timestep_modulation = self.timestep_modulation.half()
         
-    def sample_tokens(self, features, ratio=None):
+    def encode_prompt(self, batch_size):
         """
-        Sample a subset of spatial tokens.
-        
-        Following TIDE's approach of sampling 1/16 tokens for better generalization.
+        Encode null prompts using all three text encoders.
         """
-        if ratio is None:
-            ratio = self.sampling_ratio
-            
-        B, C, H, W = features.shape
-        total_tokens = H * W
-        num_samples = max(1, int(total_tokens * ratio))
+        null_prompt = [""] * batch_size
         
-        # Flatten spatial dimensions
-        features_flat = features.reshape(B, C, total_tokens).transpose(1, 2)  # (B, HW, C)
+        # Tokenize for all encoders
+        text_inputs_1 = self.tokenizer(
+            null_prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids.to(self.device)
         
-        # Random sampling (same indices for all samples in batch for consistency)
-        indices = torch.randperm(total_tokens, device=features.device)[:num_samples]
-        sampled_features = features_flat[:, indices, :]  # (B, num_samples, C)
+        text_inputs_2 = self.tokenizer_2(
+            null_prompt,
+            padding="max_length",
+            max_length=self.tokenizer_2.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids.to(self.device)
         
-        return sampled_features, indices.tolist()
+        text_inputs_3 = self.tokenizer_3(
+            null_prompt,
+            padding="max_length",
+            max_length=256,
+            truncation=True,
+            return_tensors="pt"
+        ).input_ids.to(self.device)
+        
+        # Encode with all three encoders
+        prompt_embeds_1 = self.text_encoder(text_inputs_1, output_hidden_states=True)
+        pooled_prompt_embeds_1 = prompt_embeds_1[0]
+        prompt_embeds_1 = prompt_embeds_1.hidden_states[-2]
+        
+        prompt_embeds_2 = self.text_encoder_2(text_inputs_2, output_hidden_states=True)
+        pooled_prompt_embeds_2 = prompt_embeds_2[0]
+        prompt_embeds_2 = prompt_embeds_2.hidden_states[-2]
+        
+        prompt_embeds_3 = self.text_encoder_3(text_inputs_3)[0]
+        
+        # Concatenate embeddings
+        prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2, prompt_embeds_3], dim=-1)
+        pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)
+        
+        return prompt_embeds, pooled_prompt_embeds
         
     @torch.no_grad()
     def forward_features(self, x):
         """
-        Extract transformer features during denoising process with TIDE improvements.
+        Extract transformer features during rectified flow process.
         
         Process:
         1. Encode images to latent space
-        2. Add noise (forward diffusion)
-        3. Denoise through transformer
-        4. Extract intermediate activations with timestep modulation
-        5. Sample 1/16 of tokens
+        2. Sample spatial positions (1/16) - EARLY for efficiency!
+        3. Add noise along straight-line path
+        4. Get text embeddings
+        5. Run flow matching through MMDiT (on subsampled latents)
+        6. Extract intermediate activations
+        7. Apply timestep modulation
         """
         batch_size = x.shape[0]
         
@@ -126,25 +160,31 @@ class SD3TransformerWrapper(nn.Module):
         if self.use_half:
             x = x.half()
         latents = self.vae.encode(x).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
+        latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         
-        # Step 2: Add noise (forward diffusion)
-        noise = torch.randn_like(latents)
-        timestep = torch.tensor([self.scheduler.config.num_train_timesteps // 2], device=self.device)
-        noisy_latents = self.scheduler.add_noise(latents, noise, timestep)
+        # Step 2: Sample spatial positions (SAVE COMPUTATION - do this early!)
+        latents_sampled, (H_indices, W_indices) = self.sample_latent_positions(latents)
         
-        # Step 3: Create null text embeddings (unconditional)
-        null_prompt = [""] * batch_size
-        text_inputs = self.tokenizer(
-            null_prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt"
-        )
-        text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.device))[0]
+        # Step 3: Add noise using rectified flow interpolation
+        # In rectified flow: x(t) = (1-sigma)*x_0 + sigma*noise
+        noise = torch.randn_like(latents_sampled)
         
-        # Step 4: Run through transformer and extract features
+        # Use a fixed sigma (halfway point) for noise addition
+        # SD3 uses sigma values from 0 to 1
+        sigma = 0.5  # Middle of the flow path
+        noisy_latents = (1 - sigma) * latents_sampled + sigma * noise
+        
+        # Step 4: Get text embeddings
+        prompt_embeds, pooled_prompt_embeds = self.encode_prompt(batch_size)
+        
+        # Step 4: Get text embeddings
+        prompt_embeds, pooled_prompt_embeds = self.encode_prompt(batch_size)
+        
+        # Step 5: Set up flow matching
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+        
+        # Step 6: Run through transformer and extract features
         activations = {}
         current_timestep = None
         
@@ -153,64 +193,69 @@ class SD3TransformerWrapper(nn.Module):
                 activations[name] = output
             return hook
         
-        # Register hook on the last transformer block
+        # Register hook on last transformer block
         hook_handle = None
         if hasattr(self.transformer, 'transformer_blocks'):
             last_block = self.transformer.transformer_blocks[-1]
             hook_handle = last_block.register_forward_hook(hook_fn('last_block'))
         
         # Run denoising steps
-        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
-        for i, t in enumerate(self.scheduler.timesteps[:self.timestep_to_extract + 1]):
-            # Prepare timestep
-            timestep_tensor = torch.tensor([t], device=self.device).expand(batch_size)
-            
+        latents_flow = noisy_latents
+        
+        for i, t in enumerate(timesteps[:self.timestep_to_extract + 1]):
             if i == self.timestep_to_extract:
-                current_timestep = timestep_tensor
+                current_timestep = t
             
-            # Predict noise
+            # Expand timestep
+            timestep_batch = t.expand(batch_size).to(self.device)
+            
+            # Predict flow velocity through MMDiT
             noise_pred = self.transformer(
-                noisy_latents,
-                timestep_tensor,
-                encoder_hidden_states=text_embeddings,
+                hidden_states=latents_flow,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                timestep=timestep_batch,
                 return_dict=False
             )[0]
             
-            # Denoise
-            noisy_latents = self.scheduler.step(noise_pred, t, noisy_latents, return_dict=False)[0]
+            # Step along rectified flow
+            latents_flow = self.scheduler.step(
+                noise_pred,
+                t,
+                latents_flow,
+                return_dict=False
+            )[0]
         
         # Remove hook
         if hook_handle:
             hook_handle.remove()
         
-        # Extract features from activations
+        # Step 6: Extract features
         if 'last_block' in activations:
             features = activations['last_block']
         else:
-            # Fallback: use the noisy latents themselves
-            features = noisy_latents
+            features = latents_flow
         
-        # Ensure features are 4D (B, C, H, W)
-        if features.dim() == 3:
-            # If features are (B, N, C), reshape to approximate square
-            B, N, C = features.shape
-            H = W = int(N ** 0.5)
-            features = features.transpose(1, 2).reshape(B, C, H, W)
+        # Convert to (B, N, D) format
+        if features.dim() == 4:
+            B, C, H, W = features.shape
+            features = features.reshape(B, C, H * W).transpose(1, 2)  # (B, H*W, C)
         
-        # Step 5: Sample 1/16 of tokens (TIDE improvement)
-        sampled_features, sampled_indices = self.sample_tokens(features)
+        # Step 7: Sample 1/16 of tokens
+        B, N, D = features.shape
+        num_samples = max(1, int(N * self.sampling_ratio))
+        indices = torch.randperm(N, device=features.device)[:num_samples]
+        sampled_features = features[:, indices, :]  # (B, num_samples, D)
         
-        # Step 6: Apply timestep-dependent modulation (TIDE improvement)
+        # Step 8: Apply timestep modulation
         if current_timestep is not None:
-            sampled_features = self.timestep_modulation(sampled_features, current_timestep)
-        
-        # Create CLS token as spatial average of sampled tokens
-        cls_token = sampled_features.mean(dim=1)  # (B, C)
-        patch_tokens = sampled_features  # (B, N_sampled, C)
+            sampled_features = self.timestep_modulation(features, current_timestep.unsqueeze(0))
+        else:
+            sampled_features = features
         
         return {
-            'x_norm_clstoken': cls_token,
-            'x_norm_patchtokens': patch_tokens
+            'sampled_features': sampled_features,
+            'current_timestep': current_timestep
         }
     
     def eval(self):
@@ -218,6 +263,8 @@ class SD3TransformerWrapper(nn.Module):
         self.transformer.eval()
         self.vae.eval()
         self.text_encoder.eval()
+        self.text_encoder_2.eval()
+        self.text_encoder_3.eval()
         self.timestep_modulation.eval()
         return self
     
@@ -226,6 +273,8 @@ class SD3TransformerWrapper(nn.Module):
         self.transformer.to(device)
         self.vae.to(device)
         self.text_encoder.to(device)
+        self.text_encoder_2.to(device)
+        self.text_encoder_3.to(device)
         self.timestep_modulation.to(device)
         self.device = device
         return self
@@ -235,25 +284,27 @@ class SD3TransformerWrapper(nn.Module):
         self.transformer.half()
         self.vae.half()
         self.text_encoder.half()
+        self.text_encoder_2.half()
+        self.text_encoder_3.half()
         self.timestep_modulation.half()
         return self
 
 
 class StableDiffusion(BaseModel):
     """
-    Concrete class for Stable Diffusion 3 DiT transformer feature extraction.
+    Concrete class for Stable Diffusion 3 MMDiT transformer feature extraction.
 
-    Extracts features from the diffusion transformer during the denoising process
-    with TIDE-inspired improvements:
-    - Samples 1/16 of spatial tokens for better generalization
-    - Applies timestep-dependent modulation to capture temporal dynamics
+    Extracts raw transformer activations during the rectified flow matching 
+    process for training Sparse Autoencoders (SAEs). Returns timestep-modulated
+    features sampled at 1/16 spatial positions for efficiency.
     """
 
     def __init__(self, use_half=False, device='cpu', sampling_ratio=1/16):
         super().__init__(use_half, device)
         
         print("Loading Stable Diffusion 3 pipeline...")
-        print(f"Token sampling ratio: {sampling_ratio} (sampling {int(sampling_ratio * 100)}% of tokens)")
+        print(f"Using rectified flow with FlowMatchEulerDiscreteScheduler")
+        print(f"Token sampling ratio: {sampling_ratio}")
         
         # Load SD3 pipeline
         pipe = StableDiffusion3Pipeline.from_pretrained(
@@ -265,16 +316,26 @@ class StableDiffusion(BaseModel):
         transformer = pipe.transformer
         vae = pipe.vae
         text_encoder = pipe.text_encoder
+        text_encoder_2 = pipe.text_encoder_2
+        text_encoder_3 = pipe.text_encoder_3
         tokenizer = pipe.tokenizer
-        scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+        tokenizer_2 = pipe.tokenizer_2
+        tokenizer_3 = pipe.tokenizer_3
         
-        # Create wrapper with TIDE improvements
+        # Use FlowMatchEulerDiscreteScheduler
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        
+        # Create wrapper
         self.model = SD3TransformerWrapper(
             transformer=transformer,
             vae=vae,
             scheduler=scheduler,
             text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            text_encoder_3=text_encoder_3,
             tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            tokenizer_3=tokenizer_3,
             use_half=use_half,
             device=device,
             sampling_ratio=sampling_ratio
@@ -283,7 +344,7 @@ class StableDiffusion(BaseModel):
         if self.use_half:
             self.model = self.model.half()
 
-        # SD3 preprocessing (512x512 by default)
+        # SD3 preprocessing
         self.preprocess = transforms.Compose([
             transforms.Resize(
                 512,
@@ -300,11 +361,9 @@ class StableDiffusion(BaseModel):
 
     def forward_features(self, x):
         """
-        Perform a forward pass on the input tensor.
-        Runs through the diffusion process and extracts transformer features
-        with TIDE improvements (token sampling + timestep modulation).
+        Extract raw transformer activations for SAE training.
         """
         with torch.no_grad():
             if self.use_half:
                 x = x.half()
-            return self.model.forward_features(x)['x_norm_patchtokens']
+            return self.model.forward_features(x)
