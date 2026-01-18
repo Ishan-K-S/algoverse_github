@@ -157,7 +157,7 @@ def run_blip(args):
 
 
 
-# SigLIP (from your 2nd file)
+# SigLip
 
 
 def siglip_parse_args(subparser):
@@ -259,7 +259,6 @@ def siglip_create_hdf5_storage(cachePath, numberOfImages, fp16_storage, model_na
             compression_opts=4,
         )
 
-        # Small fix (minimal change): initialize labels with -1 so resume works correctly
         f.create_dataset(
             "labels",
             shape=(numberOfImages,),
