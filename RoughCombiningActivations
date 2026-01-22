@@ -158,33 +158,71 @@ class PairedTrajectoryDataset(Dataset):
 
 def collate_cross_model(batch):
     collated_batch = {}
-    collated_metadata = {
-        "timesteps": [],
-        "sigmas": [],
-        "sample_id": [],
-    }
+    collated_metadata = {}
 
+    # Model names inferred from first sample
     model_names = batch[0][0].keys()
     for model_name in model_names:
         collated_batch[model_name] = []
 
+    # Detect metadata type
+    first_metadata = batch[0][1]
+    is_temporal = "timesteps" in first_metadata
+
+    if is_temporal:
+        collated_metadata = {
+            "timesteps": [],
+            "sigmas": [],
+            "sample_id": [],
+        }
+    else:
+        collated_metadata = {
+            "timestep_idx": [],
+            "sigma": [],
+            "sample_idx": [],
+        }
+
+    # Collate
     for batch_dict, metadata in batch:
         for model_name in model_names:
             collated_batch[model_name].append(batch_dict[model_name])
 
-        collated_metadata["timesteps"].append(metadata["timesteps"])
-        collated_metadata["sigmas"].append(metadata["sigmas"])
-        collated_metadata["sample_id"].append(metadata["sample_id"])
+        if is_temporal:
+            collated_metadata["timesteps"].append(metadata["timesteps"])
+            collated_metadata["sigmas"].append(metadata["sigmas"])
+            collated_metadata["sample_id"].append(metadata["sample_id"])
+        else:
+            collated_metadata["timestep_idx"].append(metadata["timestep_idx"])
+            collated_metadata["sigma"].append(metadata["sigma"])
+            collated_metadata["sample_idx"].append(metadata["sample_idx"])
 
+    # Stack model activations
     for model_name in model_names:
         collated_batch[model_name] = torch.stack(
             collated_batch[model_name], dim=0
         )
 
-    collated_metadata["timesteps"] = torch.stack(collated_metadata["timesteps"], dim=0)
-    collated_metadata["sigmas"] = torch.stack(collated_metadata["sigmas"], dim=0)
+    # Stack metadata tensors where applicable
+    if is_temporal:
+        collated_metadata["timesteps"] = torch.stack(
+            collated_metadata["timesteps"], dim=0
+        )
+        collated_metadata["sigmas"] = torch.stack(
+            collated_metadata["sigmas"], dim=0
+        )
+    else:
+        collated_metadata["timestep_idx"] = torch.tensor(
+            collated_metadata["timestep_idx"]
+        )
+        collated_metadata["sigma"] = torch.stack(
+            collated_metadata["sigma"]
+        )
+        collated_metadata["sample_idx"] = torch.tensor(
+            collated_metadata["sample_idx"]
+        )
 
     return collated_batch, collated_metadata
+
 
 
 def create_cross_model_dataloaders(
