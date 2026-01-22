@@ -1,0 +1,240 @@
+"""
+Dataloader for cross-prediction training with SD3 and FLUX activations.
+
+This module handles loading paired activations from both models on the same images.
+"""
+
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+
+class CrossModelActivationDataset(Dataset):
+    """
+    Dataset for cross-model activation learning.
+    """
+    
+    def __init__(
+        self,
+        data_dir: Path,
+        model_names: List[str] = ['sd3', 'flux'],
+        timestep_idx: Optional[int] = None,
+        token_sample_ratio: float = 0.3,
+        align_samples: bool = True,
+    ):
+        self.data_dir = Path(data_dir)
+        self.model_names = model_names
+        self.timestep_idx = timestep_idx
+        self.token_sample_ratio = token_sample_ratio
+        self.align_samples = align_samples
+        
+        self.model_files = {}
+        for model_name in model_names:
+            model_dir = self.data_dir / model_name
+            if not model_dir.exists():
+                raise ValueError(f"Model directory not found: {model_dir}")
+            
+            files = sorted(list(model_dir.glob('*.pt')))
+            self.model_files[model_name] = files
+        
+        if align_samples:
+            min_samples = min(len(files) for files in self.model_files.values())
+            for model_name in model_names:
+                self.model_files[model_name] = self.model_files[model_name][:min_samples]
+            self.num_samples = min_samples
+        else:
+            self.num_samples = max(len(files) for files in self.model_files.values())
+    
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict]:
+        batch_dict = {}
+        metadata = {}
+        
+        for model_name in self.model_names:
+            file_idx = idx % len(self.model_files[model_name])
+            file_path = self.model_files[model_name][file_idx]
+            data = torch.load(file_path)
+            
+            if self.timestep_idx is not None:
+                t_idx = self.timestep_idx
+            else:
+                t_idx = np.random.randint(0, len(data.activations))
+            
+            activation = data.activations[t_idx]
+            sigma = data.sigmas[t_idx]
+            
+            if activation.dim() == 3:
+                B, N, D = activation.shape
+                activation = activation.reshape(B * N, D)
+            
+            if self.token_sample_ratio < 1.0:
+                num_tokens = activation.shape[0]
+                num_samples = max(1, int(num_tokens * self.token_sample_ratio))
+                indices = torch.randperm(num_tokens)[:num_samples]
+                activation = activation[indices]
+            
+            batch_dict[model_name] = activation
+            
+            if not metadata:
+                metadata['sigma'] = sigma
+                metadata['timestep_idx'] = t_idx
+                metadata['sample_idx'] = idx
+        
+        return batch_dict, metadata
+
+
+class PairedTrajectoryDataset(Dataset):
+    def __init__(
+        self,
+        data_dir: Path,
+        model_names=("sd3", "flux"),
+        token_sample_ratio: float = 0.3,
+    ):
+        self.data_dir = Path(data_dir)
+        self.model_names = list(model_names)
+        self.token_sample_ratio = token_sample_ratio
+        self.samples = []
+
+        ref_model = self.model_names[0]
+        ref_files = sorted((self.data_dir / ref_model).glob("*.pt"))
+
+        for ref_file in ref_files:
+            sample_id = ref_file.stem.split("_")[-1]
+            model_paths = {}
+
+            valid = True
+            for model_name in self.model_names:
+                matches = list((self.data_dir / model_name).glob(f"*{sample_id}.pt"))
+                if not matches:
+                    valid = False
+                    break
+                model_paths[model_name] = matches[0]
+
+            if valid:
+                self.samples.append(
+                    {
+                        "sample_id": sample_id,
+                        "model_paths": model_paths,
+                    }
+                )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        batch = {}
+
+        shared_idxs = None
+
+        for model_name in self.model_names:
+            data = torch.load(sample["model_paths"][model_name])
+
+            activations = torch.stack(data.activations, dim=0)
+            T, B, N, D = activations.shape
+            activations = activations.view(T, B * N, D)
+
+            if self.token_sample_ratio < 1.0:
+                num_tokens = activations.shape[1]
+                k = max(1, int(num_tokens * self.token_sample_ratio))
+                if shared_idxs is None:
+                    shared_idxs = torch.randperm(num_tokens)[:k]
+                activations = activations[:, shared_idxs]
+
+            batch[model_name] = activations
+
+        metadata = {
+            "sample_id": sample["sample_id"],
+            "timesteps": torch.stack(data.timesteps),
+            "sigmas": torch.tensor(data.sigmas),
+        }
+
+        return batch, metadata
+
+
+def collate_cross_model(batch):
+    collated_batch = {}
+    collated_metadata = {
+        "timesteps": [],
+        "sigmas": [],
+        "sample_id": [],
+    }
+
+    model_names = batch[0][0].keys()
+    for model_name in model_names:
+        collated_batch[model_name] = []
+
+    for batch_dict, metadata in batch:
+        for model_name in model_names:
+            collated_batch[model_name].append(batch_dict[model_name])
+
+        collated_metadata["timesteps"].append(metadata["timesteps"])
+        collated_metadata["sigmas"].append(metadata["sigmas"])
+        collated_metadata["sample_id"].append(metadata["sample_id"])
+
+    for model_name in model_names:
+        collated_batch[model_name] = torch.stack(
+            collated_batch[model_name], dim=0
+        )
+
+    collated_metadata["timesteps"] = torch.stack(collated_metadata["timesteps"], dim=0)
+    collated_metadata["sigmas"] = torch.stack(collated_metadata["sigmas"], dim=0)
+
+    return collated_batch, collated_metadata
+
+
+def create_cross_model_dataloaders(
+    data_dir: Path,
+    model_names: List[str] = ['sd3', 'flux'],
+    batch_size: int = 64,
+    train_ratio: float = 0.9,
+    token_sample_ratio: float = 0.3,
+    num_workers: int = 4,
+    use_paired: bool = True,
+) -> Tuple[DataLoader, DataLoader]:
+    if use_paired:
+        dataset = PairedTrajectoryDataset(
+            data_dir=data_dir,
+            model_names=model_names,
+            token_sample_ratio=token_sample_ratio,
+        )
+    else:
+        dataset = CrossModelActivationDataset(
+            data_dir=data_dir,
+            model_names=model_names,
+            token_sample_ratio=token_sample_ratio,
+            align_samples=True,
+        )
+    
+    num_train = int(len(dataset) * train_ratio)
+    num_val = len(dataset) - num_train
+    
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, 
+        [num_train, num_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_cross_model,
+        pin_memory=True,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_cross_model,
+        pin_memory=True,
+    )
+    
+    return train_loader, val_loader
