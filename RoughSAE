@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Optional
+import math
+import random
+
+
+
+# Timestep Embedding
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        scale = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(
+            torch.arange(half_dim, device=timesteps.device) * -scale
+        )
+        emb = timesteps[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        return emb
+
+
+# Temporal-Aware Encoder 
+class TemporalAwareEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        timestep_dim: int = 256,
+        use_timestep_conditioning: bool = True,
+    ):
+        super().__init__()
+        self.use_timestep_conditioning = use_timestep_conditioning
+
+        if use_timestep_conditioning:
+            self.timestep_embed = TimestepEmbedding(timestep_dim)
+            self.timestep_proj = nn.Sequential(
+                nn.Linear(timestep_dim, timestep_dim),
+                nn.SiLU(),
+                nn.Linear(timestep_dim, latent_dim * 2),
+            )
+
+        self.encoder = nn.Linear(input_dim, latent_dim)
+        nn.init.zeros_(self.encoder.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        z = self.encoder(x)  # pre-sparsity latent
+
+        if self.use_timestep_conditioning and sigma is not None:
+            t_emb = self.timestep_embed(sigma)
+            scale, shift = self.timestep_proj(t_emb).chunk(2, dim=-1)
+            z = z * (1 + scale[:, None, :]) + shift[:, None, :]
+
+        return z  # IMPORTANT: pre-activation
+
+
+# Decoder 
+
+class TemporalAwareDecoder(nn.Module):
+    def __init__(self, latent_dim: int, output_dim: int):
+        super().__init__()
+        self.decoder = nn.Linear(latent_dim, output_dim)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+
+
+# Universal Sparse Autoencoder
+
+class UniversalSparseAutoencoder(nn.Module):
+    def __init__(
+        self,
+        model_dims: Dict[str, int],
+        latent_dim: int = 16384,
+        timestep_dim: int = 256,
+        use_timestep_conditioning: bool = True,
+        top_k: Optional[int] = None,
+    ):
+        super().__init__()
+        self.model_names = list(model_dims.keys())
+        self.model_dims = model_dims
+        self.latent_dim = latent_dim
+        self.top_k = top_k
+
+        self.encoders = nn.ModuleDict()
+        self.decoders = nn.ModuleDict()
+
+        for name, dim in model_dims.items():
+            self.encoders[name] = TemporalAwareEncoder(
+                dim,
+                latent_dim,
+                timestep_dim,
+                use_timestep_conditioning,
+            )
+            self.decoders[name] = TemporalAwareDecoder(
+                latent_dim,
+                dim,
+            )
+
+
+    def encode(self, x, model_name, sigma):
+        # pre-sparsity latent (for temporal loss)
+        z_pre = self.encoders[model_name](x, sigma)
+
+        # sparsity AFTER temporal modulation
+        z = F.relu(z_pre)
+
+        if self.top_k is not None:
+            mask = torch.zeros_like(z)
+            _, idx = torch.topk(z, self.top_k, dim=-1)
+            mask.scatter_(-1, idx, 1.0)
+            z = z * mask
+
+        return z_pre, z
+
+
+    def decode(self, z, model_name):
+        return self.decoders[model_name](z)
+
+
+    def forward(self, activations_dict, sigma, source_model):
+        z_pre, z_sparse = self.encode(
+            activations_dict[source_model],
+            source_model,
+            sigma,
+        )
+
+        recon = {
+            name: self.decode(z_sparse, name)
+            for name in self.model_names
+        }
+
+        return recon, z_sparse, z_pre
+
+
+    def compute_loss(
+        self,
+        activations_dict,
+        reconstructions,
+        z_pre,
+        z_pre_next=None,
+        l1_coeff=1e-3,
+        temporal_coeff=1e-2,
+    ):
+        # Universal reconstruction loss
+        recon_loss = sum(
+            F.mse_loss(reconstructions[name], activations_dict[name])
+            for name in self.model_names
+        )
+
+        # Sparsity loss (pre-activation, paper-aligned)
+        sparsity_loss = l1_coeff * z_pre.abs().mean()
+
+        # Temporal consistency (pre-sparsity latent)
+        temporal_loss = torch.tensor(0.0, device=z_pre.device)
+        if z_pre_next is not None:
+            temporal_loss = F.mse_loss(z_pre, z_pre_next)
+
+        total = recon_loss + sparsity_loss + temporal_coeff * temporal_loss
+
+        return total, {
+            "total": total,
+            "reconstruction": recon_loss,
+            "sparsity": sparsity_loss,
+            "temporal": temporal_loss,
+        }
+
+
+# Trainer
+
+class TemporalUniversalSAETrainer:
+    def __init__(
+        self,
+        model: UniversalSparseAutoencoder,
+        learning_rate: float = 1e-4,
+        l1_coeff: float = 1e-3,
+        temporal_coeff: float = 1e-2,
+        device: str = "cuda",
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.l1_coeff = l1_coeff
+        self.temporal_coeff = temporal_coeff
+
+        # Train ALL encoders + decoders jointly (USAE-correct)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=learning_rate
+        )
+
+
+    def train_step(self, activations_dict, sigma):
+        source_model = random.choice(self.model.model_names)
+
+        activations_dict = {
+            k: v.to(self.device) for k, v in activations_dict.items()
+        }
+        sigma = sigma.to(self.device)
+
+        # small timestep perturbation
+        sigma_next = sigma + 0.01 * torch.randn_like(sigma)
+
+        recon, z_sparse, z_pre = self.model(
+            activations_dict, sigma, source_model
+        )
+        _, _, z_pre_next = self.model(
+            activations_dict, sigma_next, source_model
+        )
+
+        loss, loss_dict = self.model.compute_loss(
+            activations_dict,
+            recon,
+            z_pre,
+            z_pre_next=z_pre_next,
+            l1_coeff=self.l1_coeff,
+            temporal_coeff=self.temporal_coeff,
+        )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        metrics = {k: v.item() for k, v in loss_dict.items()}
+        metrics["source_model"] = source_model
+        metrics["sparsity_ratio"] = (z_sparse > 0).float().mean().item()
+
+        return metrics
