@@ -21,7 +21,7 @@ class CrossModelActivationDataset(Dataset):
         data_dir: Path,
         model_names: List[str] = ['sd3', 'flux'],
         timestep_idx: Optional[int] = None,
-        token_sample_ratio: float = 1,
+        token_sample_ratio: float = 1.0,
         align_samples: bool = True,
     ):
         self.data_dir = Path(data_dir)
@@ -92,7 +92,7 @@ class PairedTrajectoryDataset(Dataset):
         self,
         data_dir: Path,
         model_names=("sd3", "flux"),
-        token_sample_ratio: float = 0.3,
+        token_sample_ratio: float = 1.0,
     ):
         self.data_dir = Path(data_dir)
         self.model_names = list(model_names)
@@ -230,7 +230,7 @@ def create_cross_model_dataloaders(
     model_names: List[str] = ['sd3', 'flux'],
     batch_size: int = 64,
     train_ratio: float = 0.9,
-    token_sample_ratio: float = 0.3,
+    token_sample_ratio: float = 1.0,
     num_workers: int = 4,
     use_paired: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
