@@ -1,7 +1,10 @@
 """
-Dataloader for cross-prediction training with SD3 and FLUX activations.
+Dataloader for Universal Sparse Autoencoders with SD3 and FLUX activations.
 
 This module handles loading paired activations from both models on the same images.
+Each model has its own encoder and decoder. During training, one model's encoder
+is randomly selected to encode into shared sparse space Z, then all models'
+activations are reconstructed using their respective decoders.
 """
 
 from pathlib import Path
@@ -11,9 +14,14 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
 
-class CrossModelActivationDataset(Dataset):
+class UniversalSAEDataset(Dataset):
     """
-    Dataset for cross-model activation learning.
+    Dataset for Universal SAE training.
+    
+    Returns activations from all models separately. Training procedure:
+    1. Randomly select one model's encoder (e.g., Ψ^sd3 or Ψ^flux)
+    2. Encode that model's activations into shared sparse code Z
+    3. Reconstruct ALL models' activations using their respective decoders
     """
     
     def __init__(
@@ -24,6 +32,14 @@ class CrossModelActivationDataset(Dataset):
         token_sample_ratio: float = 1.0,
         align_samples: bool = True,
     ):
+        """
+        Args:
+            data_dir: Root directory containing model subdirectories
+            model_names: List of model names (e.g., ['sd3', 'flux'])
+            timestep_idx: Fixed timestep index, or None for random sampling
+            token_sample_ratio: Fraction of tokens to sample (for memory efficiency)
+            align_samples: Whether to align sample counts across models
+        """
         self.data_dir = Path(data_dir)
         self.model_names = model_names
         self.timestep_idx = timestep_idx
@@ -51,14 +67,21 @@ class CrossModelActivationDataset(Dataset):
         return self.num_samples
     
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict]:
-        batch_dict = {}
+        """
+        Returns:
+            activations_dict: Dict mapping model_name -> activation tensor
+            metadata: Dict with sigma, timestep_idx, sample_idx
+        """
+        activations_dict = {}
         metadata = {}
+        shared_indices = None  # Use same token indices across models
         
         for model_name in self.model_names:
             file_idx = idx % len(self.model_files[model_name])
             file_path = self.model_files[model_name][file_idx]
             data = torch.load(file_path)
             
+            # Select timestep
             if self.timestep_idx is not None:
                 t_idx = self.timestep_idx
             else:
@@ -67,31 +90,40 @@ class CrossModelActivationDataset(Dataset):
             activation = data.activations[t_idx]
             sigma = data.sigmas[t_idx]
             
+            # Flatten spatial dimensions if present
             if activation.dim() == 3:
                 B, N, D = activation.shape
                 activation = activation.reshape(B * N, D)
             
+            # Token sampling with shared indices across models
             if self.token_sample_ratio < 1.0:
                 num_tokens = activation.shape[0]
                 num_samples = max(1, int(num_tokens * self.token_sample_ratio))
-                indices = torch.randperm(num_tokens)[:num_samples]
-                activation = activation[indices]
+                if shared_indices is None:
+                    shared_indices = torch.randperm(num_tokens)[:num_samples]
+                activation = activation[shared_indices]
             
-            batch_dict[model_name] = activation
+            activations_dict[model_name] = activation
             
+            # Store metadata from first model
             if not metadata:
                 metadata['sigma'] = sigma
                 metadata['timestep_idx'] = t_idx
                 metadata['sample_idx'] = idx
         
-        return batch_dict, metadata
+        return activations_dict, metadata
 
 
-class PairedTrajectoryDataset(Dataset):
+class PairedTrajectoryUniversalDataset(Dataset):
+    """
+    Dataset for Universal SAE training with full temporal trajectories.
+    Returns separate activations for each model across all timesteps.
+    """
+    
     def __init__(
         self,
         data_dir: Path,
-        model_names=("sd3", "flux"),
+        model_names: Tuple[str, ...] = ("sd3", "flux"),
         token_sample_ratio: float = 1.0,
     ):
         self.data_dir = Path(data_dir)
@@ -115,20 +147,22 @@ class PairedTrajectoryDataset(Dataset):
                 model_paths[model_name] = matches[0]
 
             if valid:
-                self.samples.append(
-                    {
-                        "sample_id": sample_id,
-                        "model_paths": model_paths,
-                    }
-                )
+                self.samples.append({
+                    "sample_id": sample_id,
+                    "model_paths": model_paths,
+                })
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        """
+        Returns:
+            activations_dict: Dict mapping model_name -> [T, N_tokens, D] tensor
+            metadata: Dict with timesteps, sigmas, sample_id
+        """
         sample = self.samples[idx]
-        batch = {}
-
+        activations_dict = {}
         shared_idxs = None
 
         for model_name in self.model_names:
@@ -138,6 +172,7 @@ class PairedTrajectoryDataset(Dataset):
             T, B, N, D = activations.shape
             activations = activations.view(T, B * N, D)
 
+            # Token sampling with shared indices across models
             if self.token_sample_ratio < 1.0:
                 num_tokens = activations.shape[1]
                 k = max(1, int(num_tokens * self.token_sample_ratio))
@@ -145,7 +180,7 @@ class PairedTrajectoryDataset(Dataset):
                     shared_idxs = torch.randperm(num_tokens)[:k]
                 activations = activations[:, shared_idxs]
 
-            batch[model_name] = activations
+            activations_dict[model_name] = activations
 
         metadata = {
             "sample_id": sample["sample_id"],
@@ -153,17 +188,22 @@ class PairedTrajectoryDataset(Dataset):
             "sigmas": torch.tensor(data.sigmas),
         }
 
-        return batch, metadata
+        return activations_dict, metadata
 
 
-def collate_cross_model(batch):
-    collated_batch = {}
+def collate_universal_sae(batch):
+    """
+    Collate function for Universal SAE training.
+    
+    Returns:
+        activations_dict: Dict mapping model_name -> stacked batch tensor
+        metadata: Collated metadata
+    """
+    # Get model names from first sample
+    model_names = list(batch[0][0].keys())
+    
+    collated_activations = {model_name: [] for model_name in model_names}
     collated_metadata = {}
-
-    # Model names inferred from first sample
-    model_names = batch[0][0].keys()
-    for model_name in model_names:
-        collated_batch[model_name] = []
 
     # Detect metadata type
     first_metadata = batch[0][1]
@@ -182,11 +222,13 @@ def collate_cross_model(batch):
             "sample_idx": [],
         }
 
-    # Collate
-    for batch_dict, metadata in batch:
+    # Collate each sample
+    for activations_dict, metadata in batch:
+        # Collect activations for each model
         for model_name in model_names:
-            collated_batch[model_name].append(batch_dict[model_name])
+            collated_activations[model_name].append(activations_dict[model_name])
 
+        # Collect metadata
         if is_temporal:
             collated_metadata["timesteps"].append(metadata["timesteps"])
             collated_metadata["sigmas"].append(metadata["sigmas"])
@@ -196,10 +238,10 @@ def collate_cross_model(batch):
             collated_metadata["sigma"].append(metadata["sigma"])
             collated_metadata["sample_idx"].append(metadata["sample_idx"])
 
-    # Stack model activations
+    # Stack activations for each model
     for model_name in model_names:
-        collated_batch[model_name] = torch.stack(
-            collated_batch[model_name], dim=0
+        collated_activations[model_name] = torch.stack(
+            collated_activations[model_name], dim=0
         )
 
     # Stack metadata tensors where applicable
@@ -221,11 +263,10 @@ def collate_cross_model(batch):
             collated_metadata["sample_idx"]
         )
 
-    return collated_batch, collated_metadata
+    return collated_activations, collated_metadata
 
 
-
-def create_cross_model_dataloaders(
+def create_universal_sae_dataloaders(
     data_dir: Path,
     model_names: List[str] = ['sd3', 'flux'],
     batch_size: int = 64,
@@ -234,14 +275,67 @@ def create_cross_model_dataloaders(
     num_workers: int = 4,
     use_paired: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create dataloaders for Universal SAE training.
+    
+    Architecture:
+    - Each model i has its own encoder Ψ^(i): R^(d_i) -> R^k (shared sparse dim)
+    - Each model i has its own decoder D^(i): R^k -> R^(d_i)
+    
+    Training procedure per iteration:
+    1. Randomly select one model i (e.g., 'sd3')
+    2. Encode A^(i) with Ψ^(i) to get shared sparse code Z
+    3. Decode Z with ALL model decoders: Â^(sd3) = D^(sd3)(Z), Â^(flux) = D^(flux)(Z)
+    4. Loss = Σ_j ||Â^(j) - A^(j)||^2 (reconstruct all models from shared code)
+    
+    Args:
+        data_dir: Root directory with model subdirectories
+        model_names: List of models (e.g., ['sd3', 'flux'])
+        batch_size: Batch size
+        train_ratio: Train/val split ratio
+        token_sample_ratio: Fraction of tokens to sample
+        num_workers: Number of dataloader workers
+        use_paired: Use paired trajectory dataset (full temporal sequences)
+    
+    Returns:
+        train_loader, val_loader
+        
+    Example usage in training loop:
+        ```
+        for activations_dict, metadata in train_loader:
+            # activations_dict = {'sd3': [B, N, D1], 'flux': [B, N, D2]}
+            
+            # Randomly select which model's encoder to use
+            encode_model = random.choice(['sd3', 'flux'])
+            
+            # Encode with selected model's encoder
+            z = encoders[encode_model](activations_dict[encode_model])  # [B, N, k]
+            
+            # Decode to ALL models with their respective decoders
+            reconstructions = {
+                'sd3': decoders['sd3'](z),      # [B, N, D1]
+                'flux': decoders['flux'](z)     # [B, N, D2]
+            }
+            
+            # Universal loss: reconstruct all models from shared sparse code
+            loss = sum(
+                F.mse_loss(reconstructions[m], activations_dict[m])
+                for m in ['sd3', 'flux']
+            )
+            
+            # Backward on selected encoder and all decoders
+            loss.backward()
+            optimizer.step()  # Updates encoders[encode_model] and all decoders
+        ```
+    """
     if use_paired:
-        dataset = PairedTrajectoryDataset(
+        dataset = PairedTrajectoryUniversalDataset(
             data_dir=data_dir,
-            model_names=model_names,
+            model_names=tuple(model_names),
             token_sample_ratio=token_sample_ratio,
         )
     else:
-        dataset = CrossModelActivationDataset(
+        dataset = UniversalSAEDataset(
             data_dir=data_dir,
             model_names=model_names,
             token_sample_ratio=token_sample_ratio,
@@ -262,7 +356,7 @@ def create_cross_model_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=collate_cross_model,
+        collate_fn=collate_universal_sae,
         pin_memory=True,
     )
     
@@ -271,7 +365,7 @@ def create_cross_model_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_cross_model,
+        collate_fn=collate_universal_sae,
         pin_memory=True,
     )
     
