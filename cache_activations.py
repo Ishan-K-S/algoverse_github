@@ -489,8 +489,8 @@ def build_parser():
                         help="Path to ImageNet root directory (contains train/val folders)")
     clip_p.add_argument("--split", type=str, default="val", choices=["train", "val"],
                         help="Dataset split to use (default: val)")
-    clip_p.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32",
-                        help="Hugging Face model name (default: openai/clip-vit-base-patch32)")
+    clip_p.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16",
+                        help="Hugging Face model name (default: openai/clip-vit-base-patch16)")
     clip_p.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for processing (default: 32)")
     clip_p.add_argument("--num_workers", type=int, default=4,
