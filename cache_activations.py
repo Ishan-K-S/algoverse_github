@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 """
 activation caching script for multiple models on imagenet in one file
 
 Includes:
-  - BLIP   -> saves shard_XXXXX.pt files (acts/labels/indices)
+  - CLIP   -> saves shard_XXXXX.pt files (acts/labels/indices)
   - SigLIP -> saves one big .h5 cache (activations/labels) + logs + run_config.json
   - ViT    -> saves per-image .npz files (like imagenet folder structure)
 """
@@ -14,12 +13,12 @@ import sys
 
 
 
-# BLIP
+# CLIP
 
 
-def blip_extract_features(model, processor, images, device):
+def clip_extract_features(model, processor, images, device):
     """
-    Extract feature vectors from images using BLIP vision encoder.
+    Extract feature vectors from images using CLIP vision encoder.
     Returns [N, D] tensor where D is the feature dimension.
     """
     import torch
@@ -37,11 +36,11 @@ def blip_extract_features(model, processor, images, device):
     return features
 
 
-def run_blip(args):
+def run_clip(args):
     import torch
     from torch.utils.data import DataLoader
     from torchvision.datasets import ImageNet
-    from transformers import BlipProcessor, BlipForConditionalGeneration
+    from transformers import CLIPProcessor, CLIPModel
     from tqdm import tqdm
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -50,8 +49,8 @@ def run_blip(args):
     print(f"Using device: {device}")
 
     print(f"Loading model: {args.model_name}")
-    processor = BlipProcessor.from_pretrained(args.model_name)
-    model = BlipForConditionalGeneration.from_pretrained(args.model_name)
+    processor = CLIPProcessor.from_pretrained(args.model_name)
+    model = CLIPModel.from_pretrained(args.model_name)
     model.eval()
     model.to(device)
 
@@ -88,7 +87,7 @@ def run_blip(args):
 
     for batch_images, batch_labels in tqdm(dataloader, desc="Processing batches"):
         try:
-            batch_features = blip_extract_features(model, processor, batch_images, device)
+            batch_features = clip_extract_features(model, processor, batch_images, device)
             batch_features = batch_features.cpu().half()
 
             batch_size = len(batch_labels)
@@ -480,29 +479,29 @@ def run_vit(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Cache ImageNet activations for multiple models (BLIP / SigLIP / ViT) from ONE file"
+        description="Cache ImageNet activations for multiple models (CLIP / SigLIP / ViT) from ONE file"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # ---- BLIP ----
-    blip_p = subparsers.add_parser("blip", help="Cache BLIP vision encoder activations to .pt shards")
-    blip_p.add_argument("--imagenet_root", type=str, required=True,
+    # ---- CLIP ----
+    clip_p = subparsers.add_parser("clip", help="Cache CLIP vision encoder activations to .pt shards")
+    clip_p.add_argument("--imagenet_root", type=str, required=True,
                         help="Path to ImageNet root directory (contains train/val folders)")
-    blip_p.add_argument("--split", type=str, default="val", choices=["train", "val"],
+    clip_p.add_argument("--split", type=str, default="val", choices=["train", "val"],
                         help="Dataset split to use (default: val)")
-    blip_p.add_argument("--model_name", type=str, default="Salesforce/blip-image-captioning-base",
-                        help="Hugging Face model name (default: Salesforce/blip-image-captioning-base)")
-    blip_p.add_argument("--batch_size", type=int, default=32,
+    clip_p.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16",
+                        help="Hugging Face model name (default: openai/clip-vit-base-patch16)")
+    clip_p.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for processing (default: 32)")
-    blip_p.add_argument("--num_workers", type=int, default=4,
+    clip_p.add_argument("--num_workers", type=int, default=4,
                         help="Number of DataLoader workers (default: 4)")
-    blip_p.add_argument("--shard_size", type=int, default=1024,
+    clip_p.add_argument("--shard_size", type=int, default=1024,
                         help="Number of images per shard (default: 1024)")
-    blip_p.add_argument("--out_dir", type=str, required=True,
+    clip_p.add_argument("--out_dir", type=str, required=True,
                         help="Output directory for shard files")
-    blip_p.add_argument("--max_images", type=int, default=None,
+    clip_p.add_argument("--max_images", type=int, default=None,
                         help="Optional: maximum number of images to process (for quick testing)")
-    blip_p.set_defaults(func=run_blip)
+    clip_p.set_defaults(func=run_clip)
 
     # ---- SigLIP ----
     siglip_p = subparsers.add_parser("siglip", help="Cache SigLIP activations to ONE .h5 file")
