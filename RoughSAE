@@ -279,8 +279,6 @@ class TemporalUniversalSAETrainer:
             )
             total_recon_loss += recon_loss_t
             
-            # FIX: Sparsity loss on ACTUAL sparse activations
-            # This is the critical fix - penalize what's actually being used
             sparsity_loss_t = z_sparse_t.abs().mean()
             total_sparsity_loss += sparsity_loss_t
             
@@ -395,16 +393,7 @@ class TemporalUniversalSAETrainer:
     @torch.no_grad()
     def validate(self, val_loader, num_batches: Optional[int] = None):
         """
-        Validation loop with fixed metric averaging.
-        
-        FIX: Properly count batches (not models * batches)
-        
-        Args:
-            val_loader: Validation data loader
-            num_batches: Number of batches to validate on (None = all)
-        
-        Returns:
-            Dict of averaged validation metrics
+        Validation loop with metric averaging.
         """
         self.model.eval()
         
@@ -464,7 +453,6 @@ class TemporalUniversalSAETrainer:
                     )
                     batch_recon += recon_loss_t.item()
                     
-                    # FIX: Sparsity on actual sparse code
                     batch_sparsity += z_sparse_t.abs().mean().item()
                     
                     # L0 and sparsity ratio
@@ -494,8 +482,7 @@ class TemporalUniversalSAETrainer:
                     total_metrics["temporal"] += sum(batch_temporal) / len(batch_temporal)
             
             num_batches_processed += 1
-        
-        # FIX: Average across batches AND models
+
         num_total_evals = num_batches_processed * len(self.model.model_names)
         for key in total_metrics:
             total_metrics[key] /= max(num_total_evals, 1)
