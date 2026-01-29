@@ -154,38 +154,23 @@ class UniversalSparseAutoencoder(nn.Module):
 
     def apply_topk(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Apply top-k sparsity (soft or hard).
-        
-        Note: Hard top-k uses straight-through estimator for gradients.
+        Apply top-k sparsity 
         """
         if self.top_k is None:
             return z
         
-        if self.use_soft_topk:
-            # Soft top-k using temperature-based thresholding
-            k_index = z.shape[-1] - self.top_k
-            threshold = torch.kthvalue(z, k_index + 1, dim=-1, keepdim=True).values
+
+        # Soft top-k using temperature-based thresholding
+        k_index = z.shape[-1] - self.top_k
+        threshold = torch.kthvalue(z, k_index + 1, dim=-1, keepdim=True).values
             
-            # Apply soft mask using sigmoid
-            soft_mask = torch.sigmoid((z - threshold) / self.topk_temperature)
-            return z * soft_mask
-        else:
-            # Hard top-k with straight-through estimator
-            # Forward: hard mask, Backward: gradients flow through
-            mask = torch.zeros_like(z)
-            _, idx = torch.topk(z, self.top_k, dim=-1)
-            mask.scatter_(-1, idx, 1.0)
-            
-            # Straight-through: use mask in forward, but let gradients pass
-            return z * mask + (z * mask - z).detach()
+        # Apply soft mask using sigmoid
+        soft_mask = torch.sigmoid((z - threshold) / self.topk_temperature)
+        return z * soft_mask
 
     def encode(self, x, model_name, sigma):
         """
         Encode input to sparse latent representation.
-        
-        Returns:
-            z_pre: Pre-activation latent (for temporal consistency)
-            z_sparse: Sparse activated latent (for reconstruction)
         """
         # Pre-activation latent
         z_pre = self.encoders[model_name](x, sigma)
@@ -204,16 +189,6 @@ class UniversalSparseAutoencoder(nn.Module):
     def forward(self, activations_dict, sigma, source_model):
         """
         Forward pass for Universal SAE.
-        
-        Args:
-            activations_dict: Dict of activations for all models
-            sigma: Timestep/noise level
-            source_model: Which model's encoder to use
-            
-        Returns:
-            recon: Dict of reconstructions for all models
-            z_sparse: Sparse latent code (post-activation, post-top-k)
-            z_pre: Pre-activation latent (for temporal loss)
         """
         z_pre, z_sparse = self.encode(
             activations_dict[source_model],
@@ -244,20 +219,6 @@ class TemporalUniversalSAETrainer:
         use_scheduler: bool = True,
         temporal_on_sparse: bool = True,
     ):
-        """
-        Args:
-            model: The Universal SAE model
-            learning_rate: Base learning rate
-            l1_coeff: Coefficient for L1 sparsity loss
-            temporal_coeff: Coefficient for temporal consistency loss
-            max_grad_norm: Maximum gradient norm for clipping
-            temporal_gradient_steps: How many timesteps to backprop through
-                                    (1 = detach each step, -1 = full BPTT)
-            device: Device to train on
-            use_scheduler: Whether to use learning rate scheduler
-            temporal_on_sparse: If True, apply temporal loss to sparse codes (z_sparse)
-                              If False, apply to pre-activation (z_pre)
-        """
         self.model = model.to(device)
         self.device = device
         self.l1_coeff = l1_coeff
@@ -282,11 +243,6 @@ class TemporalUniversalSAETrainer:
         """
         Train step for Universal SAE with temporal consistency.
         
-        FIXES:
-        1. Sparsity loss now applied to z_sparse (actual sparse code)
-        2. Temporal loss can be applied to either sparse or pre-activation
-        3. Better gradient flow handling
-        4. Improved metrics tracking
         """
         source_model = random.choice(self.model.model_names)
         
