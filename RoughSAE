@@ -197,39 +197,80 @@ class TemporalUniversalSAETrainer:
         )
 
 
-    def train_step(self, activations_dict, sigma):
+    def train_step(self, activations_dict, metadata):
+        """
+        Train step for Universal SAE with temporal consistency.
+        """
         source_model = random.choice(self.model.model_names)
-
+        
+        # Move to device
         activations_dict = {
             k: v.to(self.device) for k, v in activations_dict.items()
         }
-        sigma = sigma.to(self.device)
-
-        # small timestep perturbation
-        sigma_next = sigma + 0.01 * torch.randn_like(sigma)
-
-        recon, z_sparse, z_pre = self.model(
-            activations_dict, sigma, source_model
-        )
-        _, _, z_pre_next = self.model(
-            activations_dict, sigma_next, source_model
-        )
-
-        loss, loss_dict = self.model.compute_loss(
-            activations_dict,
-            recon,
-            z_pre,
-            z_pre_next=z_pre_next,
-            l1_coeff=self.l1_coeff,
-            temporal_coeff=self.temporal_coeff,
-        )
-
+        sigmas = metadata['sigmas'].to(self.device)  # [B, T]
+        
+        B, T, N, D = activations_dict[source_model].shape
+        
+        total_recon_loss = 0.0
+        total_sparsity_loss = 0.0
+        temporal_losses = []
+        
+        z_pre_prev = None
+        
+        # Process each timestep
+        for t in range(T):
+            # Extract activations at timestep t
+            acts_t = {k: v[:, t] for k, v in activations_dict.items()}  # [B, N, D]
+            sigma_t = sigmas[:, t]  # [B]
+            
+            # Forward pass
+            recon_t, z_sparse_t, z_pre_t = self.model(
+                acts_t, sigma_t, source_model
+            )
+            
+            # Reconstruction loss (all models)
+            recon_loss_t = sum(
+                F.mse_loss(recon_t[name], acts_t[name])
+                for name in self.model.model_names
+            )
+            total_recon_loss += recon_loss_t
+            
+            # Sparsity loss (pre-activation)
+            sparsity_loss_t = z_pre_t.abs().mean()
+            total_sparsity_loss += sparsity_loss_t
+            
+            # Temporal consistency (between consecutive timesteps)
+            if z_pre_prev is not None:
+                temporal_loss_t = F.mse_loss(z_pre_prev, z_pre_t)
+                temporal_losses.append(temporal_loss_t)
+            
+            z_pre_prev = z_pre_t.detach()  # Detach to prevent gradient accumulation
+        
+        # Average losses over time
+        recon_loss = total_recon_loss / T
+        sparsity_loss = (self.l1_coeff * total_sparsity_loss) / T
+        
+        if temporal_losses:
+            temporal_loss = torch.stack(temporal_losses).mean()
+        else:
+            temporal_loss = torch.tensor(0.0, device=self.device)
+        
+        # Total loss
+        total_loss = recon_loss + sparsity_loss + self.temporal_coeff * temporal_loss
+        
+        # Backward pass
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         self.optimizer.step()
-
-        metrics = {k: v.item() for k, v in loss_dict.items()}
-        metrics["source_model"] = source_model
-        metrics["sparsity_ratio"] = (z_sparse > 0).float().mean().item()
-
+        
+        # Metrics
+        metrics = {
+            "total": total_loss.item(),
+            "reconstruction": recon_loss.item(),
+            "sparsity": sparsity_loss.item(),
+            "temporal": temporal_loss.item(),
+            "source_model": source_model,
+            "sparsity_ratio": (z_sparse_t > 0).float().mean().item(),
+        }
+        
         return metrics
