@@ -113,18 +113,6 @@ class UniversalSparseAutoencoder(nn.Module):
         data_means: Optional[Dict[str, torch.Tensor]] = None,
         normalize_decoder_weights: bool = True,
     ):
-        """
-        Args:
-            model_dims: Dict mapping model names to their feature dimensions
-            latent_dim: Dimension of shared sparse latent space
-            timestep_dim: Dimension of timestep embeddings
-            use_timestep_conditioning: Whether to use temporal conditioning
-            top_k: Number of top features to keep (None for no top-k)
-            use_soft_topk: Use soft (differentiable) top-k instead of hard masking
-            topk_temperature: Temperature for soft top-k (lower = sharper)
-            data_means: Optional dict of mean activations per model for decoder init
-            normalize_decoder_weights: Whether to normalize decoder weights (unit norm)
-        """
         super().__init__()
         self.model_names = list(model_dims.keys())
         self.model_dims = model_dims
@@ -159,14 +147,23 @@ class UniversalSparseAutoencoder(nn.Module):
         if self.top_k is None:
             return z
         
-
-        # Soft top-k using temperature-based thresholding
-        k_index = z.shape[-1] - self.top_k
-        threshold = torch.kthvalue(z, k_index + 1, dim=-1, keepdim=True).values
+        if self.use_soft_topk:
+            # Soft top-k using temperature-based thresholding
+            k_index = z.shape[-1] - self.top_k
+            threshold = torch.kthvalue(z, k_index + 1, dim=-1, keepdim=True).values
             
-        # Apply soft mask using sigmoid
-        soft_mask = torch.sigmoid((z - threshold) / self.topk_temperature)
-        return z * soft_mask
+            # Apply soft mask using sigmoid
+            soft_mask = torch.sigmoid((z - threshold) / self.topk_temperature)
+            return z * soft_mask
+        else:
+            # Hard top-k with straight-through estimator
+            # Forward: hard mask, Backward: gradients flow through
+            mask = torch.zeros_like(z)
+            _, idx = torch.topk(z, self.top_k, dim=-1)
+            mask.scatter_(-1, idx, 1.0)
+            
+            # Straight-through: use mask in forward, but let gradients pass
+            return z * mask + (z * mask - z).detach()
 
     def encode(self, x, model_name, sigma):
         """
@@ -242,7 +239,6 @@ class TemporalUniversalSAETrainer:
     def train_step(self, activations_dict, metadata):
         """
         Train step for Universal SAE with temporal consistency.
-        
         """
         source_model = random.choice(self.model.model_names)
         
@@ -278,7 +274,6 @@ class TemporalUniversalSAETrainer:
                 for name in self.model.model_names
             )
             total_recon_loss += recon_loss_t
-            
             sparsity_loss_t = z_sparse_t.abs().mean()
             total_sparsity_loss += sparsity_loss_t
             
@@ -482,7 +477,6 @@ class TemporalUniversalSAETrainer:
                     total_metrics["temporal"] += sum(batch_temporal) / len(batch_temporal)
             
             num_batches_processed += 1
-
         num_total_evals = num_batches_processed * len(self.model.model_names)
         for key in total_metrics:
             total_metrics[key] /= max(num_total_evals, 1)
