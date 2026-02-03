@@ -61,7 +61,7 @@ def cache_model_activations(model, model_name, imagenet_root, path_to_cache, bat
     print(f"Caching model activations: {model_name}")
     print("Loading ImageNet")
 
-    imagenet_data = ImageNet(imagenet_root, transform=model.preprocess)
+    imagenet_data = ImageNet(imagenet_root, split='train',transform=model.preprocess)
 
     print("ImageNet Loaded")
 
@@ -128,8 +128,8 @@ def cache_model_activations(model, model_name, imagenet_root, path_to_cache, bat
 
 if __name__ == '__main__':
     # Configuration
-    imagenet_root = "[INSERT IMAGENET ROOT PATH]"
-    path_to_cache = "[INSERT CACHE PATH]"
+    imagenet_root = "./imagenet_sample"
+    path_to_cache = "./cache_output"
     
     # Select which model to cache (uncomment one)
     

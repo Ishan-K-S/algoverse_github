@@ -18,6 +18,9 @@ from torchvision.datasets import ImageNet
 
 from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor
 
+from huggingface_hub import login
+login()
+
 
 def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, label: int):
     """
@@ -29,7 +32,8 @@ def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, t
     sigmas_arr = np.asarray(sigmas, dtype=np.float32)
     # timesteps might be torch scalar tensors; convert safely to int64
     ts_arr = np.asarray([int(t.item()) for t in timesteps], dtype=np.int64)
-
+    if activation_tnd.dtype == torch.bfloat16:
+        activation_tnd = activation_tnd.float()
     np.savez_compressed(
         path_no_ext + ".npz",
         activation=activation_tnd.numpy(),
@@ -106,9 +110,8 @@ def cache_diffusion_activations(
 
 
 if __name__ == "__main__":
-    imagenet_root = "[INSERT IMAGENET ROOT PATH]"
-    cache_root = "[INSERT CACHE PATH]"
-
+    imagenet_root = "./imagenet_sample"
+    cache_root = "./cache_output"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
@@ -124,6 +127,6 @@ if __name__ == "__main__":
         imagenet_root=imagenet_root,
         cache_root=cache_root,
         split="train",
-        batch_size=2,   # diffusion is heavy; tune for VRAM
+        batch_size=2,
         num_workers=8,
     )

@@ -62,8 +62,8 @@ def combine_activations(activation_root: str, output_root: str, split: str, sour
 
 
 if __name__ == "__main__":
-    activation_root = ""
-    output_root = ""
+    activation_root = "./cache_output"
+    output_root = "./combined_output"
     split = "train"
 
     # add diffusion sources as needed:
