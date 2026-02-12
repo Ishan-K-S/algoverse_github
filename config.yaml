@@ -34,5 +34,5 @@ model_zoo:
   SigLIP: { input_shape: 768, num_tokens: 196, og_model: SigLIP }
   DinoV2: { input_shape: 384, num_tokens: 196, og_model: DinoV2 }
 
-  SD3:    { input_shape: <D_SD3>, num_tokens: <N_SD3>, og_model: SD3 }
-  FLUX:   { input_shape: <D_FLUX>, num_tokens: <N_FLUX>, og_model: FLUX }
+  SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
+  FLUX:   { input_shape: 3072, num_tokens: 4096, og_model: FLUX }
