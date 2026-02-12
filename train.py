@@ -1,6 +1,6 @@
-# train.py (patched)
+# train.py (patched with token interpolation)
 import random
-from typing import Optional
+from typing import Optional, Dict, Set
 
 import torch
 import torch.nn.functional as F
@@ -8,8 +8,17 @@ from einops import rearrange
 from tqdm import tqdm
 
 
-def mse_flat(a, b):
-    # a,b: (B,N,D)
+def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Compute MSE loss between two tensors, flattening the token dimension.
+    
+    Args:
+        a, b: (B, N, D) tensors (must have same shape)
+    
+    Returns:
+        Scalar MSE loss
+    """
+    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
     return F.mse_loss(
         rearrange(a, "b n d -> (b n) d"),
         rearrange(b, "b n d -> (b n) d"),
@@ -18,28 +27,34 @@ def mse_flat(a, b):
 
 def _ensure_bt(sigmas: torch.Tensor, batch_size: int) -> torch.Tensor:
     """
-    Ensure sigmas is shaped (B,T).
-    Accepts (T,) or (1,T) or (B,T).
+    Ensure sigmas is shaped (B, T).
+    Accepts (T,) or (1, T) or (B, T).
     """
     if sigmas.dim() == 1:
-        sigmas = sigmas.unsqueeze(0)  # (1,T)
+        sigmas = sigmas.unsqueeze(0)  # (1, T)
     if sigmas.shape[0] == 1 and batch_size > 1:
         sigmas = sigmas.expand(batch_size, -1)
     return sigmas
 
 
-def _get_sigmas_bt(meta: dict, model_name: str, batch_size: int, device: str) -> Optional[torch.Tensor]:
+def _get_sigmas_bt(
+    meta: dict,
+    model_name: str,
+    batch_size: int,
+    device: str,
+) -> Optional[torch.Tensor]:
     """
+    Extract sigmas for a given model from metadata.
+    
     Your data.py returns metadata like:
-      meta["sigmas"] : (1,T) or (B,T)  (picked from first diffusion source)
-      meta["sigmas_by_model"][name] : (1,T) or (B,T)
-    NOT meta[name]["sigmas"].
-
-    This helper pulls the best available sigmas for a given model and returns (B,T) on device.
+      meta["sigmas"] : (1, T) or (B, T)  (picked from first diffusion source)
+      meta["sigmas_by_model"][name] : (1, T) or (B, T)
+    
+    This helper pulls the best available sigmas for a given model and returns (B, T) on device.
     """
     sig = None
 
-    # Preferred: per-model
+    # Preferred: per-model sigmas
     if isinstance(meta, dict) and "sigmas_by_model" in meta:
         if model_name in meta["sigmas_by_model"]:
             sig = meta["sigmas_by_model"][model_name]
@@ -69,19 +84,36 @@ def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     return int(round(t_src * (t_tgt_len - 1) / (t_src_len - 1)))
 
 
-def train_universal_sae(model, dataloader, optimizer, diffusion_models, device="cuda"):
+def train_universal_sae(
+    model,
+    dataloader,
+    optimizer,
+    diffusion_models: Set[str],
+    model_tokens: Optional[Dict[str, int]] = None,
+    device: str = "cuda",
+):
     """
+    Train the Universal SAE with cross-model reconstruction.
+    
     Training policy:
       - Pick a random source each batch.
       - Encode source -> shared latent z.
-      - Decode z into EVERY target model.
-      - Vision targets compare against (B,N,D).
-      - Diffusion targets compare against ONE selected timestep (B,N,D) using that target's sigma.
+      - Decode z into EVERY target model (with token interpolation as needed).
+      - Vision targets compare against (B, N, D).
+      - Diffusion targets compare against ONE selected timestep (B, N, D) using that target's sigma.
 
-    This fixes the bug where diffusion targets were skipped when source was vision.
+    Args:
+        model: UniversalSAE instance
+        dataloader: DataLoader yielding ((acts_dict, metadata), labels)
+        optimizer: Optimizer for model parameters
+        diffusion_models: Set of model names that are diffusion/flow models
+        model_tokens: Dict mapping model name -> number of tokens.
+                      Used for interpolation when cross-reconstructing.
+        device: Device to train on
     """
     model.train()
     diffusion_models = set(diffusion_models)
+    model_tokens = model_tokens or {}
 
     for (acts, meta), _y in tqdm(dataloader, desc="train", dynamic_ncols=True):
         source = random.choice(list(acts.keys()))
@@ -90,7 +122,7 @@ def train_universal_sae(model, dataloader, optimizer, diffusion_models, device="
         loss = 0.0
 
         if source in diffusion_models:
-            # acts[source]: (B,T,N,D)
+            # Diffusion source: acts[source] is (B, T, N, D)
             x_src = acts[source].to(device)
             B, Tsrc, N, D = x_src.shape
 
@@ -101,63 +133,75 @@ def train_universal_sae(model, dataloader, optimizer, diffusion_models, device="
                     f"Expected meta['sigmas_by_model'][{source!r}] or meta['sigmas']."
                 )
 
-            # iterate all timesteps for the source diffusion model
+            # Iterate all timesteps for the source diffusion model
             for t_src in range(Tsrc):
                 sigma_src = src_sigmas_bt[:, t_src]  # (B,)
-                x_t = x_src[:, t_src]                # (B,N,D)
+                x_t = x_src[:, t_src]                # (B, N, D)
 
                 _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
 
-                # decode to every target
+                # Decode to every target
                 for target, x_target in acts.items():
                     x_target = x_target.to(device)
 
                     if target in diffusion_models:
-                        # x_target: (B,Ttgt,N,D)
+                        # Diffusion target: x_target is (B, Ttgt, N, D)
                         if x_target.dim() != 4:
                             raise ValueError(
-                                f"Expected diffusion target '{target}' to be (B,T,N,D), got {tuple(x_target.shape)}"
+                                f"Expected diffusion target '{target}' to be (B, T, N, D), got {tuple(x_target.shape)}"
                             )
                         Ttgt = x_target.shape[1]
 
                         tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
                         if tgt_sigmas_bt is None:
-                            # if you truly don't have sigmas for a diffusion target, you can't apply temporal affine
                             raise KeyError(
                                 f"Target '{target}' is diffusion but sigmas not found in metadata. "
                                 f"Expected meta['sigmas_by_model'][{target!r}] or meta['sigmas']."
                             )
 
                         t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
-                        sigma_tgt = tgt_sigmas_bt[:, t_tgt]   # (B,)
-                        x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                        loss = loss + mse_flat(x_hat, x_target[:, t_tgt])
+                        sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
+                        
+                        # Decode with source info for token interpolation
+                        x_hat = model.decode(z, target=target, sigma=sigma_tgt, source=source)
+                        
+                        # Get target slice and interpolate if needed for loss computation
+                        x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
+                        
+                        # x_hat should already be (B, N_tgt, D_tgt) after decode with interpolation
+                        loss = loss + mse_flat(x_hat, x_target_t)
 
                     else:
-                        # vision target: (B,N,D)
+                        # Vision target: x_target is (B, N, D)
                         if x_target.dim() != 3:
                             raise ValueError(
-                                f"Expected vision target '{target}' to be (B,N,D), got {tuple(x_target.shape)}"
+                                f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                             )
-                        x_hat = model.decode(z, target=target, sigma=None)
+                        
+                        # Decode with source info for token interpolation
+                        x_hat = model.decode(z, target=target, sigma=None, source=source)
                         loss = loss + mse_flat(x_hat, x_target)
 
         else:
-            # vision source: (B,N,D)
+            # Vision source: acts[source] is (B, N, D)
             x_src = acts[source].to(device)
+            if x_src.dim() != 3:
+                raise ValueError(
+                    f"Expected vision source '{source}' to be (B, N, D), got {tuple(x_src.shape)}"
+                )
             B, N, D = x_src.shape
 
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
 
-            # decode to every target, INCLUDING diffusion
+            # Decode to every target, INCLUDING diffusion
             for target, x_target in acts.items():
                 x_target = x_target.to(device)
 
                 if target in diffusion_models:
-                    # pick a timestep for THIS diffusion target
+                    # Diffusion target: pick a random timestep
                     if x_target.dim() != 4:
                         raise ValueError(
-                            f"Expected diffusion target '{target}' to be (B,T,N,D), got {tuple(x_target.shape)}"
+                            f"Expected diffusion target '{target}' to be (B, T, N, D), got {tuple(x_target.shape)}"
                         )
                     Ttgt = x_target.shape[1]
                     t_tgt = random.randrange(Ttgt)
@@ -170,16 +214,24 @@ def train_universal_sae(model, dataloader, optimizer, diffusion_models, device="
                         )
 
                     sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
-                    x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                    loss = loss + mse_flat(x_hat, x_target[:, t_tgt])
+                    
+                    # Decode with source info for token interpolation
+                    x_hat = model.decode(z, target=target, sigma=sigma_tgt, source=source)
+                    
+                    # Get target slice
+                    x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
+                    
+                    loss = loss + mse_flat(x_hat, x_target_t)
 
                 else:
-                    # vision target: (B,N,D)
+                    # Vision target: (B, N, D)
                     if x_target.dim() != 3:
                         raise ValueError(
-                            f"Expected vision target '{target}' to be (B,N,D), got {tuple(x_target.shape)}"
+                            f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                         )
-                    x_hat = model.decode(z, target=target, sigma=None)
+                    
+                    # Decode with source info for token interpolation
+                    x_hat = model.decode(z, target=target, sigma=None, source=source)
                     loss = loss + mse_flat(x_hat, x_target)
 
         loss.backward()

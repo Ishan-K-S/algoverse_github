@@ -83,6 +83,18 @@ if __name__ == "__main__":
     sources = list(MODEL_ZOO.keys())
     diffusion_models = set(CONFIG.get("diffusion_models", []))
 
+    # ----- Extract model dimensions AND token counts from model_zoo -----
+    model_dims = {}
+    model_tokens = {}
+    for m in MODEL_ZOO.keys():
+        model_dims[m] = _parse_int_field(MODEL_ZOO[m]["input_shape"], f"model_zoo.{m}.input_shape")
+        if "num_tokens" in MODEL_ZOO[m]:
+            model_tokens[m] = _parse_int_field(MODEL_ZOO[m]["num_tokens"], f"model_zoo.{m}.num_tokens")
+
+    print(f"[config] Model dimensions: {model_dims}")
+    print(f"[config] Model tokens: {model_tokens}")
+    print(f"[config] Diffusion models: {diffusion_models}")
+
     # ----- Run name -----
     run_name_template = CONFIG.get("run_name", "usae_run")
     run_name = _expand_run_name(run_name_template, sources, CONFIG, SAE_PARAMS)
@@ -120,8 +132,6 @@ if __name__ == "__main__":
     )
 
     # ----- Build UniversalSAE -----
-    model_dims = {m: _parse_int_field(MODEL_ZOO[m]["input_shape"], f"model_zoo.{m}.input_shape") for m in MODEL_ZOO.keys()}
-
     exp_factor = _parse_int_field(CONFIG.get("exp_factor", 8), "CONFIG.global.exp_factor")
     input_shape = _parse_int_field(CONFIG.get("input_shape", 768), "CONFIG.global.input_shape")
     default_latent = exp_factor * input_shape
@@ -131,14 +141,19 @@ if __name__ == "__main__":
         model_dims=model_dims,
         latent_dim=latent_dim,
         diffusion_models=diffusion_models,
+        model_tokens=model_tokens,  # NEW: pass token counts for interpolation
         timestep_dim=_parse_int_field(CONFIG.get("timestep_dim", 256), "CONFIG.global.timestep_dim"),
         top_k=_parse_int_field(SAE_PARAMS.get("top_k", CONFIG.get("top_k", 32)), "sae_params.top_k"),
         topk_temperature=float(CONFIG.get("topk_temperature", 0.1)),
         use_soft_topk=bool(CONFIG.get("use_soft_topk", True)),
+        interpolation_mode=str(CONFIG.get("interpolation_mode", "bilinear")),  # NEW: configurable
     )
 
     device = str(CONFIG.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
+
+    print(f"[model] UniversalSAE created with latent_dim={latent_dim}")
+    print(f"[model] Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ----- Optimizer -----
     optimizer = optim.AdamW(
@@ -160,6 +175,7 @@ if __name__ == "__main__":
             dataloader=dataloader,
             optimizer=optimizer,
             diffusion_models=diffusion_models,
+            model_tokens=model_tokens,  # NEW: pass token counts for interpolation
             device=device,
         )
 
@@ -177,6 +193,7 @@ if __name__ == "__main__":
                     "run_name": run_name,
                     "diffusion_models": sorted(list(diffusion_models)),
                     "model_dims": model_dims,
+                    "model_tokens": model_tokens,  # NEW: save token counts
                     "latent_dim": latent_dim,
                 },
                 ckpt_path,
