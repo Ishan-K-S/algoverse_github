@@ -14,7 +14,6 @@ import os
 import numpy as np
 import torch
 from tqdm import tqdm
-#from torchvision.datasets import ImageNet
 from coco_dataset_setup import CocoData
 
 
@@ -24,7 +23,7 @@ from huggingface_hub import login
 login()
 
 
-def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, label: int):
+def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, filename: str):
     """
     path_no_ext: full path without ".npz"
     activation_tnd: (T, N, D) on CPU
@@ -41,7 +40,7 @@ def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, t
         activation=activation_tnd.numpy(),
         sigmas=sigmas_arr,
         timesteps=ts_arr,
-        label=np.asarray(label, dtype=np.int64),
+        filename=filename,
     )
 
 
@@ -51,7 +50,7 @@ def cache_diffusion_activations(
     source_name: str,
     coco_root: str,
     cache_root: str,
-    split: str = "train",
+    #split: str = "train",
     batch_size: int = 4,
     num_workers: int = 8,
 ):
@@ -62,7 +61,8 @@ def cache_diffusion_activations(
       activations (list of (B,N,D)), sigmas(list[float]), timesteps(list[tensor]).
       (This matches your DiffusionActivationExtractor.py.) :contentReference[oaicite:4]{index=4}
     """
-    print(f"[diffusion-cache] source={source_name} split={split}")
+    #print(f"[diffusion-cache] source={source_name} split={split}")
+
     ds = CocoData(coco_root, transform=extractor.preprocess)
 
     dl = torch.utils.data.DataLoader(
@@ -73,8 +73,11 @@ def cache_diffusion_activations(
         pin_memory=True,
     )
 
+    os.makedirs(cache_root, exist_ok=True)
+
     for i, (x, y) in enumerate(tqdm(dl, desc=f"Caching {source_name}", dynamic_ncols=True)):
         # x is already preprocessed tensor from extractor.preprocess
+        #x is images and y is filename
         x = x.to(extractor.device, non_blocking=True)
         y = y.cpu()
 
@@ -92,7 +95,8 @@ def cache_diffusion_activations(
         timesteps = out.timesteps
 
         for j in range(acts_btnd.shape[0]):
-            image_path = image_paths[j][0]  # full path
+            image_path = image_paths[j][0]    # full path
+            filename = image_paths[j]  
             # IMPORTANT: match ImageNet structure in cache root
             # ImageNet root structure is <imagenet_root>/<split>/<class>/<img>.JPEG
             rel_path = os.path.relpath(image_path, dl.dataset.root)
@@ -107,13 +111,13 @@ def cache_diffusion_activations(
                 activation_tnd=acts_btnd[j],
                 sigmas=sigmas,
                 timesteps=timesteps,
-                label=int(y[j].item()),
+                filename=filename,
             )
-
+    print(f"caching complete")
 
 if __name__ == "__main__":
     coco_root = "./REPLACE WITH THE COCO DATA ROOT"
-    cache_root = "./cache_output"
+    cache_root = "./REPLACE WITH CACHE ROOT"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
@@ -128,7 +132,7 @@ if __name__ == "__main__":
         source_name=source_name,
         coco_root=coco_root,
         cache_root=cache_root,
-        split="train",
+        #split="train",
         batch_size=2,
         num_workers=8,
     )
