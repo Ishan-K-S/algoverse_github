@@ -86,7 +86,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
         #y = y.cpu()
 
         # Retrieve batch filenames from the dataset
-        image_paths = data_loader.dataset.samples[i * data_loader.batch_size:(i + 1) * data_loader.batch_size]
+        #image_paths = data_loader.dataset.samples[i * data_loader.batch_size:(i + 1) * data_loader.batch_size]
 
         # Get output features based on model type
         with torch.no_grad():
@@ -110,7 +110,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
         # Loop through each sample in the batch
         for j in range(x.size(0)):
             # Get the corresponding image path
-            image_path = image_paths[j][0]
+            #image_path = image_paths[j][0]
             filename= y[j]
 
             # Convert Coco image path to the corresponding cache path
