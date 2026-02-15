@@ -97,8 +97,8 @@ def train_universal_sae(
     
     Training policy:
       - Pick a random source each batch.
-      - Encode source -> shared latent z.
-      - Decode z into EVERY target model (with token interpolation as needed).
+      - Encode source -> shared latent z (always at canonical token count).
+      - Decode z into EVERY target model (unpooled to target token count).
       - Vision targets compare against (B, N, D).
       - Diffusion targets compare against ONE selected timestep (B, N, D) using that target's sigma.
 
@@ -107,8 +107,7 @@ def train_universal_sae(
         dataloader: DataLoader yielding ((acts_dict, metadata), labels)
         optimizer: Optimizer for model parameters
         diffusion_models: Set of model names that are diffusion/flow models
-        model_tokens: Dict mapping model name -> number of tokens.
-                      Used for interpolation when cross-reconstructing.
+        model_tokens: Dict mapping model name -> number of tokens (for reference, not used in training)
         device: Device to train on
     """
     model.train()
@@ -139,6 +138,7 @@ def train_universal_sae(
                 x_t = x_src[:, t_src]                # (B, N, D)
 
                 _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
+                # z is now (B, shared_latent_tokens, latent_dim) - canonical size
 
                 # Decode to every target
                 for target, x_target in acts.items():
@@ -162,13 +162,13 @@ def train_universal_sae(
                         t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
                         sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
                         
-                        # Decode with source info for token interpolation
-                        x_hat = model.decode(z, target=target, sigma=sigma_tgt, source=source)
+                        # Decode: z is canonical size, unpooled to target token count internally
+                        x_hat = model.decode(z, target=target, sigma=sigma_tgt)
                         
-                        # Get target slice and interpolate if needed for loss computation
+                        # Get target slice
                         x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
                         
-                        # x_hat should already be (B, N_tgt, D_tgt) after decode with interpolation
+                        # x_hat is already (B, N_tgt, D_tgt) after unpooling
                         loss = loss + mse_flat(x_hat, x_target_t)
 
                     else:
@@ -178,8 +178,8 @@ def train_universal_sae(
                                 f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                             )
                         
-                        # Decode with source info for token interpolation
-                        x_hat = model.decode(z, target=target, sigma=None, source=source)
+                        # Decode: z is canonical size, unpooled to target token count internally
+                        x_hat = model.decode(z, target=target, sigma=None)
                         loss = loss + mse_flat(x_hat, x_target)
 
         else:
@@ -192,6 +192,7 @@ def train_universal_sae(
             B, N, D = x_src.shape
 
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
+            # z is now (B, shared_latent_tokens, latent_dim) - canonical size
 
             # Decode to every target, INCLUDING diffusion
             for target, x_target in acts.items():
@@ -215,8 +216,8 @@ def train_universal_sae(
 
                     sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
                     
-                    # Decode with source info for token interpolation
-                    x_hat = model.decode(z, target=target, sigma=sigma_tgt, source=source)
+                    # Decode: z is canonical size, unpooled to target token count internally
+                    x_hat = model.decode(z, target=target, sigma=sigma_tgt)
                     
                     # Get target slice
                     x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
@@ -230,8 +231,8 @@ def train_universal_sae(
                             f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                         )
                     
-                    # Decode with source info for token interpolation
-                    x_hat = model.decode(z, target=target, sigma=None, source=source)
+                    # Decode: z is canonical size, unpooled to target token count internally
+                    x_hat = model.decode(z, target=target, sigma=None)
                     loss = loss + mse_flat(x_hat, x_target)
 
         loss.backward()

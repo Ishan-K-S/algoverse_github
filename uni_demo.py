@@ -136,23 +136,31 @@ if __name__ == "__main__":
     input_shape = _parse_int_field(CONFIG.get("input_shape", 768), "CONFIG.global.input_shape")
     default_latent = exp_factor * input_shape
     latent_dim = _parse_int_field(CONFIG.get("latent_dim", CONFIG.get("nb_components", default_latent)), "CONFIG.global.latent_dim")
+    
+    # NEW: Shared latent tokens (canonical token count)
+    shared_latent_tokens = _parse_int_field(
+        CONFIG.get("shared_latent_tokens", 256), 
+        "CONFIG.global.shared_latent_tokens"
+    )
 
     model = UniversalSAE(
         model_dims=model_dims,
         latent_dim=latent_dim,
         diffusion_models=diffusion_models,
-        model_tokens=model_tokens,  # NEW: pass token counts for interpolation
+        model_tokens=model_tokens,
+        shared_latent_tokens=shared_latent_tokens,  # NEW: pass canonical token count
         timestep_dim=_parse_int_field(CONFIG.get("timestep_dim", 256), "CONFIG.global.timestep_dim"),
         top_k=_parse_int_field(SAE_PARAMS.get("top_k", CONFIG.get("top_k", 32)), "sae_params.top_k"),
         topk_temperature=float(CONFIG.get("topk_temperature", 0.1)),
         use_soft_topk=bool(CONFIG.get("use_soft_topk", True)),
-        interpolation_mode=str(CONFIG.get("interpolation_mode", "bilinear")),  # NEW: configurable
+        interpolation_mode=str(CONFIG.get("interpolation_mode", "bilinear")),
     )
 
     device = str(CONFIG.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
 
     print(f"[model] UniversalSAE created with latent_dim={latent_dim}")
+    print(f"[model] Shared latent tokens: {shared_latent_tokens}")
     print(f"[model] Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ----- Optimizer -----
@@ -193,7 +201,8 @@ if __name__ == "__main__":
                     "run_name": run_name,
                     "diffusion_models": sorted(list(diffusion_models)),
                     "model_dims": model_dims,
-                    "model_tokens": model_tokens,  # NEW: save token counts
+                    "model_tokens": model_tokens,
+                    "shared_latent_tokens": shared_latent_tokens,  # NEW: save canonical token count
                     "latent_dim": latent_dim,
                 },
                 ckpt_path,

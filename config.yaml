@@ -12,12 +12,14 @@ global:
   target_class: "ALL" # or eg. tabby cat, cottontail rabbit etc.
   use_class_tokens: false
   num_tokens: 196 #
+  shared_latent_tokens: 256 # canonical token count in shared latent space (NEW: fixed-size latent)
   loss_criterion: L1
   lr: 0.0003
   final_lr: 1.0e-06
-  # Token interpolation mode for cross-model reconstruction
+  # Token interpolation mode for pooling/unpooling operations
   # Options: "bilinear" (default), "nearest", "bicubic"
-  # Used when source and target models have different token counts
+  # Used to pool all models to shared_latent_tokens before encoding
+  # and unpool from shared_latent_tokens after decoding
   interpolation_mode: bilinear
   run_name: ${model_1}_${model_2}_${model_3}_${model_4}_ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_class-${target_class}_cross_${loss_criterion}_${nb_epochs}epochs_TEST
   diffusion_models: ["SD3", "FLUX"]

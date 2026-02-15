@@ -110,12 +110,18 @@ class UniversalSAE(nn.Module):
     """
     Separate encoder/decoder per model -> shared latent space.
     
-    Now with token interpolation support for cross-model translation
-    when models have different token counts.
+    Now uses a FIXED-SIZE shared latent space where all models are pooled/unpooled
+    to a canonical token count. This ensures:
+    - Consistent sparsity: top-k operates on the same grid for all models
+    - Shared semantics: latent features have the same spatial meaning across models
+
+    Architecture:
+      Input (variable tokens) → Pool to canonical size → Encode → Sparse latent (fixed size) 
+      → Decode → Unpool to target size → Output (variable tokens)
 
     Diffusion-only:
-      x --pre_affine(sigma)--> SAE encoder --> z
-      z --> SAE decoder --> x_hat --post_affine(sigma)--> x_hat_final
+      x --pre_affine(sigma)--> Pool --> SAE encoder --> z (sparse, fixed size)
+      z --> SAE decoder --> Unpool --> x_hat --post_affine(sigma)--> x_hat_final
     """
     def __init__(
         self,
@@ -123,6 +129,7 @@ class UniversalSAE(nn.Module):
         latent_dim: int,
         diffusion_models: Set[str],
         model_tokens: Optional[Dict[str, int]] = None,
+        shared_latent_tokens: int = 256,
         timestep_dim: int = 256,
         top_k: Optional[int] = None,
         topk_temperature: float = 0.1,
@@ -135,7 +142,9 @@ class UniversalSAE(nn.Module):
             latent_dim: Shared latent dimension for all models
             diffusion_models: Set of model names that are diffusion/flow models
             model_tokens: Dict mapping model name -> number of tokens (N).
-                          Required for cross-model token interpolation.
+                          Required for pooling/unpooling operations.
+            shared_latent_tokens: Canonical number of tokens in the shared latent space.
+                                  All models are pooled to this size before encoding.
             timestep_dim: Dimension for timestep embeddings (diffusion only)
             top_k: If set, apply top-k sparsity to latent z
             topk_temperature: Temperature for soft top-k
@@ -147,12 +156,21 @@ class UniversalSAE(nn.Module):
         self.diffusion_models = set(diffusion_models)
         self.model_dims = model_dims
         self.model_tokens = model_tokens or {}
+        self.shared_latent_tokens = shared_latent_tokens
         self.interpolation_mode = interpolation_mode
 
         self.latent_dim = latent_dim
         self.top_k = top_k
         self.topk_temperature = topk_temperature
         self.use_soft_topk = use_soft_topk
+
+        # Validate that all models have token counts specified
+        for name in self.model_names:
+            if name not in self.model_tokens:
+                raise ValueError(
+                    f"Model '{name}' missing from model_tokens. "
+                    f"All models must have token counts specified for fixed-size shared latent."
+                )
 
         self.saes = nn.ModuleDict({k: PerModelSAE(v, latent_dim) for k, v in model_dims.items()})
 
@@ -166,10 +184,6 @@ class UniversalSAE(nn.Module):
             else:
                 self.pre[name] = nn.Identity()
                 self.post[name] = nn.Identity()
-
-    def get_num_tokens(self, model_name: str) -> Optional[int]:
-        """Get the number of tokens for a model, if known."""
-        return self.model_tokens.get(model_name, None)
 
     def apply_topk(self, z: torch.Tensor) -> torch.Tensor:
         if self.top_k is None:
@@ -197,23 +211,37 @@ class UniversalSAE(nn.Module):
         """
         Encode activations from a source model into the shared latent space.
         
+        Now pools input to canonical token count BEFORE encoding to ensure
+        consistent sparse latent representation across all models.
+        
         Args:
-            x: (B, N, D) activations from the source model
+            x: (B, N_src, D) activations from the source model
             source: Name of the source model
             sigma: (B,) noise levels (required for diffusion models)
         
         Returns:
-            z_pre: Pre-activation latent (before ReLU and top-k)
-            z: Final sparse latent representation
+            z_pre: Pre-activation latent (before ReLU and top-k) - (B, shared_latent_tokens, latent_dim)
+            z: Final sparse latent representation - (B, shared_latent_tokens, latent_dim)
         """
-        # diffusion-only: adapt before encoder
+        # diffusion-only: adapt before pooling
         if source in self.diffusion_models:
             assert sigma is not None, f"sigma required for diffusion source '{source}'"
             x = self.pre[source](x, sigma)
 
-        z_pre = self.saes[source].encode_pre(x)
+        # Pool to canonical token count
+        src_tokens = self.model_tokens[source]
+        if src_tokens != self.shared_latent_tokens:
+            x = interpolate_tokens(
+                x,
+                src_tokens=src_tokens,
+                tgt_tokens=self.shared_latent_tokens,
+                mode=self.interpolation_mode,
+            )
+        # x is now (B, shared_latent_tokens, D_src)
+
+        z_pre = self.saes[source].encode_pre(x)  # (B, shared_latent_tokens, latent_dim)
         z = F.relu(z_pre)
-        z = self.apply_topk(z)
+        z = self.apply_topk(z)  # Top-k now operates on consistent grid
         return z_pre, z
 
     def decode(
@@ -221,32 +249,37 @@ class UniversalSAE(nn.Module):
         z: torch.Tensor,
         target: str,
         sigma: Optional[torch.Tensor] = None,
-        source: Optional[str] = None,
+        source: Optional[str] = None,  # No longer needed but kept for API compatibility
     ) -> torch.Tensor:
         """
         Decode from shared latent space to a target model's activation space.
         
-        Handles token interpolation when source and target have different token counts.
+        Now unpools from canonical token count AFTER decoding.
         
         Args:
-            z: (B, N_src, latent_dim) latent representation
+            z: (B, shared_latent_tokens, latent_dim) latent representation
             target: Name of the target model
             sigma: (B,) noise levels (required for diffusion targets)
-            source: Name of the source model (needed for token interpolation)
+            source: DEPRECATED - no longer used since z is always canonical size
         
         Returns:
             x_hat: (B, N_tgt, D_tgt) reconstructed activations
         """
-        # Interpolate tokens if source and target have different token counts
-        if source is not None and source in self.model_tokens and target in self.model_tokens:
-            src_tokens = self.model_tokens[source]
-            tgt_tokens = self.model_tokens[target]
-            if src_tokens != tgt_tokens:
-                z = interpolate_tokens(z, src_tokens, tgt_tokens, mode=self.interpolation_mode)
+        # z is always (B, shared_latent_tokens, latent_dim)
+        x_hat = self.saes[target].decode(z)  # (B, shared_latent_tokens, D_tgt)
         
-        x_hat = self.saes[target].decode(z)
+        # Unpool to target token count
+        tgt_tokens = self.model_tokens[target]
+        if tgt_tokens != self.shared_latent_tokens:
+            x_hat = interpolate_tokens(
+                x_hat,
+                src_tokens=self.shared_latent_tokens,
+                tgt_tokens=tgt_tokens,
+                mode=self.interpolation_mode,
+            )
+        # x_hat is now (B, N_tgt, D_tgt)
         
-        # diffusion-only: adapt after decoder
+        # diffusion-only: adapt after unpooling
         if target in self.diffusion_models:
             assert sigma is not None, f"sigma required for diffusion target '{target}'"
             x_hat = self.post[target](x_hat, sigma)
