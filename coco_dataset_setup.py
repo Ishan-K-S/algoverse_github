@@ -23,11 +23,13 @@ class CocoData(Dataset):
     def __getitem__(self, index):
 
         """Returns a single image as a tuple in the form of (tensor, filename)"""
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
+        
 
         filename = self.images[index]
         image_path = os.path.join(self.path_to_data, filename)
+
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
 
         if self.transform:
             img = self.transform(img)
