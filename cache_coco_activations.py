@@ -32,7 +32,7 @@ def load_tensor_compressed(path):
 
 # Save tensor in NPY format with compression
 def save_tensor_npz(tensors, filename, path):
-    np.savez_compressed(path, activation=tensors[0].numpy(), filename=filename)
+    np.savez_compressed(path, activation=tensors.numpy(), filename=filename)
 
 # Load tensor from NPZ format
 def load_tensor_npz(path):
@@ -135,8 +135,8 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
 
             save_tensor_npz(
                 path=cache_image_path,
-                tensors=(output_features[j].detach().clone(), y[j].detach().clone()),
-                filename = filename
+                activation=(output_features[j].detach()),  #.clone(), y[j].detach().clone()),
+                filename = filename,
             )
     print(f"Caching Complete!")
 
