@@ -148,8 +148,8 @@ if __name__ == '__main__':
     # Select which model to cache (uncomment one)
     
     # Option 1: ViT - Output shape: Bx197x768
-    model = ViT().cuda()
-    model_name = "ViT"
+    #model = ViT().cuda()
+    #model_name = "ViT"
     
     # Option 2: CLIP - Output shape: Bx197x768 (same as ViT)
     # model = CLIP().cuda()
@@ -160,8 +160,8 @@ if __name__ == '__main__':
     # model_name = "SigLIP"
     
     # Option 4: DinoV2 - Output shape: Bx257x384
-    # model = DinoV2().cuda()
-    # model_name = "DinoV2"
+    model = DinoV2().cuda()
+    model_name = "DinoV2"
 
     model.eval()
     
