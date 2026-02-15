@@ -142,8 +142,8 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
 
 if __name__ == '__main__':
     # Configuration
-    coco_root = "/content/coco_data/val2017"
-    path_to_cache = "/content/cache_path"
+    coco_root = "AlgoverseResearchAIJK/coco_data/train2017"
+    path_to_cache = "AlgoverseResearchAIJK/cache_path"
     
     # Select which model to cache (uncomment one)
     
