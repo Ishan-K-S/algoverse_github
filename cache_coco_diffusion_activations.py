@@ -127,11 +127,11 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
-    # extractor = SD3ActivationExtractor(device=device, num_inference_steps=28)
-    # source_name = "SD3"
+    extractor = SD3ActivationExtractor(device=device, num_inference_steps=28)
+    source_name = "SD3"
 
-    extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
-    source_name = "FLUX"
+    #extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
+    #source_name = "FLUX"
 
     cache_diffusion_activations(
         extractor=extractor,
