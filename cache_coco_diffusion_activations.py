@@ -73,16 +73,17 @@ def cache_diffusion_activations(
         pin_memory=True,
     )
 
-    os.makedirs(cache_root, exist_ok=True)
+    #os.makedirs(cache_root, exist_ok=True)
 
     for i, (x, y) in enumerate(tqdm(dl, desc=f"Caching {source_name}", dynamic_ncols=True)):
         # x is already preprocessed tensor from extractor.preprocess
         #x is images and y is filename
         x = x.to(extractor.device, non_blocking=True)
-        y = y.cpu()
+        #y = y.cpu()
 
         # match your vision script’s way of mapping batch indices -> file paths :contentReference[oaicite:5]{index=5}
-        image_paths = dl.dataset.samples[i * dl.batch_size : (i + 1) * dl.batch_size]
+        #image_paths = dl.dataset.samples[i * dl.batch_size : (i + 1) * dl.batch_size]
+        
 
         out = extractor.extract_activations(x)
         # out.activations: list length T, each (B,N,D)
@@ -95,29 +96,34 @@ def cache_diffusion_activations(
         timesteps = out.timesteps
 
         for j in range(acts_btnd.shape[0]):
-            image_path = image_paths[j][0]    # full path
-            filename = image_paths[j]  
+            #image_path = image_paths[j][0]    # full path
+            filename = y[j]  
             # IMPORTANT: match ImageNet structure in cache root
             # ImageNet root structure is <imagenet_root>/<split>/<class>/<img>.JPEG
-            rel_path = os.path.relpath(image_path, dl.dataset.root)
+            """rel_path = os.path.relpath(image_path, dl.dataset.root)
             cache_path = os.path.join(cache_root, rel_path)
             cache_dir = os.path.dirname(cache_path)
             os.makedirs(cache_dir, exist_ok=True)
 
             # .../n014.../n014..._1234.JPEG -> .../n014.../n014..._1234_<source>.npz
-            base = cache_path.replace(".JPEG", f"_{source_name}")
+            base = cache_path.replace(".JPEG", f"_{source_name}")"""
+
+            cache_filename = filename.replace('.jpg', f'_{source_name}.npz')
+            cache_path = os.path.join(cache_root, cache_filename)
+            base = cache_path.replace('.npz', '')
+
             save_diffusion_npz(
                 path_no_ext=base,
                 activation_tnd=acts_btnd[j],
                 sigmas=sigmas,
                 timesteps=timesteps,
-                filename=filename,
+                filename=cache_filename,
             )
     print(f"caching complete")
 
 if __name__ == "__main__":
-    coco_root = "./REPLACE WITH THE COCO DATA ROOT"
-    cache_root = "./REPLACE WITH CACHE ROOT"
+    coco_root = "/content/coco_data/val2017"
+    cache_root = "/content/cache_path"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
