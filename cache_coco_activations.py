@@ -114,6 +114,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
             filename= y[j]
 
             # Convert Coco image path to the corresponding cache path
+            """image_path = os.path.join(f"/{filename}")
             relative_path = os.path.relpath(image_path, data_loader.dataset.root)
             activation_path = os.path.join(path_to_cache, relative_path)
 
@@ -124,10 +125,16 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
             os.makedirs(activation_dir, exist_ok=True)
 
             # Save both the activations and label
-            activation_filename = activation_path.replace('.JPEG', f"_{model_name}")
+            activation_filename = activation_path.replace('.JPEG', f"_{model_name}")"""
+
+            cache_filename = filename.replace('.jpg', f'_{model_name}.npz')
+            cache_filename = cache_filename.replace('.jpeg', f'_{model_name}.npz')
+            cache_filename = cache_filename.replace('.png', f'_{model_name}.npz')
+            
+            cache_image_path = os.path.join(path_to_cache, cache_filename)
 
             save_tensor_npz(
-                path=activation_filename,
+                path=cache_image_path,
                 tensors=(output_features[j].detach().clone(), y[j].detach().clone()),
                 filename = filename
             )
