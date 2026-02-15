@@ -83,7 +83,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
         #x are images, y are filenames
         x, y = batch
         x = x.cuda()
-        y = y.cpu()
+        #y = y.cpu()
 
         # Retrieve batch filenames from the dataset
         image_paths = data_loader.dataset.samples[i * data_loader.batch_size:(i + 1) * data_loader.batch_size]
