@@ -135,7 +135,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
 
             save_tensor_npz(
                 path=cache_image_path,
-                activation=(output_features[j].detach()),  #.clone(), y[j].detach().clone()),
+                tensors=(output_features[j].detach()),  #.clone(), y[j].detach().clone()),
                 filename = filename,
             )
     print(f"Caching Complete!")
