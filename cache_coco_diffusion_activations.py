@@ -122,8 +122,10 @@ def cache_diffusion_activations(
     print(f"caching complete")
 
 if __name__ == "__main__":
-    coco_root = "/content/coco_data/val2017"
-    cache_root = "/content/cache_path"
+    coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
+    cache_root = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
+
+  
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
