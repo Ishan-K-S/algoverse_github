@@ -154,6 +154,9 @@ if __name__ == "__main__":
         topk_temperature=float(CONFIG.get("topk_temperature", 0.1)),
         use_soft_topk=bool(CONFIG.get("use_soft_topk", True)),
         interpolation_mode=str(CONFIG.get("interpolation_mode", "bilinear")),
+        token_reshape_mode=str(CONFIG.get("token_reshape_mode", "interpolation")),
+        attention_heads=_parse_int_field(CONFIG.get("attention_heads", 8), "CONFIG.global.attention_heads"),
+        attention_dropout=float(CONFIG.get("attention_dropout", 0.0)),
     )
 
     device = str(CONFIG.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
@@ -161,6 +164,7 @@ if __name__ == "__main__":
 
     print(f"[model] UniversalSAE created with latent_dim={latent_dim}")
     print(f"[model] Shared latent tokens: {shared_latent_tokens}")
+    print(f"[model] Token reshape mode: {CONFIG.get('token_reshape_mode', 'interpolation')}")
     print(f"[model] Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ----- Optimizer -----
