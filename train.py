@@ -1,4 +1,4 @@
-# train.py (patched with token interpolation)
+# train.py (patched with token interpolation + wandb logging)
 import random
 from typing import Optional, Dict, Set
 
@@ -6,6 +6,12 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -91,6 +97,9 @@ def train_universal_sae(
     diffusion_models: Set[str],
     model_tokens: Optional[Dict[str, int]] = None,
     device: str = "cuda",
+    epoch: int = 0,
+    use_wandb: bool = False,
+    log_every: int = 50,
 ):
     """
     Train the Universal SAE with cross-model reconstruction.
@@ -109,16 +118,22 @@ def train_universal_sae(
         diffusion_models: Set of model names that are diffusion/flow models
         model_tokens: Dict mapping model name -> number of tokens (for reference, not used in training)
         device: Device to train on
+        epoch: Current epoch index (used for wandb step calculation)
+        use_wandb: Whether to log metrics to wandb
+        log_every: Log to wandb every N steps
     """
     model.train()
     diffusion_models = set(diffusion_models)
     model_tokens = model_tokens or {}
 
-    for (acts, meta), _y in tqdm(dataloader, desc="train", dynamic_ncols=True):
+    global_step = epoch * len(dataloader)
+
+    for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         source = random.choice(list(acts.keys()))
 
         optimizer.zero_grad()
         loss = 0.0
+        per_target_losses: Dict[str, float] = {}
 
         if source in diffusion_models:
             # Diffusion source: acts[source] is (B, T, N, D)
@@ -162,14 +177,14 @@ def train_universal_sae(
                         t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
                         sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
                         
-                        # Decode: z is canonical size, unpooled to target token count internally
                         x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                        
-                        # Get target slice
                         x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
                         
-                        # x_hat is already (B, N_tgt, D_tgt) after unpooling
-                        loss = loss + mse_flat(x_hat, x_target_t)
+                        target_loss = mse_flat(x_hat, x_target_t)
+                        loss = loss + target_loss
+                        per_target_losses[f"{source}->{target}"] = (
+                            per_target_losses.get(f"{source}->{target}", 0.0) + target_loss.item()
+                        )
 
                     else:
                         # Vision target: x_target is (B, N, D)
@@ -178,9 +193,12 @@ def train_universal_sae(
                                 f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                             )
                         
-                        # Decode: z is canonical size, unpooled to target token count internally
                         x_hat = model.decode(z, target=target, sigma=None)
-                        loss = loss + mse_flat(x_hat, x_target)
+                        target_loss = mse_flat(x_hat, x_target)
+                        loss = loss + target_loss
+                        per_target_losses[f"{source}->{target}"] = (
+                            per_target_losses.get(f"{source}->{target}", 0.0) + target_loss.item()
+                        )
 
         else:
             # Vision source: acts[source] is (B, N, D)
@@ -216,13 +234,12 @@ def train_universal_sae(
 
                     sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
                     
-                    # Decode: z is canonical size, unpooled to target token count internally
                     x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                    
-                    # Get target slice
                     x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
                     
-                    loss = loss + mse_flat(x_hat, x_target_t)
+                    target_loss = mse_flat(x_hat, x_target_t)
+                    loss = loss + target_loss
+                    per_target_losses[f"{source}->{target}"] = target_loss.item()
 
                 else:
                     # Vision target: (B, N, D)
@@ -231,9 +248,33 @@ def train_universal_sae(
                             f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
                         )
                     
-                    # Decode: z is canonical size, unpooled to target token count internally
                     x_hat = model.decode(z, target=target, sigma=None)
-                    loss = loss + mse_flat(x_hat, x_target)
+                    target_loss = mse_flat(x_hat, x_target)
+                    loss = loss + target_loss
+                    per_target_losses[f"{source}->{target}"] = target_loss.item()
 
         loss.backward()
         optimizer.step()
+
+        # --- wandb logging ---
+        if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
+            log_dict = {
+                "train/total_loss": loss.item() if hasattr(loss, "item") else float(loss),
+                "train/source_model": source,
+                "train/epoch": epoch,
+                "train/global_step": global_step + batch_idx,
+            }
+
+            # Per source->target pair losses
+            for pair, val in per_target_losses.items():
+                safe_key = pair.replace("->", "_to_")
+                log_dict[f"train/loss_{safe_key}"] = val
+
+            # Latent sparsity: fraction of zero activations in z
+            with torch.no_grad():
+                sparsity = (z == 0).float().mean().item()
+            log_dict["train/latent_sparsity"] = sparsity
+
+            wandb.log(log_dict, step=global_step + batch_idx)
+
+    return loss  # return last batch loss for convenience
