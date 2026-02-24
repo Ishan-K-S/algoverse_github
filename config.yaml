@@ -32,6 +32,11 @@ global:
   attention_dropout: 0.0
   run_name: ${model_1}_${model_2}_${model_3}_${model_4}_ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_class-${target_class}_cross_${loss_criterion}_${nb_epochs}epochs_TEST
   diffusion_models: ["SD3", "FLUX"]
+  # --- wandb ---
+  use_wandb: true
+  wandb_project: "universal-sae"   # your wandb project name
+  wandb_entity:                     # your wandb username or team (leave blank to use default)
+  wandb_log_every: 50               # log every N training steps
 viz:
   batch_size: 100
   class_name: "ALL" # or eg. 'hippopotamus'
