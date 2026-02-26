@@ -14,17 +14,16 @@ import os
 import numpy as np
 import torch
 from tqdm import tqdm
-#from torchvision.datasets import ImageNet
 from coco_dataset_setup import CocoData
 
 
 from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor
 
 from huggingface_hub import login
-login()
+login(token="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")
 
 
-def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, label: int):
+def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, filename: str):
     """
     path_no_ext: full path without ".npz"
     activation_tnd: (T, N, D) on CPU
@@ -41,7 +40,7 @@ def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, t
         activation=activation_tnd.numpy(),
         sigmas=sigmas_arr,
         timesteps=ts_arr,
-        label=np.asarray(label, dtype=np.int64),
+        filename=filename,
     )
 
 
@@ -51,7 +50,7 @@ def cache_diffusion_activations(
     source_name: str,
     coco_root: str,
     cache_root: str,
-    split: str = "train",
+    #split: str = "train",
     batch_size: int = 4,
     num_workers: int = 8,
 ):
@@ -62,7 +61,8 @@ def cache_diffusion_activations(
       activations (list of (B,N,D)), sigmas(list[float]), timesteps(list[tensor]).
       (This matches your DiffusionActivationExtractor.py.) :contentReference[oaicite:4]{index=4}
     """
-    print(f"[diffusion-cache] source={source_name} split={split}")
+    #print(f"[diffusion-cache] source={source_name} split={split}")
+
     ds = CocoData(coco_root, transform=extractor.preprocess)
 
     dl = torch.utils.data.DataLoader(
@@ -73,13 +73,17 @@ def cache_diffusion_activations(
         pin_memory=True,
     )
 
+    #os.makedirs(cache_root, exist_ok=True)
+
     for i, (x, y) in enumerate(tqdm(dl, desc=f"Caching {source_name}", dynamic_ncols=True)):
         # x is already preprocessed tensor from extractor.preprocess
+        #x is images and y is filename
         x = x.to(extractor.device, non_blocking=True)
-        y = y.cpu()
+        #y = y.cpu()
 
         # match your vision script’s way of mapping batch indices -> file paths :contentReference[oaicite:5]{index=5}
-        image_paths = dl.dataset.samples[i * dl.batch_size : (i + 1) * dl.batch_size]
+        #image_paths = dl.dataset.samples[i * dl.batch_size : (i + 1) * dl.batch_size]
+        
 
         out = extractor.extract_activations(x)
         # out.activations: list length T, each (B,N,D)
@@ -92,43 +96,51 @@ def cache_diffusion_activations(
         timesteps = out.timesteps
 
         for j in range(acts_btnd.shape[0]):
-            image_path = image_paths[j][0]  # full path
+            #image_path = image_paths[j][0]    # full path
+            filename = y[j]  
             # IMPORTANT: match ImageNet structure in cache root
             # ImageNet root structure is <imagenet_root>/<split>/<class>/<img>.JPEG
-            rel_path = os.path.relpath(image_path, dl.dataset.root)
+            """rel_path = os.path.relpath(image_path, dl.dataset.root)
             cache_path = os.path.join(cache_root, rel_path)
             cache_dir = os.path.dirname(cache_path)
             os.makedirs(cache_dir, exist_ok=True)
 
             # .../n014.../n014..._1234.JPEG -> .../n014.../n014..._1234_<source>.npz
-            base = cache_path.replace(".JPEG", f"_{source_name}")
+            base = cache_path.replace(".JPEG", f"_{source_name}")"""
+
+            cache_filename = filename.replace('.jpg', f'_{source_name}.npz')
+            cache_path = os.path.join(cache_root, cache_filename)
+            base = cache_path.replace('.npz', '')
+
             save_diffusion_npz(
                 path_no_ext=base,
                 activation_tnd=acts_btnd[j],
                 sigmas=sigmas,
                 timesteps=timesteps,
-                label=int(y[j].item()),
+                filename=cache_filename,
             )
-
+    print(f"caching complete")
 
 if __name__ == "__main__":
-    coco_root = "./REPLACE WITH THE COCO DATA ROOT"
-    cache_root = "./cache_output"
+    coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
+    cache_root = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
+
+  
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
-    # extractor = SD3ActivationExtractor(device=device, num_inference_steps=28)
-    # source_name = "SD3"
+    extractor = SD3ActivationExtractor(device=device, num_inference_steps=28)
+    source_name = "SD3"
 
-    extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
-    source_name = "FLUX"
+    #extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
+    #source_name = "FLUX"
 
     cache_diffusion_activations(
         extractor=extractor,
         source_name=source_name,
         coco_root=coco_root,
         cache_root=cache_root,
-        split="train",
+        #split="train",
         batch_size=2,
         num_workers=8,
     )

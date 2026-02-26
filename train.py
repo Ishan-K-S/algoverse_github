@@ -3,6 +3,7 @@ import random
 from typing import Optional, Dict, Set
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
@@ -17,10 +18,10 @@ except ImportError:
 def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     Compute MSE loss between two tensors, flattening the token dimension.
-    
+
     Args:
         a, b: (B, N, D) tensors (must have same shape)
-    
+
     Returns:
         Scalar MSE loss
     """
@@ -32,10 +33,7 @@ def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _ensure_bt(sigmas: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """
-    Ensure sigmas is shaped (B, T).
-    Accepts (T,) or (1, T) or (B, T).
-    """
+    """Ensure sigmas is shaped (B, T). Accepts (T,) or (1, T) or (B, T)."""
     if sigmas.dim() == 1:
         sigmas = sigmas.unsqueeze(0)  # (1, T)
     if sigmas.shape[0] == 1 and batch_size > 1:
@@ -51,11 +49,11 @@ def _get_sigmas_bt(
 ) -> Optional[torch.Tensor]:
     """
     Extract sigmas for a given model from metadata.
-    
+
     Your data.py returns metadata like:
       meta["sigmas"] : (1, T) or (B, T)  (picked from first diffusion source)
       meta["sigmas_by_model"][name] : (1, T) or (B, T)
-    
+
     This helper pulls the best available sigmas for a given model and returns (B, T) on device.
     """
     sig = None
@@ -86,9 +84,10 @@ def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
         return 0
     if t_src_len <= 1:
         return min(t_src, t_tgt_len - 1)
-    # proportional
     return int(round(t_src * (t_tgt_len - 1) / (t_src_len - 1)))
 
+
+# Training loop
 
 def train_universal_sae(
     model,
@@ -96,6 +95,7 @@ def train_universal_sae(
     optimizer,
     diffusion_models: Set[str],
     model_tokens: Optional[Dict[str, int]] = None,
+    attention_stack: Optional[GlobalAttentionStack] = None,
     device: str = "cuda",
     epoch: int = 0,
     use_wandb: bool = False,
@@ -103,13 +103,14 @@ def train_universal_sae(
 ):
     """
     Train the Universal SAE with cross-model reconstruction.
-    
+
     Training policy:
       - Pick a random source each batch.
       - Encode source -> shared latent z (always at canonical token count).
       - Decode z into EVERY target model (unpooled to target token count).
       - Vision targets compare against (B, N, D).
-      - Diffusion targets compare against ONE selected timestep (B, N, D) using that target's sigma.
+      - Diffusion targets compare against ONE selected timestep (B, N, D)
+        using that target's sigma.
 
     Args:
         model: UniversalSAE instance
@@ -123,6 +124,9 @@ def train_universal_sae(
         log_every: Log to wandb every N steps
     """
     model.train()
+    if attention_stack is not None:
+        attention_stack.train()
+
     diffusion_models = set(diffusion_models)
     model_tokens = model_tokens or {}
 
@@ -147,26 +151,27 @@ def train_universal_sae(
                     f"Expected meta['sigmas_by_model'][{source!r}] or meta['sigmas']."
                 )
 
-            # Iterate all timesteps for the source diffusion model
             for t_src in range(Tsrc):
-                sigma_src = src_sigmas_bt[:, t_src]  # (B,)
-                x_t = x_src[:, t_src]                # (B, N, D)
+                sigma_src = src_sigmas_bt[:, t_src]   # (B,)
+                x_t = x_src[:, t_src]                 # (B, N, D)
 
                 _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
                 # z is now (B, shared_latent_tokens, latent_dim) - canonical size
 
-                # Decode to every target
+                # --- Optional global attention over token dimension ---
+                if attention_stack is not None:
+                    z = attention_stack(z)
+
                 for target, x_target in acts.items():
                     x_target = x_target.to(device)
 
                     if target in diffusion_models:
-                        # Diffusion target: x_target is (B, Ttgt, N, D)
                         if x_target.dim() != 4:
                             raise ValueError(
-                                f"Expected diffusion target '{target}' to be (B, T, N, D), got {tuple(x_target.shape)}"
+                                f"Expected diffusion target '{target}' to be (B, T, N, D), "
+                                f"got {tuple(x_target.shape)}"
                             )
                         Ttgt = x_target.shape[1]
-
                         tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
                         if tgt_sigmas_bt is None:
                             raise KeyError(
@@ -187,10 +192,10 @@ def train_universal_sae(
                         )
 
                     else:
-                        # Vision target: x_target is (B, N, D)
                         if x_target.dim() != 3:
                             raise ValueError(
-                                f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
+                                f"Expected vision target '{target}' to be (B, N, D), "
+                                f"got {tuple(x_target.shape)}"
                             )
                         
                         x_hat = model.decode(z, target=target, sigma=None)
@@ -205,22 +210,26 @@ def train_universal_sae(
             x_src = acts[source].to(device)
             if x_src.dim() != 3:
                 raise ValueError(
-                    f"Expected vision source '{source}' to be (B, N, D), got {tuple(x_src.shape)}"
+                    f"Expected vision source '{source}' to be (B, N, D), "
+                    f"got {tuple(x_src.shape)}"
                 )
             B, N, D = x_src.shape
 
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
             # z is now (B, shared_latent_tokens, latent_dim) - canonical size
 
-            # Decode to every target, INCLUDING diffusion
+            # --- Optional global attention over token dimension ---
+            if attention_stack is not None:
+                z = attention_stack(z)
+
             for target, x_target in acts.items():
                 x_target = x_target.to(device)
 
                 if target in diffusion_models:
-                    # Diffusion target: pick a random timestep
                     if x_target.dim() != 4:
                         raise ValueError(
-                            f"Expected diffusion target '{target}' to be (B, T, N, D), got {tuple(x_target.shape)}"
+                            f"Expected diffusion target '{target}' to be (B, T, N, D), "
+                            f"got {tuple(x_target.shape)}"
                         )
                     Ttgt = x_target.shape[1]
                     t_tgt = random.randrange(Ttgt)
@@ -242,10 +251,10 @@ def train_universal_sae(
                     per_target_losses[f"{source}->{target}"] = target_loss.item()
 
                 else:
-                    # Vision target: (B, N, D)
                     if x_target.dim() != 3:
                         raise ValueError(
-                            f"Expected vision target '{target}' to be (B, N, D), got {tuple(x_target.shape)}"
+                            f"Expected vision target '{target}' to be (B, N, D), "
+                            f"got {tuple(x_target.shape)}"
                         )
                     
                     x_hat = model.decode(z, target=target, sigma=None)
