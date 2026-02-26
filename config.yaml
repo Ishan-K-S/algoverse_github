@@ -1,62 +1,60 @@
 global:
-  path_to_cache:  # path to your cached models in form npz
-  combined_npz: true # whether the derived model activations from each image are stored all together in the same npz file (for quicker loading)
-  imagenet_root:  # location of imagenet directory
+  path_to_cache:        # path to your flat cached .npz directory
+  combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
-  exp_factor: 8 # expansion factor of the input shape eg. 8*768=6144
-  input_shape: 768
+  exp_factor: 8         # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
+  input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
   batch_size: 32
-  nb_epochs: 30 # number of epochs
-  standardize: true # standardize activations
-  divide_norm: false # normalize (rather than standardize)
-  target_class: "ALL" # or eg. tabby cat, cottontail rabbit etc.
+  num_workers: 8        # DataLoader worker processes
+  nb_epochs: 30
+  save_every: 5         # save a checkpoint every N epochs
+  standardize: true     # standardise activations (mean=0, std=1)
+  divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
-  num_tokens: 196 #
-  shared_latent_tokens: 256 # canonical token count in shared latent space (NEW: fixed-size latent)
+  num_tokens: 196
+  shared_latent_tokens: 256   # canonical token count in the shared latent space
+  timestep_dim: 256           # dimension of timestep/sigma embeddings (diffusion only)
   loss_criterion: L1
   lr: 0.0003
   final_lr: 1.0e-06
+  weight_decay: 1.0e-05
   # Token interpolation mode for pooling/unpooling operations
   # Options: "bilinear" (default), "nearest", "bicubic"
-  # Used to pool all models to shared_latent_tokens before encoding
-  # and unpool from shared_latent_tokens after decoding
   interpolation_mode: bilinear
   # Token reshape strategy: "interpolation" or "attention"
-  # - interpolation: fast, parameter-free bilinear/nearest/bicubic spatial resampling
-  #   assumes tokens are on a square spatial grid (sqrt(N) x sqrt(N))
-  # - attention: learned cross-attention pooling/unpooling per model
-  #   more expressive but adds parameters and is slower (especially for FLUX 4096 tokens)
   token_reshape_mode: interpolation
   # Attention reshape settings (only used when token_reshape_mode: attention)
   attention_heads: 8
   attention_dropout: 0.0
-  run_name: ${model_1}_${model_2}_${model_3}_${model_4}_ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_class-${target_class}_cross_${loss_criterion}_${nb_epochs}epochs_TEST
+  topk_temperature: 0.1
+  use_soft_topk: true
+  device: cuda           # "cuda" or "cpu"
+  run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_cross_${nb_epochs}epochs
   diffusion_models: ["SD3", "FLUX"]
   # --- wandb ---
   use_wandb: true
-  wandb_project: "universal-sae"   # your wandb project name
-  wandb_entity:                     # your wandb username or team (leave blank to use default)
+  wandb_project: "universal-sae"
+  wandb_entity:                     # your wandb username or team (leave blank for default)
   wandb_log_every: 50               # log every N training steps
 viz:
   batch_size: 100
-  class_name: "ALL" # or eg. 'hippopotamus'
-  sample_size: 5000 # 50000 for all or eg. 500 for subset
-  set: val # default: validation set
+  sample_size: 5000
+  set: val
 sae_params:
-  encoder_module: mlp_bn_1 # batchnorm mlp layer is used in encoder
+  encoder_module: mlp_bn_1
   dictionary_initializer: null
   data_initializer: null
   dictionary_normalization: l2
   top_k: 32
 model_zoo:
-  # Vision encoders - all use 196 tokens (14x14 patches)
-  ViT:    { input_shape: 768, num_tokens: 196, og_model: ViT }
-  CLIP:   { input_shape: 768, num_tokens: 196, og_model: CLIP }
-  SigLIP: { input_shape: 768, num_tokens: 196, og_model: SigLIP }
-  DinoV2: { input_shape: 384, num_tokens: 196, og_model: DinoV2 }
+  # Vision encoders - all produce 196 tokens (14x14 patches, 224x224 input)
+  ViT:    { input_shape: 768,  num_tokens: 196, og_model: ViT }
+  CLIP:   { input_shape: 768,  num_tokens: 196, og_model: CLIP }
+  SigLIP: { input_shape: 768,  num_tokens: 196, og_model: SigLIP }
+  DinoV2: { input_shape: 384,  num_tokens: 196, og_model: DinoV2 }
 
-  # Diffusion/Flow models - different token counts
-  # SD3: 1024 tokens (32x32 patches)
-  # FLUX: 4096 tokens (64x64 patches)
+  # Diffusion/Flow models
+  # SD3:  1024 tokens (32x32 patches), feature dim 1536
+  # FLUX: 4096 tokens (64x64 patches), feature dim 3072
   SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
   FLUX:   { input_shape: 3072, num_tokens: 4096, og_model: FLUX }

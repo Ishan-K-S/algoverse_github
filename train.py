@@ -1,4 +1,4 @@
-# train.py (patched with token interpolation + wandb logging)
+# train.py
 import random
 from typing import Optional, Dict, Set
 
@@ -50,20 +50,15 @@ def _get_sigmas_bt(
     """
     Extract sigmas for a given model from metadata.
 
-    Your data.py returns metadata like:
-      meta["sigmas"] : (1, T) or (B, T)  (picked from first diffusion source)
-      meta["sigmas_by_model"][name] : (1, T) or (B, T)
-
-    This helper pulls the best available sigmas for a given model and returns (B, T) on device.
+    Looks for per-model sigmas first, then falls back to global sigmas.
+    Returns (B, T) on device, or None if not found.
     """
     sig = None
 
-    # Preferred: per-model sigmas
     if isinstance(meta, dict) and "sigmas_by_model" in meta:
         if model_name in meta["sigmas_by_model"]:
             sig = meta["sigmas_by_model"][model_name]
 
-    # Fallback: global sigmas
     if sig is None and isinstance(meta, dict) and "sigmas" in meta:
         sig = meta["sigmas"]
 
@@ -87,15 +82,16 @@ def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     return int(round(t_src * (t_tgt_len - 1) / (t_src_len - 1)))
 
 
+# ---------------------------------------------------------------------------
 # Training loop
+# ---------------------------------------------------------------------------
 
 def train_universal_sae(
-    model,
+    model: nn.Module,
     dataloader,
     optimizer,
     diffusion_models: Set[str],
     model_tokens: Optional[Dict[str, int]] = None,
-    attention_stack: Optional[GlobalAttentionStack] = None,
     device: str = "cuda",
     epoch: int = 0,
     use_wandb: bool = False,
@@ -117,30 +113,31 @@ def train_universal_sae(
         dataloader: DataLoader yielding ((acts_dict, metadata), labels)
         optimizer: Optimizer for model parameters
         diffusion_models: Set of model names that are diffusion/flow models
-        model_tokens: Dict mapping model name -> number of tokens (for reference, not used in training)
+        model_tokens: Dict mapping model name -> number of tokens (informational)
         device: Device to train on
         epoch: Current epoch index (used for wandb step calculation)
         use_wandb: Whether to log metrics to wandb
         log_every: Log to wandb every N steps
     """
     model.train()
-    if attention_stack is not None:
-        attention_stack.train()
 
     diffusion_models = set(diffusion_models)
     model_tokens = model_tokens or {}
 
     global_step = epoch * len(dataloader)
+    last_loss = torch.tensor(0.0)
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         source = random.choice(list(acts.keys()))
 
         optimizer.zero_grad()
-        loss = 0.0
+        loss = torch.tensor(0.0, device=device)
         per_target_losses: Dict[str, float] = {}
 
         if source in diffusion_models:
+            # ----------------------------------------------------------------
             # Diffusion source: acts[source] is (B, T, N, D)
+            # ----------------------------------------------------------------
             x_src = acts[source].to(device)
             B, Tsrc, N, D = x_src.shape
 
@@ -156,11 +153,6 @@ def train_universal_sae(
                 x_t = x_src[:, t_src]                 # (B, N, D)
 
                 _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
-                # z is now (B, shared_latent_tokens, latent_dim) - canonical size
-
-                # --- Optional global attention over token dimension ---
-                if attention_stack is not None:
-                    z = attention_stack(z)
 
                 for target, x_target in acts.items():
                     x_target = x_target.to(device)
@@ -175,21 +167,18 @@ def train_universal_sae(
                         tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
                         if tgt_sigmas_bt is None:
                             raise KeyError(
-                                f"Target '{target}' is diffusion but sigmas not found in metadata. "
-                                f"Expected meta['sigmas_by_model'][{target!r}] or meta['sigmas']."
+                                f"Target '{target}' is diffusion but sigmas not found in metadata."
                             )
 
                         t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
-                        sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
-                        
+                        sigma_tgt = tgt_sigmas_bt[:, t_tgt]
                         x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                        x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
-                        
+                        x_target_t = x_target[:, t_tgt]
+
                         target_loss = mse_flat(x_hat, x_target_t)
                         loss = loss + target_loss
-                        per_target_losses[f"{source}->{target}"] = (
-                            per_target_losses.get(f"{source}->{target}", 0.0) + target_loss.item()
-                        )
+                        key = f"{source}->{target}"
+                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
 
                     else:
                         if x_target.dim() != 3:
@@ -197,30 +186,25 @@ def train_universal_sae(
                                 f"Expected vision target '{target}' to be (B, N, D), "
                                 f"got {tuple(x_target.shape)}"
                             )
-                        
                         x_hat = model.decode(z, target=target, sigma=None)
                         target_loss = mse_flat(x_hat, x_target)
                         loss = loss + target_loss
-                        per_target_losses[f"{source}->{target}"] = (
-                            per_target_losses.get(f"{source}->{target}", 0.0) + target_loss.item()
-                        )
+                        key = f"{source}->{target}"
+                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
 
         else:
+            # ----------------------------------------------------------------
             # Vision source: acts[source] is (B, N, D)
+            # ----------------------------------------------------------------
             x_src = acts[source].to(device)
             if x_src.dim() != 3:
                 raise ValueError(
                     f"Expected vision source '{source}' to be (B, N, D), "
                     f"got {tuple(x_src.shape)}"
                 )
-            B, N, D = x_src.shape
+            B = x_src.shape[0]
 
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
-            # z is now (B, shared_latent_tokens, latent_dim) - canonical size
-
-            # --- Optional global attention over token dimension ---
-            if attention_stack is not None:
-                z = attention_stack(z)
 
             for target, x_target in acts.items():
                 x_target = x_target.to(device)
@@ -237,15 +221,13 @@ def train_universal_sae(
                     tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
                     if tgt_sigmas_bt is None:
                         raise KeyError(
-                            f"Target '{target}' is diffusion but sigmas not found in metadata. "
-                            f"Expected meta['sigmas_by_model'][{target!r}] or meta['sigmas']."
+                            f"Target '{target}' is diffusion but sigmas not found in metadata."
                         )
 
-                    sigma_tgt = tgt_sigmas_bt[:, t_tgt]  # (B,)
-                    
+                    sigma_tgt = tgt_sigmas_bt[:, t_tgt]
                     x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                    x_target_t = x_target[:, t_tgt]  # (B, N_tgt, D_tgt)
-                    
+                    x_target_t = x_target[:, t_tgt]
+
                     target_loss = mse_flat(x_hat, x_target_t)
                     loss = loss + target_loss
                     per_target_losses[f"{source}->{target}"] = target_loss.item()
@@ -256,7 +238,6 @@ def train_universal_sae(
                             f"Expected vision target '{target}' to be (B, N, D), "
                             f"got {tuple(x_target.shape)}"
                         )
-                    
                     x_hat = model.decode(z, target=target, sigma=None)
                     target_loss = mse_flat(x_hat, x_target)
                     loss = loss + target_loss
@@ -264,26 +245,26 @@ def train_universal_sae(
 
         loss.backward()
         optimizer.step()
+        last_loss = loss
 
-        # --- wandb logging ---
+        # ----------------------------------------------------------------
+        # wandb logging
+        # ----------------------------------------------------------------
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
             log_dict = {
-                "train/total_loss": loss.item() if hasattr(loss, "item") else float(loss),
+                "train/total_loss": loss.item(),
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step + batch_idx,
             }
-
-            # Per source->target pair losses
             for pair, val in per_target_losses.items():
                 safe_key = pair.replace("->", "_to_")
                 log_dict[f"train/loss_{safe_key}"] = val
 
-            # Latent sparsity: fraction of zero activations in z
             with torch.no_grad():
                 sparsity = (z == 0).float().mean().item()
             log_dict["train/latent_sparsity"] = sparsity
 
             wandb.log(log_dict, step=global_step + batch_idx)
 
-    return loss  # return last batch loss for convenience
+    return last_loss
