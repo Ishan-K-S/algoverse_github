@@ -34,7 +34,7 @@ from train import train_universal_sae
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = "YOUR_WANDB_API_KEY_HERE"  # <-- replace with your key
+WANDB_API_KEY = "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"  # <-- replace with your key
 
 try:
     import wandb
