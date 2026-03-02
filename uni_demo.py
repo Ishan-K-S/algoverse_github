@@ -97,6 +97,57 @@ def _expand_run_name(
     return out
 
 
+from torch.utils.data.dataloader import default_collate
+
+
+def custom_collate(batch):
+    """
+    Collate that handles the ((acts_dict, metadata), label) structure returned
+    by CocoActivationDataset when return_metadata=True.
+
+    The default collate crashes because metadata contains:
+      - dict[str, Tensor]  (sigmas_by_model, timesteps_by_model)
+      - list[str]          (diffusion_sources)
+      - int                (index)
+    We handle each case explicitly.
+    """
+    first = batch[0]
+    # Check if this is the (acts, metadata) tuple path
+    if not (isinstance(first[0], tuple) and len(first[0]) == 2):
+        return default_collate(batch)
+
+    acts_list  = [item[0][0] for item in batch]
+    meta_list  = [item[0][1] for item in batch]
+    labels     = [item[1]    for item in batch]
+
+    # Collate activations: dict[str, Tensor] -> dict[str, (B, ...)]
+    acts_batch = {k: torch.stack([a[k] for a in acts_list], dim=0) for k in acts_list[0]}
+
+    # Collate metadata field by field
+    meta_batch: Dict[str, Any] = {}
+    for k in meta_list[0]:
+        vals = [m[k] for m in meta_list]
+        if isinstance(vals[0], torch.Tensor):
+            # sigmas / timesteps stored as (1, T) -> cat to (B, T)
+            meta_batch[k] = torch.cat(vals, dim=0)
+        elif isinstance(vals[0], dict):
+            # sigmas_by_model / timesteps_by_model: dict[model, (1,T)] -> dict[model, (B,T)]
+            inner_keys = vals[0].keys()
+            meta_batch[k] = {
+                ik: torch.cat([v[ik] for v in vals], dim=0)
+                for ik in inner_keys
+                if all(ik in v for v in vals)
+            }
+        elif isinstance(vals[0], list):
+            # diffusion_sources: identical across samples, just keep first
+            meta_batch[k] = vals[0]
+        else:
+            # index (int) etc. — keep as list
+            meta_batch[k] = vals
+
+    return (acts_batch, meta_batch), default_collate(labels)
+
+
 def _require_nonempty(cfg: Dict[str, Any], key: str) -> str:
     v = cfg.get(key, None)
     if v is None or (isinstance(v, str) and len(v.strip()) == 0):
@@ -180,6 +231,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=_parse_int_field(CONFIG.get("num_workers", 8),   "CONFIG.global.num_workers"),
         pin_memory=True,
+        collate_fn=custom_collate,
     )
 
     # ----- Build UniversalSAE -----

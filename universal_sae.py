@@ -351,8 +351,10 @@ class UniversalSAE(nn.Module):
 
         if self.use_soft_topk:
             # soft mask around kth value threshold
-            k_index = z.shape[-1] - self.top_k
-            thr = torch.kthvalue(z, k_index + 1, dim=-1, keepdim=True).values
+            # kthvalue requires k in [1, latent_dim]; clamp so top_k <= latent_dim is safe
+            k_index = max(0, z.shape[-1] - self.top_k)
+            k = max(1, k_index + 1)
+            thr = torch.kthvalue(z, k, dim=-1, keepdim=True).values
             mask = torch.sigmoid((z - thr) / self.topk_temperature)
             return z * mask
 

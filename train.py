@@ -261,9 +261,12 @@ def train_universal_sae(
                 safe_key = pair.replace("->", "_to_")
                 log_dict[f"train/loss_{safe_key}"] = val
 
-            with torch.no_grad():
-                sparsity = (z == 0).float().mean().item()
-            log_dict["train/latent_sparsity"] = sparsity
+            try:
+                with torch.no_grad():
+                    sparsity = (z == 0).float().mean().item()
+                log_dict["train/latent_sparsity"] = sparsity
+            except NameError:
+                pass  # z not defined if no forward pass ran (shouldn't happen)
 
             wandb.log(log_dict, step=global_step + batch_idx)
 
