@@ -1,5 +1,5 @@
 global:
-  path_to_cache:        # path to your flat cached .npz directory
+  path_to_cache: "/lambda/nfs/AlgoverseResearchAIJK/combined_path"       # path to your flat cached .npz directory
   combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
   exp_factor: 8         # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
@@ -48,9 +48,9 @@ sae_params:
   top_k: 32
 model_zoo:
   # Vision encoders - all produce 196 tokens (14x14 patches, 224x224 input)
-  ViT:    { input_shape: 768,  num_tokens: 196, og_model: ViT }
-  CLIP:   { input_shape: 768,  num_tokens: 196, og_model: CLIP }
-  SigLIP: { input_shape: 768,  num_tokens: 196, og_model: SigLIP }
+  #ViT:    { input_shape: 768,  num_tokens: 196, og_model: ViT }
+  #CLIP:   { input_shape: 768,  num_tokens: 196, og_model: CLIP }
+  #SigLIP: { input_shape: 768,  num_tokens: 196, og_model: SigLIP }
   DinoV2: { input_shape: 384,  num_tokens: 196, og_model: DinoV2 }
 
   # Diffusion/Flow models
