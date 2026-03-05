@@ -28,7 +28,7 @@ from train import train_universal_sae
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = ""  # Set your key here or via WANDB_API_KEY env variable
+WANDB_API_KEY = "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"  # Set your key here or via WANDB_API_KEY env variable
 
 try:
     import wandb
