@@ -92,17 +92,24 @@ def train_universal_sae(
     epoch: int = 0,
     use_wandb: bool = False,
     log_every: int = 50,
+    pair_ema: Optional[Dict[str, float]] = None,
+    ema_alpha: float = 0.1,
+    curriculum_epochs: int = 2,
+    curriculum_self_only: bool = True,
+    balanced_sources: bool = True,
 ):
     """
-    Train the Universal SAE with cross-model reconstruction.
+    Train the Universal SAE with optional self/cross reconstruction.
 
-    Training policy:
-      - Pick a random source each batch.
-      - Encode source -> shared latent z (always at canonical token count).
-      - Decode z into EVERY target model (unpooled to target token count).
-      - Vision targets compare against (B, N, D).
-      - Diffusion targets compare against ONE selected timestep (B, N, D)
-        using that target's sigma.
+    Each batch can be balanced across sources, and early epochs can
+    run curriculum warm start with self-reconstruction only.
+
+    - Encode source activations to shared latent z.
+    - Decode z to every target model for loss computation.
+    - For vision targets: compare full (B, N, D) output.
+    - For diffusion targets: compare one timestep (B, N, D) with sigma.
+    - Per source->target pair: aggregate loss, normalize by term count,
+      and scale by running EMA.
 
     Args:
         model: UniversalSAE instance
@@ -120,6 +127,9 @@ def train_universal_sae(
     diffusion_models = set(diffusion_models)
     model_tokens = model_tokens or {}
 
+    if pair_ema is None:
+        pair_ema = {}
+
     cross_weight = 2.0
     self_weight = 1.0
 
@@ -130,39 +140,115 @@ def train_universal_sae(
     last_loss = torch.tensor(0.0)
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
-        source = random.choice(list(acts.keys()))
-
         optimizer.zero_grad()
-        loss = torch.tensor(0.0, device=device)
+
+        source_list = sorted(list(acts.keys()))
+        if balanced_sources:
+            active_sources = source_list
+        else:
+            active_sources = [source_list[batch_idx % len(source_list)]]
+
+        allow_cross = (epoch >= curriculum_epochs) if curriculum_self_only else True
+
+        pair_loss_tensors: Dict[str, torch.Tensor] = {}
+        pair_term_count: Dict[str, int] = {}
         per_target_losses: Dict[str, float] = {}
 
-        if source in diffusion_models:
-            # ----------------------------------------------------------------
-            # Diffusion source: acts[source] is (B, T, N, D)
-            # ----------------------------------------------------------------
-            x_src = acts[source].to(device)
+        for source in active_sources:
+            if source not in acts:
+                continue
 
-            if x_src.dim() != 4:
-                raise ValueError(
-                    f"Expected diffusion source '{source}' to be (B, T, N, D), "
-                    f"got {tuple(x_src.shape)}"
-                )
+            if source in diffusion_models:
+                # ----------------------------------------------------------------
+                # Diffusion source: acts[source] is (B, T, N, D)
+                # ----------------------------------------------------------------
+                x_src = acts[source].to(device)
 
-            B, Tsrc, N, D = x_src.shape
+                if x_src.dim() != 4:
+                    raise ValueError(
+                        f"Expected diffusion source '{source}' to be (B, T, N, D), "
+                        f"got {tuple(x_src.shape)}"
+                    )
 
-            src_sigmas_bt = _get_sigmas_bt(meta, source, B, device)
-            if src_sigmas_bt is None:
-                raise KeyError(
-                    f"Source '{source}' is diffusion but sigmas not found in metadata. "
-                    f"Expected meta['sigmas_by_model'][{source!r}] or meta['sigmas']."
-                )
+                B, Tsrc, N, D = x_src.shape
 
-            for t_src in range(Tsrc):
-                sigma_src = src_sigmas_bt[:, t_src]
-                x_t = x_src[:, t_src]
-                _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
+                src_sigmas_bt = _get_sigmas_bt(meta, source, B, device)
+                if src_sigmas_bt is None:
+                    raise KeyError(
+                        f"Source '{source}' is diffusion but sigmas not found in metadata. "
+                        f"Expected meta['sigmas_by_model'][{source!r}] or meta['sigmas']."
+                    )
+
+                for t_src in range(Tsrc):
+                    sigma_src = src_sigmas_bt[:, t_src]
+                    x_t = x_src[:, t_src]
+                    _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
+
+                    for target, x_target in acts.items():
+                        if source != target and not allow_cross:
+                            continue
+
+                        x_target = x_target.to(device)
+
+                        if target in diffusion_models:
+                            if x_target.dim() != 4:
+                                raise ValueError(
+                                    f"Expected diffusion target '{target}' to be (B, T, N, D), "
+                                    f"got {tuple(x_target.shape)}"
+                                )
+
+                            Ttgt = x_target.shape[1]
+                            tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
+                            if tgt_sigmas_bt is None:
+                                raise KeyError(
+                                    f"Target '{target}' is diffusion but sigmas not found in metadata."
+                                )
+
+                            t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
+                            sigma_tgt = tgt_sigmas_bt[:, t_tgt]
+
+                            x_hat = model.decode(z, target=target, sigma=sigma_tgt)
+                            x_target_t = x_target[:, t_tgt]
+
+                            target_loss = mse_flat(x_hat, x_target_t)
+                        else:
+                            if x_target.dim() != 3:
+                                raise ValueError(
+                                    f"Expected vision target '{target}' to be (B, N, D), "
+                                    f"got {tuple(x_target.shape)}"
+                                )
+
+                            x_hat = model.decode(z, target=target, sigma=None)
+                            target_loss = mse_flat(x_hat, x_target)
+
+                        w = cross_weight if source != target else self_weight
+                        weighted_target_loss = w * target_loss
+
+                        key = f"{source}->{target}"
+                        pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
+                        pair_term_count[key] = pair_term_count.get(key, 0) + 1
+                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
+
+            else:
+                # ----------------------------------------------------------------
+                # Vision source: acts[source] is (B, N, D)
+                # ----------------------------------------------------------------
+                x_src = acts[source].to(device)
+
+                if x_src.dim() != 3:
+                    raise ValueError(
+                        f"Expected vision source '{source}' to be (B, N, D), "
+                        f"got {tuple(x_src.shape)}"
+                    )
+
+                B = x_src.shape[0]
+
+                _z_pre, z = model.encode(x_src, source=source, sigma=None)
 
                 for target, x_target in acts.items():
+                    if source != target and not allow_cross:
+                        continue
+
                     x_target = x_target.to(device)
 
                     if target in diffusion_models:
@@ -173,25 +259,19 @@ def train_universal_sae(
                             )
 
                         Ttgt = x_target.shape[1]
+                        t_tgt = random.randrange(Ttgt)
+
                         tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
                         if tgt_sigmas_bt is None:
                             raise KeyError(
                                 f"Target '{target}' is diffusion but sigmas not found in metadata."
                             )
 
-                        t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
                         sigma_tgt = tgt_sigmas_bt[:, t_tgt]
-
                         x_hat = model.decode(z, target=target, sigma=sigma_tgt)
                         x_target_t = x_target[:, t_tgt]
 
                         target_loss = mse_flat(x_hat, x_target_t)
-                        w = cross_weight if source != target else self_weight
-                        loss = loss + w * target_loss
-
-                        key = f"{source}->{target}"
-                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
-
                     else:
                         if x_target.dim() != 3:
                             raise ValueError(
@@ -202,71 +282,25 @@ def train_universal_sae(
                         x_hat = model.decode(z, target=target, sigma=None)
                         target_loss = mse_flat(x_hat, x_target)
 
-                        w = cross_weight if source != target else self_weight
-                        loss = loss + w * target_loss
-
-                        key = f"{source}->{target}"
-                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
-
-        else:
-            # ----------------------------------------------------------------
-            # Vision source: acts[source] is (B, N, D)
-            # ----------------------------------------------------------------
-            x_src = acts[source].to(device)
-
-            if x_src.dim() != 3:
-                raise ValueError(
-                    f"Expected vision source '{source}' to be (B, N, D), "
-                    f"got {tuple(x_src.shape)}"
-                )
-
-            B = x_src.shape[0]
-
-            _z_pre, z = model.encode(x_src, source=source, sigma=None)
-
-            for target, x_target in acts.items():
-                x_target = x_target.to(device)
-
-                if target in diffusion_models:
-                    if x_target.dim() != 4:
-                        raise ValueError(
-                            f"Expected diffusion target '{target}' to be (B, T, N, D), "
-                            f"got {tuple(x_target.shape)}"
-                        )
-
-                    Ttgt = x_target.shape[1]
-                    t_tgt = random.randrange(Ttgt)
-
-                    tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
-                    if tgt_sigmas_bt is None:
-                        raise KeyError(
-                            f"Target '{target}' is diffusion but sigmas not found in metadata."
-                        )
-
-                    sigma_tgt = tgt_sigmas_bt[:, t_tgt]
-                    x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                    x_target_t = x_target[:, t_tgt]
-
-                    target_loss = mse_flat(x_hat, x_target_t)
                     w = cross_weight if source != target else self_weight
-                    loss = loss + w * target_loss
+                    weighted_target_loss = w * target_loss
 
-                    per_target_losses[f"{source}->{target}"] = target_loss.item()
+                    key = f"{source}->{target}"
+                    pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
+                    pair_term_count[key] = pair_term_count.get(key, 0) + 1
+                    per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
 
-                else:
-                    if x_target.dim() != 3:
-                        raise ValueError(
-                            f"Expected vision target '{target}' to be (B, N, D), "
-                            f"got {tuple(x_target.shape)}"
-                        )
+        loss = torch.tensor(0.0, device=device)
+        for key, pt_loss in pair_loss_tensors.items():
+            count = pair_term_count.get(key, 1)
+            normalized_pt_loss = pt_loss / float(count)
 
-                    x_hat = model.decode(z, target=target, sigma=None)
-                    target_loss = mse_flat(x_hat, x_target)
+            ema_prev = pair_ema.get(key, normalized_pt_loss.item())
+            pair_ema[key] = ema_alpha * normalized_pt_loss.item() + (1.0 - ema_alpha) * ema_prev
 
-                    w = cross_weight if source != target else self_weight
-                    loss = loss + w * target_loss
+            loss = loss + normalized_pt_loss / (pair_ema[key] + 1e-8)
 
-                    per_target_losses[f"{source}->{target}"] = target_loss.item()
+        last_loss = loss
 
         loss.backward()
         optimizer.step()
@@ -302,4 +336,4 @@ def train_universal_sae(
 
             wandb.log(log_dict, step=global_step_actual)
 
-    return last_loss
+    return last_loss, pair_ema

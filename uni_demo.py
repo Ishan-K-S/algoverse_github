@@ -162,7 +162,7 @@ if __name__ == "__main__":
         cache_root=cache_root,
         sources=sources,
         combined_npz=combined_npz,
-        standardize=bool(CONFIG.get("standardize", False)),
+        standardize=bool(CONFIG.get("standardize", True)),
         divide_norm=bool(CONFIG.get("divide_norm", False)),
         use_class_tokens=bool(CONFIG.get("use_class_tokens", True)),
         return_metadata=combined_npz,   # metadata (sigmas) only available in combined files
@@ -252,10 +252,12 @@ if __name__ == "__main__":
     save_every = _parse_int_field(CONFIG.get("save_every", 5), "CONFIG.global.save_every")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    pair_ema: Dict[str, float] = {}
+
     for epoch in range(nb_epochs):
         t0 = time.time()
 
-        train_universal_sae(
+        last_loss, pair_ema = train_universal_sae(
             model=model,
             dataloader=dataloader,
             optimizer=optimizer,
@@ -265,6 +267,11 @@ if __name__ == "__main__":
             epoch=epoch,
             use_wandb=use_wandb,
             log_every=log_every,
+            pair_ema=pair_ema,
+            ema_alpha=float(CONFIG.get("ema_alpha", 0.1)),
+            curriculum_epochs=int(CONFIG.get("curriculum_epochs", 2)),
+            curriculum_self_only=bool(CONFIG.get("curriculum_self_only", True)),
+            balanced_sources=bool(CONFIG.get("balanced_sources", True)),
         )
 
         scheduler.step()
