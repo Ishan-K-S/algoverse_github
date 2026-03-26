@@ -30,7 +30,7 @@ def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, t
     sigmas: list[float] length T
     timesteps: list[torch.Tensor] length T (each scalar tensor)
     """
-    sigmas_arr = np.asarray(sigmas, dtype=np.float32)[None, :]
+    sigmas_arr = np.asarray(sigmas, dtype=np.float32)
     # timesteps might be torch scalar tensors; convert safely to int64
     ts_arr = np.asarray([int(t.item()) for t in timesteps], dtype=np.int64)
     if activation_tnd.dtype == torch.bfloat16:
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
-    extractor = SD3ActivationExtractor(device=device, num_inference_steps=4)
+    extractor = SD3ActivationExtractor(device=device, num_inference_steps=28)
     source_name = "SD3"
 
     #extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
