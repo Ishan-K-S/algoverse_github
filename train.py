@@ -227,7 +227,6 @@ def train_universal_sae(
                         key = f"{source}->{target}"
                         pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
                         pair_term_count[key] = pair_term_count.get(key, 0) + 1
-                        per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
 
             else:
                 # ----------------------------------------------------------------
@@ -288,9 +287,9 @@ def train_universal_sae(
                     key = f"{source}->{target}"
                     pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
                     pair_term_count[key] = pair_term_count.get(key, 0) + 1
-                    per_target_losses[key] = per_target_losses.get(key, 0.0) + target_loss.item()
 
         loss = torch.tensor(0.0, device=device)
+        per_target_losses = {}
         for key, pt_loss in pair_loss_tensors.items():
             count = pair_term_count.get(key, 1)
             normalized_pt_loss = pt_loss / float(count)
@@ -298,7 +297,10 @@ def train_universal_sae(
             ema_prev = pair_ema.get(key, normalized_pt_loss.item())
             pair_ema[key] = ema_alpha * normalized_pt_loss.item() + (1.0 - ema_alpha) * ema_prev
 
-            loss = loss + normalized_pt_loss / (pair_ema[key] + 1e-8)
+            scaled_pair_loss = normalized_pt_loss / (pair_ema[key] + 1e-8)
+            loss = loss + scaled_pair_loss
+
+            per_target_losses[key] = scaled_pair_loss.item()
 
         last_loss = loss
 
