@@ -94,7 +94,7 @@ def train_universal_sae(
     log_every: int = 50,
     pair_ema: Optional[Dict[str, float]] = None,
     ema_alpha: float = 0.1,
-    curriculum_epochs: int = 2,
+    curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = True,
 ):
