@@ -125,8 +125,6 @@ def train_universal_sae(
     diffusion_models = set(diffusion_models)
     model_tokens = model_tokens or {}
 
-    if pair_ema is None:
-        pair_ema = {}
 
     cross_weight = 2.0
     self_weight = 1.0
