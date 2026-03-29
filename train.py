@@ -294,13 +294,9 @@ def train_universal_sae(
             count = pair_term_count.get(key, 1)
             normalized_pt_loss = pt_loss / float(count)
 
-            ema_prev = pair_ema.get(key, normalized_pt_loss.item())
-            pair_ema[key] = ema_alpha * normalized_pt_loss.item() + (1.0 - ema_alpha) * ema_prev
+            loss = loss + normalized_pt_loss
 
-            scaled_pair_loss = normalized_pt_loss / (pair_ema[key] + 1e-8)
-            loss = loss + scaled_pair_loss
-
-            per_target_losses[key] = scaled_pair_loss.item()
+            per_target_losses[key] = normalized_pt_loss.item()
 
         last_loss = loss
 
