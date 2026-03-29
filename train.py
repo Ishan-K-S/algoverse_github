@@ -330,4 +330,4 @@ def train_universal_sae(
 
             wandb.log(log_dict, step=global_step_actual)
 
-    return last_loss, pair_ema
+    return last_loss
