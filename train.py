@@ -323,8 +323,13 @@ def train_universal_sae(
 
             try:
                 with torch.no_grad():
-                    sparsity = (z == 0).float().mean().item()
+                    topk_vals, _ = torch.topk(z, model.top_k, dim=-1)
+                    threshold = topk_vals[..., -1:]  # kth largest value
+                    sparsity = (z < threshold).float().mean().item()
+                    # Also log true active fraction
+                    active_frac = model.top_k / z.shape[-1]
                 log_dict["train/latent_sparsity"] = sparsity
+                log_dict["train/active_frac"] = active_frac
             except NameError:
                 pass
 
