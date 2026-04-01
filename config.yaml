@@ -27,7 +27,7 @@ global:
   attention_heads: 8
   attention_dropout: 0.0
   topk_temperature: 0.1
-  use_soft_topk: true
+  use_soft_topk: false
   device: cuda           # "cuda" or "cpu"
   run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_cross_${nb_epochs}epochs
   diffusion_models: ["SD3", "FLUX"]
