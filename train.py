@@ -297,6 +297,23 @@ def train_universal_sae(
         last_loss = loss
 
         loss.backward()
+
+        # ── Grad norms (must be computed BEFORE optimizer.step) ──────────
+        sd3_pooler_grad = None
+        sd3_sae_grad = None
+        if hasattr(model, "token_poolers") and "SD3" in model.token_poolers:
+            sd3_pooler_grad = sum(
+                p.grad.norm().item()
+                for p in model.token_poolers["SD3"].parameters()
+                if p.grad is not None
+            )
+        if hasattr(model, "saes") and "SD3" in model.saes:
+            sd3_sae_grad = sum(
+                p.grad.norm().item()
+                for p in model.saes["SD3"].parameters()
+                if p.grad is not None
+            )
+
         optimizer.step()
         last_loss = loss
 
@@ -321,12 +338,25 @@ def train_universal_sae(
                 safe_key = pair.replace("->", "_to_")
                 log_dict[f"train/loss_{safe_key}"] = val
 
+            # Sparsity: fraction of latent dims below top-k threshold (per token)
             try:
                 with torch.no_grad():
-                    sparsity = (z == 0).float().mean().item()
+                    topk_vals, _ = torch.topk(z, model.top_k, dim=-1)
+                    threshold = topk_vals[..., -1:]
+                    sparsity = (z < threshold).float().mean().item()
+                    active_frac = model.top_k / z.shape[-1]
                 log_dict["train/latent_sparsity"] = sparsity
-            except NameError:
+                log_dict["train/active_frac"] = active_frac
+            except (NameError, Exception):
                 pass
+
+            # Grad norms
+            if sd3_pooler_grad is not None:
+                log_dict["train/sd3_pooler_grad_norm"] = sd3_pooler_grad
+            if sd3_sae_grad is not None:
+                log_dict["train/sd3_sae_grad_norm"] = sd3_sae_grad
+            if sd3_pooler_grad and sd3_sae_grad:
+                log_dict["train/sd3_pooler_sae_grad_ratio"] = sd3_pooler_grad / sd3_sae_grad
 
             wandb.log(log_dict, step=global_step_actual)
 
