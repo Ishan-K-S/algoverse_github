@@ -232,11 +232,28 @@ if __name__ == "__main__":
         },allow_val_change=True)
 
     # ----- Optimizer -----
+    # Poolers/unpoolers get 10x higher LR to compensate for gradient starvation
+    # (they receive ~10x weaker gradients than SAE layers due to the long backprop chain)
+    base_lr = float(CONFIG.get("lr", 3e-4))
+    pooler_lr = base_lr * 10
+    weight_decay = float(CONFIG.get("weight_decay", 1e-5))
+
+    pooler_params   = list(model.token_poolers.parameters())   if hasattr(model, "token_poolers")   else []
+    unpooler_params = list(model.token_unpoolers.parameters()) if hasattr(model, "token_unpoolers") else []
+    pooler_param_ids = {id(p) for p in pooler_params + unpooler_params}
+    rest_params = [p for p in model.parameters() if id(p) not in pooler_param_ids]
+
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=float(CONFIG.get("lr", 3e-4)),
-        weight_decay=float(CONFIG.get("weight_decay", 1e-5)),
+        [
+            {"params": pooler_params,   "lr": pooler_lr, "initial_lr": pooler_lr},
+            {"params": unpooler_params, "lr": pooler_lr, "initial_lr": pooler_lr},
+            {"params": rest_params,     "lr": base_lr,   "initial_lr": base_lr},
+        ],
+        weight_decay=weight_decay,
     )
+    print(f"[optim] base_lr={base_lr:.2e}  pooler_lr={pooler_lr:.2e}"
+          f"  pooler_params={len(pooler_params)}  unpooler_params={len(unpooler_params)}"
+          f"  rest_params={len(rest_params)}")
 
     # ----- LR scheduler (cosine decay to final_lr) -----
     nb_epochs  = _parse_int_field(CONFIG.get("nb_epochs", 1),    "CONFIG.global.nb_epochs")
