@@ -149,8 +149,10 @@ class GlobalAttentionReshape(nn.Module):
         self.dim = dim
 
         # Learned query embeddings - one per output token
-        # These are fixed positional queries, not derived from the input
-        self.queries = nn.Parameter(torch.randn(1, tgt_tokens, dim) * 0.02)
+        # Scaled init (dim**-0.5) keeps attention logits in a reasonable range
+        # so gradients flow through softmax rather than being flattened by
+        # near-uniform attention weights (which happens with the old * 0.02 init)
+        self.queries = nn.Parameter(torch.randn(1, tgt_tokens, dim) * (dim ** -0.5))
 
         self.attn1 = nn.MultiheadAttention(
             embed_dim=dim,
@@ -177,16 +179,17 @@ class GlobalAttentionReshape(nn.Module):
         B = x.shape[0]
         q = self.queries.expand(B, -1, -1)  # (B, N_tgt, D)
 
-        # First cross-attention pass builds the initial resampled representation.
+        # First cross-attention pass: learned queries attend over source tokens
+        # to build the initial resampled representation.
         out1, _ = self.attn1(query=q, key=x, value=x)  # (B, N_tgt, D)
         if self.src_tokens == self.tgt_tokens:
             out1 = self.norm1(out1 + x)
         else:
             out1 = self.norm1(out1 + q)
 
-        # A second cross-attention layer lets the learned output tokens refine
-        # themselves against the same source tokens.
-        out2, _ = self.attn2(query=out1, key=x, value=x)  # (B, N_tgt, D)
+        # Second pass: self-attention over out1 (not x again) so each layer
+        # learns something meaningfully different rather than redundant cross-attentions.
+        out2, _ = self.attn2(query=out1, key=out1, value=out1)  # (B, N_tgt, D)
         out = self.norm2(out2 + out1)
 
         return out
