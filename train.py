@@ -303,9 +303,9 @@ def train_universal_sae(
         global_step_actual = global_step + batch_idx
 
         if global_step_actual < warmup_steps:
-            warmup_lr = base_lr * (global_step_actual / warmup_steps)
+            warmup_frac = global_step_actual / max(warmup_steps, 1)
             for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr
+                pg["lr"] = pg["initial_lr"] * warmup_frac
 
         # ----------------------------------------------------------------
         # wandb logging
@@ -323,13 +323,8 @@ def train_universal_sae(
 
             try:
                 with torch.no_grad():
-                    topk_vals, _ = torch.topk(z, model.top_k, dim=-1)
-                    threshold = topk_vals[..., -1:]  # kth largest value
-                    sparsity = (z < threshold).float().mean().item()
-                    # Also log true active fraction
-                    active_frac = model.top_k / z.shape[-1]
+                    sparsity = (z == 0).float().mean().item()
                 log_dict["train/latent_sparsity"] = sparsity
-                log_dict["train/active_frac"] = active_frac
             except NameError:
                 pass
 
