@@ -1,72 +1,98 @@
 import random
-from typing import Optional, Dict, Set
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
-
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
+import wandb
 
 
 def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    Compute MSE loss between two tensors, flattening the token dimension.
-
-    Args:
-        a, b: (B, N, D) tensors (must have same shape)
-
-    Returns:
-        Scalar MSE loss
+    Compute MSE loss between two activation tensors of shape (B, N, D).
     """
-    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}")
     return F.mse_loss(
         rearrange(a, "b n d -> (b n) d"),
         rearrange(b, "b n d -> (b n) d"),
     )
 
 
-def _ensure_bt(sigmas: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """Ensure sigmas is shaped (B, T)."""
-    # Squeeze out any size-1 dims in the middle
-    sigmas = sigmas.squeeze()  # removes ALL size-1 dims -> (T,) or (B, T)
-    if sigmas.dim() == 1:
-        sigmas = sigmas.unsqueeze(0).expand(batch_size, -1)  # (B, T)
-    assert sigmas.shape == (batch_size, sigmas.shape[1]), \
-        f"_ensure_bt: unexpected shape {tuple(sigmas.shape)} for batch_size={batch_size}"
-    return sigmas
-
-
-def _get_sigmas_bt(meta, model_name, batch_size, device):
+def cosine_reconstruction_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    Extract sigmas for a given model from metadata.
-
-    Looks for per-model sigmas first, then falls back to global sigmas.
-    Returns (B, T) on device, or None if not found.
+    Cosine-distance reconstruction loss on flattened token activations.
     """
-    sig = None
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}")
 
-    if isinstance(meta, dict) and "sigmas_by_model" in meta:
-        if model_name in meta["sigmas_by_model"]:
-            sig = meta["sigmas_by_model"][model_name]
+    a_flat = rearrange(a, "b n d -> (b n) d")
+    b_flat = rearrange(b, "b n d -> (b n) d")
+    return (1.0 - F.cosine_similarity(a_flat, b_flat, dim=-1)).mean()
 
-    if sig is None and isinstance(meta, dict) and "sigmas" in meta:
-        sig = meta["sigmas"]
 
-    if sig is None:
+def decoder_orthogonality_loss(decoder: nn.Linear) -> torch.Tensor:
+    """
+    Encourage decoder atoms to be less entangled.
+
+    For a decoder mapping latent_dim -> activation_dim, each latent feature is a
+    decoder column. We penalize off-diagonal cosine similarities between atoms.
+    """
+    weight = decoder.weight
+    atoms = F.normalize(weight.t(), dim=-1)
+    gram = atoms @ atoms.t()
+    eye = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+    off_diag = gram - eye
+    return off_diag.pow(2).mean()
+
+
+def _ensure_bt(values: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """
+    Ensure per-batch timesteps/noise levels are shaped (B, T).
+    """
+    values = values.squeeze()
+    if values.dim() == 1:
+        values = values.unsqueeze(0).expand(batch_size, -1)
+    if values.dim() != 2 or values.shape[0] != batch_size:
+        raise ValueError(
+            f"_ensure_bt expected shape (B, T); got {tuple(values.shape)} for B={batch_size}"
+        )
+    return values
+
+
+def _get_sigmas_bt(meta, model_name: str, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+    """
+    Extract timestep conditioning for a given model from metadata.
+
+    Preferred keys:
+      - meta["timesteps_by_model"][model_name]
+      - meta["timesteps"]
+
+    Backward-compatible fallbacks:
+      - meta["sigmas_by_model"][model_name]
+      - meta["sigmas"]
+    """
+    values = None
+
+    if isinstance(meta, dict):
+        if "timesteps_by_model" in meta and model_name in meta["timesteps_by_model"]:
+            values = meta["timesteps_by_model"][model_name]
+        elif "timesteps" in meta:
+            values = meta["timesteps"]
+        elif "sigmas_by_model" in meta and model_name in meta["sigmas_by_model"]:
+            values = meta["sigmas_by_model"][model_name]
+        elif "sigmas" in meta:
+            values = meta["sigmas"]
+
+    if values is None:
         return None
 
-    sig = sig.to(device)
-    sig = _ensure_bt(sig, batch_size)
-    return sig
+    return _ensure_bt(values.to(device), batch_size)
 
 
-def _map_timestep_idx(t_src, t_src_len, t_tgt_len):
+def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     """
     Map timestep index from source schedule to target schedule if lengths differ.
     Uses proportional mapping [0..Tsrc-1] -> [0..Ttgt-1].
@@ -78,9 +104,200 @@ def _map_timestep_idx(t_src, t_src_len, t_tgt_len):
     return int(round(t_src * (t_tgt_len - 1) / (t_src_len - 1)))
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+def _nearest_timestep_idx(
+    src_timestep_value: torch.Tensor,
+    tgt_timestep_values: torch.Tensor,
+) -> int:
+    """
+    Align timesteps by actual conditioning value rather than proportional index.
+
+    Uses the batch-mean timestep/noise level as a robust summary when values are
+    provided per example.
+    """
+    src_value = src_timestep_value.float().mean()
+    tgt_values = tgt_timestep_values.float().mean(dim=0)
+    return int(torch.argmin((tgt_values - src_value).abs()).item())
+
+
+def _pick_diffusion_slice(
+    x: torch.Tensor,
+    t_bt: torch.Tensor,
+    timestep_idx: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Select one diffusion timestep slice
+    """
+    if x.dim() != 4:
+        raise ValueError(f"Expected diffusion activations shaped (B, T, N, D), got {tuple(x.shape)}")
+
+    _, total_steps, _, _ = x.shape
+    if timestep_idx is None:
+        timestep_idx = random.randrange(total_steps)
+    return x[:, timestep_idx], t_bt[:, timestep_idx], timestep_idx
+
+
+def _pick_temporal_neighbor_idx(timestep_idx: int, total_steps: int) -> Optional[int]:
+    """
+    Pick a neighboring timestep index for temporal consistency.
+
+    Prefers an adjacent step because temporal consistency objective is
+    meant to smooth nearby timesteps along the denoising trajectory.
+    """
+    if total_steps <= 1:
+        return None
+    if timestep_idx == 0:
+        return 1
+    if timestep_idx == total_steps - 1:
+        return total_steps - 2
+    return timestep_idx - 1 if random.random() < 0.5 else timestep_idx + 1
+
+
+def temporal_consistency_loss(
+    z_curr: torch.Tensor,
+    z_neigh: torch.Tensor,
+    t_curr: torch.Tensor,
+    t_neigh: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Encourage neighboring timesteps to have smoothly varying sparse features.
+
+    This is a local continuity penalty between adjacent or near-adjacent
+    diffusion steps. We avoid inverse timestep weighting because that can make
+    gradients unstable when the step spacing is very small.
+    """
+    if z_curr.shape != z_neigh.shape:
+        raise ValueError(
+            f"Temporal consistency shape mismatch: {tuple(z_curr.shape)} vs {tuple(z_neigh.shape)}"
+        )
+
+    del t_curr, t_neigh
+    return F.mse_loss(z_curr, z_neigh)
+
+
+def sparsity_loss(z: torch.Tensor, delta: float = 0.1) -> torch.Tensor:
+    """
+    Huber-style sparsity penalty on the latent activations.
+
+    This keeps the explicit sparse objective even when top-k masking is already
+    present in the encoder.
+    """
+    return F.huber_loss(z, torch.zeros_like(z), delta=delta, reduction="mean")
+
+
+def _sample_layer_index(num_layers: int) -> int:
+    if num_layers <= 1:
+        return 0
+    return random.randrange(num_layers)
+
+
+def _extract_source_slice(
+    x: torch.Tensor,
+    is_diffusion: bool,
+    timestep_values_bt: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """
+    Normalize source activation layouts into a single slice the SAE can encode.
+
+    Returns:
+      x_slice: (B, N, D)
+      timestep_slice: (B,) or None
+      layer_idx: selected layer index or None
+      timestep_idx: selected timestep index or None
+      total_layers: total number of layers or None
+      total_steps: total number of diffusion steps or None
+
+    Supported shapes:
+      vision: (B, N, D) or (B, L, N, D)
+      diffusion: (B, T, N, D) or (B, L, T, N, D)
+    """
+    if is_diffusion:
+        if x.dim() == 5:
+            _, total_layers, _, _, _ = x.shape
+            layer_idx = _sample_layer_index(total_layers)
+            x = x[:, layer_idx]
+        elif x.dim() == 4:
+            layer_idx = None
+            total_layers = None
+        else:
+            raise ValueError(
+                f"Expected diffusion activations shaped (B, T, N, D) or (B, L, T, N, D), got {tuple(x.shape)}"
+            )
+
+        if timestep_values_bt is None:
+            raise ValueError("Diffusion source requires timestep values.")
+        x_slice, timestep_slice, timestep_idx = _pick_diffusion_slice(x, timestep_values_bt)
+        return x_slice, timestep_slice, layer_idx, timestep_idx, total_layers, x.shape[1]
+
+    if x.dim() == 4:
+        _, total_layers, _, _ = x.shape
+        layer_idx = _sample_layer_index(total_layers)
+        x = x[:, layer_idx]
+    elif x.dim() == 3:
+        layer_idx = None
+        total_layers = None
+    else:
+        raise ValueError(
+            f"Expected vision activations shaped (B, N, D) or (B, L, N, D), got {tuple(x.shape)}"
+        )
+
+    return x, None, layer_idx, None, total_layers, None
+
+
+def _extract_target_slice(
+    x: torch.Tensor,
+    is_diffusion: bool,
+    timestep_values_bt: Optional[torch.Tensor],
+    source_timestep_values: Optional[torch.Tensor],
+    source_layer_idx: Optional[int],
+    source_total_layers: Optional[int],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
+    """
+    Normalize target activation layouts into one comparison slice.
+
+    Layer alignment uses the same layer index when possible, with proportional
+    fallback if source and target expose different numbers of layers.
+    Diffusion timestep alignment uses nearest actual timestep/noise level.
+    """
+    layer_idx = None
+    if is_diffusion:
+        if x.dim() == 5:
+            total_layers = x.shape[1]
+            if source_layer_idx is None:
+                layer_idx = _sample_layer_index(total_layers)
+            else:
+                src_layers = source_total_layers if source_total_layers is not None else total_layers
+                layer_idx = _map_timestep_idx(source_layer_idx, src_layers, total_layers)
+            x = x[:, layer_idx]
+        elif x.dim() != 4:
+            raise ValueError(
+                f"Expected diffusion activations shaped (B, T, N, D) or (B, L, T, N, D), got {tuple(x.shape)}"
+            )
+
+        if timestep_values_bt is None:
+            raise ValueError("Diffusion target requires timestep values.")
+
+        if source_timestep_values is None:
+            timestep_idx = random.randrange(x.shape[1])
+        else:
+            timestep_idx = _nearest_timestep_idx(source_timestep_values, timestep_values_bt)
+
+        return x[:, timestep_idx], timestep_values_bt[:, timestep_idx], layer_idx, timestep_idx
+
+    if x.dim() == 4:
+        total_layers = x.shape[1]
+        if source_layer_idx is None:
+            layer_idx = _sample_layer_index(total_layers)
+        else:
+            src_layers = source_total_layers if source_total_layers is not None else total_layers
+            layer_idx = _map_timestep_idx(source_layer_idx, src_layers, total_layers)
+        x = x[:, layer_idx]
+    elif x.dim() != 3:
+        raise ValueError(
+            f"Expected vision activations shaped (B, N, D) or (B, L, N, D), got {tuple(x.shape)}"
+        )
+
+    return x, None, layer_idx, None
+
 
 def train_universal_sae(
     model: nn.Module,
@@ -92,40 +309,17 @@ def train_universal_sae(
     epoch: int = 0,
     use_wandb: bool = False,
     log_every: int = 50,
-    curriculum_epochs: int = 5,
-    curriculum_self_only: bool = True,
-    balanced_sources: bool = True,
+    temporal_consistency_weight: float = 0.1,
+    cosine_weight: float = 0.0,
+    sparsity_weight: float = 1e-2,
+    orthogonality_weight: float = 1e-3,
 ):
     """
-    Train the Universal SAE with optional self/cross reconstruction.
-
-    Each batch can be balanced across sources, and early epochs can
-    run curriculum warm start with self-reconstruction only.
-
-    - Encode source activations to shared latent z.
-    - Decode z to every target model for loss computation.
-    - For vision targets: compare full (B, N, D) output.
-    - For diffusion targets: compare one timestep (B, N, D) with sigma.
-    - Per source->target pair: aggregate loss, normalize by term count,
-      and scale by running EMA.
-
-    Args:
-        model: UniversalSAE instance
-        dataloader: DataLoader yielding ((acts_dict, metadata), labels)
-        optimizer: Optimizer for model parameters
-        diffusion_models: Set of model names that are diffusion/flow models
-        model_tokens: Dict mapping model name -> number of tokens (informational)
-        device: Device to train on
-        epoch: Current epoch index (used for wandb step calculation)
-        use_wandb: Whether to log metrics to wandb
-        log_every: Log to wandb every N steps
+    Train a Universal SAE with Temporal Awareness
     """
     model.train()
 
     diffusion_models = set(diffusion_models)
-    model_tokens = model_tokens or {}
-
-
     cross_weight = 2.0
     self_weight = 1.0
 
@@ -133,200 +327,123 @@ def train_universal_sae(
     base_lr = optimizer.param_groups[0]["lr"]
 
     global_step = epoch * len(dataloader)
-    last_loss = torch.tensor(0.0)
+    last_loss = torch.tensor(0.0, device=device)
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
+        source = random.choice(list(acts.keys()))
         optimizer.zero_grad()
 
-        source_list = sorted(list(acts.keys()))
-        if balanced_sources:
-            active_sources = source_list
-        else:
-            active_sources = [source_list[batch_idx % len(source_list)]]
-
-        allow_cross = (epoch >= curriculum_epochs) if curriculum_self_only else True
-
-        pair_loss_tensors: Dict[str, torch.Tensor] = {}
-        pair_term_count: Dict[str, int] = {}
-        per_target_losses: Dict[str, float] = {}
-
-        for source in active_sources:
-            if source not in acts:
-                continue
-
-            if source in diffusion_models:
-                # ----------------------------------------------------------------
-                # Diffusion source: acts[source] is (B, T, N, D)
-                # ----------------------------------------------------------------
-                x_src = acts[source].to(device)
-
-                if x_src.dim() != 4:
-                    raise ValueError(
-                        f"Expected diffusion source '{source}' to be (B, T, N, D), "
-                        f"got {tuple(x_src.shape)}"
-                    )
-
-                B, Tsrc, N, D = x_src.shape
-
-                src_sigmas_bt = _get_sigmas_bt(meta, source, B, device)
-                if src_sigmas_bt is None:
-                    raise KeyError(
-                        f"Source '{source}' is diffusion but sigmas not found in metadata. "
-                        f"Expected meta['sigmas_by_model'][{source!r}] or meta['sigmas']."
-                    )
-
-                for t_src in range(Tsrc):
-                    sigma_src = src_sigmas_bt[:, t_src]
-                    x_t = x_src[:, t_src]
-                    _z_pre, z = model.encode(x_t, source=source, sigma=sigma_src)
-
-                    for target, x_target in acts.items():
-                        if source != target and not allow_cross:
-                            continue
-
-                        x_target = x_target.to(device)
-
-                        if target in diffusion_models:
-                            if x_target.dim() != 4:
-                                raise ValueError(
-                                    f"Expected diffusion target '{target}' to be (B, T, N, D), "
-                                    f"got {tuple(x_target.shape)}"
-                                )
-
-                            Ttgt = x_target.shape[1]
-                            tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
-                            if tgt_sigmas_bt is None:
-                                raise KeyError(
-                                    f"Target '{target}' is diffusion but sigmas not found in metadata."
-                                )
-
-                            t_tgt = _map_timestep_idx(t_src, Tsrc, Ttgt)
-                            sigma_tgt = tgt_sigmas_bt[:, t_tgt]
-
-                            x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                            x_target_t = x_target[:, t_tgt]
-
-                            target_loss = mse_flat(x_hat, x_target_t)
-                        else:
-                            if x_target.dim() != 3:
-                                raise ValueError(
-                                    f"Expected vision target '{target}' to be (B, N, D), "
-                                    f"got {tuple(x_target.shape)}"
-                                )
-
-                            x_hat = model.decode(z, target=target, sigma=None)
-                            target_loss = mse_flat(x_hat, x_target)
-
-                        w = cross_weight if source != target else self_weight
-                        weighted_target_loss = w * target_loss
-
-                        key = f"{source}->{target}"
-                        pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
-                        pair_term_count[key] = pair_term_count.get(key, 0) + 1
-
-            else:
-                # ----------------------------------------------------------------
-                # Vision source: acts[source] is (B, N, D)
-                # ----------------------------------------------------------------
-                x_src = acts[source].to(device)
-
-                if x_src.dim() != 3:
-                    raise ValueError(
-                        f"Expected vision source '{source}' to be (B, N, D), "
-                        f"got {tuple(x_src.shape)}"
-                    )
-
-                B = x_src.shape[0]
-
-                _z_pre, z = model.encode(x_src, source=source, sigma=None)
-
-                for target, x_target in acts.items():
-                    if source != target and not allow_cross:
-                        continue
-
-                    x_target = x_target.to(device)
-
-                    if target in diffusion_models:
-                        if x_target.dim() != 4:
-                            raise ValueError(
-                                f"Expected diffusion target '{target}' to be (B, T, N, D), "
-                                f"got {tuple(x_target.shape)}"
-                            )
-
-                        Ttgt = x_target.shape[1]
-                        t_tgt = random.randrange(Ttgt)
-
-                        tgt_sigmas_bt = _get_sigmas_bt(meta, target, B, device)
-                        if tgt_sigmas_bt is None:
-                            raise KeyError(
-                                f"Target '{target}' is diffusion but sigmas not found in metadata."
-                            )
-
-                        sigma_tgt = tgt_sigmas_bt[:, t_tgt]
-                        x_hat = model.decode(z, target=target, sigma=sigma_tgt)
-                        x_target_t = x_target[:, t_tgt]
-
-                        target_loss = mse_flat(x_hat, x_target_t)
-                    else:
-                        if x_target.dim() != 3:
-                            raise ValueError(
-                                f"Expected vision target '{target}' to be (B, N, D), "
-                                f"got {tuple(x_target.shape)}"
-                            )
-
-                        x_hat = model.decode(z, target=target, sigma=None)
-                        target_loss = mse_flat(x_hat, x_target)
-
-                    w = cross_weight if source != target else self_weight
-                    weighted_target_loss = w * target_loss
-
-                    key = f"{source}->{target}"
-                    pair_loss_tensors[key] = pair_loss_tensors.get(key, torch.tensor(0.0, device=device)) + weighted_target_loss
-                    pair_term_count[key] = pair_term_count.get(key, 0) + 1
-
         loss = torch.tensor(0.0, device=device)
-        per_target_losses = {}
-        for key, pt_loss in pair_loss_tensors.items():
-            count = pair_term_count.get(key, 1)
-            normalized_pt_loss = pt_loss / float(count)
+        per_target_losses: Dict[str, float] = {}
+        batch_sparsity_loss = None
 
-            loss = loss + normalized_pt_loss
+        if source in diffusion_models:
+            x_src_full = acts[source].to(device)
+            batch_size = x_src_full.shape[0]
+            src_timesteps_bt = _get_sigmas_bt(meta, source, batch_size, x_src_full.device)
+            if src_timesteps_bt is None:
+                raise KeyError(
+                    f"Missing timestep metadata for diffusion source '{source}'. "
+                    f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
+                )
 
-            per_target_losses[key] = normalized_pt_loss.item()
+            x_src, t_src_values, source_layer_idx, t_src_idx, source_total_layers, source_total_steps = _extract_source_slice(
+                x_src_full,
+                is_diffusion=True,
+                timestep_values_bt=src_timesteps_bt,
+            )
+            _z_pre, z = model.encode(x_src, source=source, sigma=t_src_values)
 
-        last_loss = loss
+            neighbor_idx = _pick_temporal_neighbor_idx(t_src_idx, source_total_steps)
+            temporal_loss_value = None
+            if neighbor_idx is not None and temporal_consistency_weight > 0:
+                if x_src_full.dim() == 5 and source_layer_idx is not None:
+                    x_neighbor = x_src_full[:, source_layer_idx, neighbor_idx]
+                else:
+                    x_neighbor = x_src_full[:, neighbor_idx]
+                t_neighbor_values = src_timesteps_bt[:, neighbor_idx]
+                _z_pre_neighbor, z_neighbor = model.encode(x_neighbor, source=source, sigma=t_neighbor_values)
+                temporal_loss_value = temporal_consistency_loss(
+                    z,
+                    z_neighbor,
+                    t_src_values,
+                    t_neighbor_values,
+                )
+                loss = loss + temporal_consistency_weight * temporal_loss_value
+                per_target_losses[f"{source}_temporal"] = temporal_loss_value.item()
+        else:
+            x_src = acts[source].to(device)
+            batch_size = x_src.shape[0]
+            x_src, _unused_t, source_layer_idx, t_src_idx, source_total_layers, source_total_steps = _extract_source_slice(
+                x_src,
+                is_diffusion=False,
+            )
+            _z_pre, z = model.encode(x_src, source=source, sigma=None)
+
+        if sparsity_weight > 0:
+            batch_sparsity_loss = sparsity_loss(z)
+            loss = loss + sparsity_weight * batch_sparsity_loss
+            per_target_losses[f"{source}_sparsity"] = batch_sparsity_loss.item()
+
+        if orthogonality_weight > 0:
+            source_ortho = decoder_orthogonality_loss(model.saes[source].dec)
+            loss = loss + orthogonality_weight * source_ortho
+            per_target_losses[f"{source}_orthogonality"] = source_ortho.item()
+
+        for target, x_target in acts.items():
+            x_target = x_target.to(device)
+
+            if target in diffusion_models:
+                tgt_timesteps_bt = _get_sigmas_bt(meta, target, batch_size, x_target.device)
+                if tgt_timesteps_bt is None:
+                    raise KeyError(
+                        f"Missing timestep metadata for diffusion target '{target}'. "
+                        f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
+                    )
+
+                x_target_t, t_tgt_values, _target_layer_idx, t_tgt_idx = _extract_target_slice(
+                    x_target,
+                    is_diffusion=True,
+                    timestep_values_bt=tgt_timesteps_bt,
+                    source_timestep_values=t_src_values if source in diffusion_models else None,
+                    source_layer_idx=source_layer_idx,
+                    source_total_layers=source_total_layers,
+                )
+                x_hat = model.decode(z, target=target, sigma=t_tgt_values)
+            else:
+                x_target_t, _unused_tgt_t, _target_layer_idx, _unused_tgt_idx = _extract_target_slice(
+                    x_target,
+                    is_diffusion=False,
+                    timestep_values_bt=None,
+                    source_timestep_values=None,
+                    source_layer_idx=source_layer_idx,
+                    source_total_layers=source_total_layers,
+                )
+                x_hat = model.decode(z, target=target, sigma=None)
+
+            target_mse_loss = mse_flat(x_hat, x_target_t)
+            target_cosine_loss = cosine_reconstruction_loss(x_hat, x_target_t) if cosine_weight > 0 else None
+            weight = cross_weight if source != target else self_weight
+            target_total_loss = target_mse_loss
+            if target_cosine_loss is not None:
+                target_total_loss = target_total_loss + cosine_weight * target_cosine_loss
+                per_target_losses[f"{source}->{target}_cosine"] = target_cosine_loss.item()
+
+            loss = loss + weight * target_total_loss
+            per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
 
         loss.backward()
-
-        # ── Grad norms (must be computed BEFORE optimizer.step) ──────────
-        sd3_pooler_grad = None
-        sd3_sae_grad = None
-        if hasattr(model, "token_poolers") and "SD3" in model.token_poolers:
-            sd3_pooler_grad = sum(
-                p.grad.norm().item()
-                for p in model.token_poolers["SD3"].parameters()
-                if p.grad is not None
-            )
-        if hasattr(model, "saes") and "SD3" in model.saes:
-            sd3_sae_grad = sum(
-                p.grad.norm().item()
-                for p in model.saes["SD3"].parameters()
-                if p.grad is not None
-            )
-
         optimizer.step()
-        last_loss = loss
+        if hasattr(model, "normalize_decoder_dictionaries_"):
+            model.normalize_decoder_dictionaries_()
+        last_loss = loss.detach()
 
         global_step_actual = global_step + batch_idx
-
         if global_step_actual < warmup_steps:
-            warmup_frac = global_step_actual / max(warmup_steps, 1)
+            warmup_lr = base_lr * (global_step_actual / warmup_steps)
             for pg in optimizer.param_groups:
-                pg["lr"] = pg["initial_lr"] * warmup_frac
+                pg["lr"] = warmup_lr
 
-        # ----------------------------------------------------------------
-        # wandb logging
-        # ----------------------------------------------------------------
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
             log_dict = {
                 "train/total_loss": loss.item(),
@@ -334,29 +451,12 @@ def train_universal_sae(
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
             }
-            for pair, val in per_target_losses.items():
+            for pair, value in per_target_losses.items():
                 safe_key = pair.replace("->", "_to_")
-                log_dict[f"train/loss_{safe_key}"] = val
+                log_dict[f"train/loss_{safe_key}"] = value
 
-            # Sparsity: fraction of latent dims below top-k threshold (per token)
-            try:
-                with torch.no_grad():
-                    topk_vals, _ = torch.topk(z, model.top_k, dim=-1)
-                    threshold = topk_vals[..., -1:]
-                    sparsity = (z < threshold).float().mean().item()
-                    active_frac = model.top_k / z.shape[-1]
-                log_dict["train/latent_sparsity"] = sparsity
-                log_dict["train/active_frac"] = active_frac
-            except (NameError, Exception):
-                pass
-
-            # Grad norms
-            if sd3_pooler_grad is not None:
-                log_dict["train/sd3_pooler_grad_norm"] = sd3_pooler_grad
-            if sd3_sae_grad is not None:
-                log_dict["train/sd3_sae_grad_norm"] = sd3_sae_grad
-            if sd3_pooler_grad and sd3_sae_grad:
-                log_dict["train/sd3_pooler_sae_grad_ratio"] = sd3_pooler_grad / sd3_sae_grad
+            with torch.no_grad():
+                log_dict["train/latent_sparsity"] = (z == 0).float().mean().item()
 
             wandb.log(log_dict, step=global_step_actual)
 
