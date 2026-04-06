@@ -24,10 +24,10 @@ class TimestepEmbedding(nn.Module):
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
-class TemporalAffine(nn.Module):
+class TIDETemporalModulation(nn.Module):
     """
-    Sigma-conditioned per-channel affine:
-      x' = x * (1 + scale(sigma)) + shift(sigma)
+    Timestep-conditioned per-channel affine used by TIDE:
+      x_mod = x * (1 + scale(t)) + shift(t)
 
     Works for x shaped (B,D) or (B,N,D).
     """
@@ -40,12 +40,39 @@ class TemporalAffine(nn.Module):
             nn.SiLU(),
             nn.Linear(tdim, 2 * dim),
         )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        # sigma may arrive as (B,), (B,1), (B,1,1) etc. - flatten to (B,)
+    @staticmethod
+    def _flatten_timestep(timestep: torch.Tensor) -> torch.Tensor:
+        if timestep.dim() == 0:
+            return timestep.unsqueeze(0).float()
+        if timestep.dim() == 1:
+            return timestep.float()
+        return timestep.flatten(start_dim=1)[:, 0].float()
+
+    def init_from_adaln(
+        self,
+        scale_weight: torch.Tensor,
+        scale_bias: torch.Tensor,
+        shift_weight: torch.Tensor,
+        shift_bias: torch.Tensor,
+    ) -> None:
+        final = self.mlp[-1]
+        with torch.no_grad():
+            final.weight.copy_(torch.cat([scale_weight, shift_weight], dim=0))
+            final.bias.copy_(torch.cat([scale_bias, shift_bias], dim=0))
+
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        # timestep may arrive as (B,), (B,1), (B,1,1), etc. - flatten to (B,)
         B = x.shape[0]
-        sigma = sigma.flatten(start_dim=1)[:, 0].float() if sigma.dim() > 1 else sigma.float()
-        h = self.t_embed(sigma)
+        timestep = self._flatten_timestep(timestep)
+        if timestep.shape[0] != B:
+            raise ValueError(
+                f"Timestep batch mismatch: got {tuple(timestep.shape)} for activations "
+                f"with batch size {B}."
+            )
+        h = self.t_embed(timestep)
         scale, shift = self.mlp(h).chunk(2, dim=-1)  # (B,D), (B,D)
         if x.dim() == 3:
             return x * (1 + scale[:, None, :]) + shift[:, None, :]
@@ -148,11 +175,7 @@ class GlobalAttentionReshape(nn.Module):
         self.tgt_tokens = tgt_tokens
         self.dim = dim
 
-        # Learned query embeddings - one per output token
-        # Scaled init (dim**-0.5) keeps attention logits in a reasonable range
-        # so gradients flow through softmax rather than being flattened by
-        # near-uniform attention weights (which happens with the old * 0.02 init)
-        self.queries = nn.Parameter(torch.randn(1, tgt_tokens, dim) * (dim ** -0.5))
+        self.queries = nn.Parameter(torch.randn(1, tgt_tokens, dim) * 0.02)
 
         self.attn1 = nn.MultiheadAttention(
             embed_dim=dim,
@@ -179,17 +202,12 @@ class GlobalAttentionReshape(nn.Module):
         B = x.shape[0]
         q = self.queries.expand(B, -1, -1)  # (B, N_tgt, D)
 
-        # First cross-attention pass: learned queries attend over source tokens
-        # to build the initial resampled representation.
         out1, _ = self.attn1(query=q, key=x, value=x)  # (B, N_tgt, D)
         if self.src_tokens == self.tgt_tokens:
             out1 = self.norm1(out1 + x)
         else:
             out1 = self.norm1(out1 + q)
-
-        # Second pass: self-attention over out1 (not x again) so each layer
-        # learns something meaningfully different rather than redundant cross-attentions.
-        out2, _ = self.attn2(query=out1, key=out1, value=out1)  # (B, N_tgt, D)
+        out2, _ = self.attn2(query=out1, key=x, value=x)  # (B, N_tgt, D)
         out = self.norm2(out2 + out1)
 
         return out
@@ -213,23 +231,22 @@ class PerModelSAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.dec(z)
 
+    @torch.no_grad()
+    def normalize_decoder_columns_(self, eps: float = 1e-8) -> None:
+        """
+        Normalize decoder atoms to unit norm.
+
+        For nn.Linear(latent_dim -> in_dim), each latent feature corresponds to
+        one decoder column.
+        """
+        weight = self.dec.weight.data
+        norms = weight.norm(dim=0, keepdim=True).clamp_min(eps)
+        self.dec.weight.data = weight / norms
+
 
 class UniversalSAE(nn.Module):
     """
     Separate encoder/decoder per model -> shared latent space.
-
-    Now uses a FIXED-SIZE shared latent space where all models are pooled/unpooled
-    to a canonical token count. This ensures:
-    - Consistent sparsity: top-k operates on the same grid for all models
-    - Shared semantics: latent features have the same spatial meaning across models
-
-    Architecture:
-      Input (variable tokens) -> Pool to canonical size -> Encode -> Sparse latent (fixed size)
-      -> Decode -> Unpool to target size -> Output (variable tokens)
-
-    Diffusion-only:
-      x --pre_affine(sigma)--> Pool --> SAE encoder --> z (sparse, fixed size)
-      z --> SAE decoder --> Unpool --> x_hat --post_affine(sigma)--> x_hat_final
     """
 
     def __init__(
@@ -247,6 +264,7 @@ class UniversalSAE(nn.Module):
         token_reshape_mode: TokenReshapeMode = "attention",
         attention_heads: int = 8,
         attention_dropout: float = 0.0,
+        tide_modulation_location: Literal["pre", "post", "both"] = "pre",
     ):
         """
         Args:
@@ -282,6 +300,7 @@ class UniversalSAE(nn.Module):
         self.shared_latent_tokens = shared_latent_tokens
         self.interpolation_mode = interpolation_mode
         self.token_reshape_mode = token_reshape_mode
+        self.tide_modulation_location = tide_modulation_location
 
         self.latent_dim = latent_dim
         self.top_k = top_k
@@ -298,8 +317,6 @@ class UniversalSAE(nn.Module):
 
         self.saes = nn.ModuleDict({k: PerModelSAE(v, latent_dim) for k, v in model_dims.items()})
 
-        # Token reshape modules (only built when attention mode is selected,
-        # since interpolation is parameter-free and applied inline)
         if token_reshape_mode == "attention":
             # Each model needs a pooler (src_tokens -> shared_latent_tokens)
             # and an unpooler (shared_latent_tokens -> src_tokens)
@@ -329,8 +346,8 @@ class UniversalSAE(nn.Module):
         self.post = nn.ModuleDict()
         for name, dim in model_dims.items():
             if name in self.diffusion_models:
-                self.pre[name] = TemporalAffine(dim, tdim=timestep_dim)
-                self.post[name] = TemporalAffine(dim, tdim=timestep_dim)
+                self.pre[name] = TIDETemporalModulation(dim, tdim=timestep_dim)
+                self.post[name] = TIDETemporalModulation(dim, tdim=timestep_dim)
             else:
                 self.pre[name] = nn.Identity()
                 self.post[name] = nn.Identity()
@@ -405,27 +422,19 @@ class UniversalSAE(nn.Module):
         """
         Encode activations from a source model into the shared latent space.
 
-        Now pools input to canonical token count BEFORE encoding to ensure
-        consistent sparse latent representation across all models.
-
         Args:
             x: (B, N_src, D) activations from the source model
             source: Name of the source model
-            sigma: (B,) noise levels (required for diffusion models)
+            sigma: (B,) diffusion timestep / noise level (required for diffusion models)
 
         Returns:
             z_pre: Pre-activation latent (before ReLU and top-k) - (B, shared_latent_tokens, latent_dim)
             z: Final sparse latent representation - (B, shared_latent_tokens, latent_dim)
         """
-        # diffusion-only: adapt before pooling
-        if source in self.diffusion_models:
+        if source in self.diffusion_models and self.tide_modulation_location in {"pre", "both"}:
             assert sigma is not None, f"sigma required for diffusion source '{source}'"
             x = self.pre[source](x, sigma)
 
-        # Auto-correct model_tokens if the actual tensor disagrees with config.
-        # This handles the common case where num_tokens in config.yaml is wrong
-        # (e.g. cached with CLS token included but use_class_tokens=false strips it,
-        # or the cache was generated with a different patch size).
         actual_tokens = x.shape[1]
         declared_tokens = self.model_tokens[source]
         if actual_tokens != declared_tokens:
@@ -449,7 +458,6 @@ class UniversalSAE(nn.Module):
             tgt_tokens=self.shared_latent_tokens,
             direction="pool",
         )
-        # x is now (B, shared_latent_tokens, D_src)
 
         z_pre = self.saes[source].encode_pre(x)  # (B, shared_latent_tokens, latent_dim)
         z = F.relu(z_pre)
@@ -461,17 +469,16 @@ class UniversalSAE(nn.Module):
         z: torch.Tensor,
         target: str,
         sigma: Optional[torch.Tensor] = None,
-        source: Optional[str] = None,  # No longer needed but kept for API compatibility
+        source: Optional[str] = None,  
     ) -> torch.Tensor:
         """
         Decode from shared latent space to a target model's activation space.
 
-        Now unpools from canonical token count AFTER decoding.
-
         Args:
             z: (B, shared_latent_tokens, latent_dim) latent representation
             target: Name of the target model
-            sigma: (B,) noise levels (required for diffusion targets)
+            sigma: (B,) diffusion timestep / noise level (required for diffusion targets
+                   when post/both modulation is enabled)
             source: DEPRECATED - no longer used since z is always canonical size
 
         Returns:
@@ -481,7 +488,6 @@ class UniversalSAE(nn.Module):
         x_hat = self.saes[target].decode(z)  # (B, shared_latent_tokens, D_tgt)
 
         # Unpool to target token count
-        # Note: model_tokens[target] may have been auto-corrected by a prior encode() call.
         tgt_tokens = self.model_tokens[target]
         x_hat = self._reshape_tokens(
             x_hat,
@@ -490,10 +496,8 @@ class UniversalSAE(nn.Module):
             tgt_tokens=tgt_tokens,
             direction="unpool",
         )
-        # x_hat is now (B, N_tgt, D_tgt)
 
-        # diffusion-only: adapt after unpooling
-        if target in self.diffusion_models:
+        if target in self.diffusion_models and self.tide_modulation_location in {"post", "both"}:
             assert sigma is not None, f"sigma required for diffusion target '{target}'"
             x_hat = self.post[target](x_hat, sigma)
 
@@ -525,3 +529,11 @@ class UniversalSAE(nn.Module):
         z_pre, z = self.encode(x, source, sigma_src)
         x_hat = self.decode(z, target, sigma_tgt, source=source)
         return z_pre, z, x_hat
+
+    @torch.no_grad()
+    def normalize_decoder_dictionaries_(self) -> None:
+        """
+        Keep every per-model decoder dictionary on the unit sphere.
+        """
+        for sae in self.saes.values():
+            sae.normalize_decoder_columns_()
