@@ -312,7 +312,7 @@ def train_universal_sae(
     temporal_consistency_weight: float = 0.1,
     cosine_weight: float = 0.0,
     sparsity_weight: float = 1e-2,
-    orthogonality_weight: float = 1e-3,
+    orthogonality_weight: float = 0,
 ):
     """
     Train a Universal SAE with Temporal Awareness
