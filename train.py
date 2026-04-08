@@ -132,7 +132,10 @@ def _pick_diffusion_slice(
 
     _, total_steps, _, _ = x.shape
     if timestep_idx is None:
-        timestep_idx = random.randrange(total_steps)
+            #Old code:
+        #timestep_idx = random.randrange(total_steps)
+            #For now, we're always using the last timestep, as done below:
+        timestep_idx = total_steps - 1
     return x[:, timestep_idx], t_bt[:, timestep_idx], timestep_idx
 
 
