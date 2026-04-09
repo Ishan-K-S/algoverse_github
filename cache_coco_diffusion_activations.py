@@ -125,7 +125,9 @@ if __name__ == "__main__":
     coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
     cache_root = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
 
-  
+    colab_coco_root = "/content/coco_data/val2017"
+    colab_path_to_cache = "/content/cache"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
@@ -141,8 +143,8 @@ if __name__ == "__main__":
     cache_diffusion_activations(
         extractor=extractor,
         source_name=source_name,
-        coco_root=coco_root,
-        cache_root=cache_root,
+        coco_root=colab_coco_root,
+        cache_root=colab_path_to_cache,
         #split="train",
         batch_size=2,
         num_workers=8,
