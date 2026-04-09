@@ -602,6 +602,148 @@ class FLUXActivationExtractor(BaseActivationExtractor):
             denoised_latents=latents,
         )
 
+class PixArtActivationExtractor(BaseActivationExtractor):
+    """
+    Extract activations from Pixart diffuser model.
+    
+
+    """
+    
+    def __init__(
+        self,
+        model_id: str = "PixArt-alpha/PixArt-XL-2-1024-MS",
+        num_inference_steps: int = 28,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__(model_id, num_inference_steps, device, dtype)
+        self._load_pipeline()
+        
+        # PixArt preprocessing
+        self.preprocess = transforms.Compose([
+            transforms.Resize(512, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+            transforms.CenterCrop(512),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+    
+    def _load_pipeline(self):
+        """Load PixArt pipeline components."""
+        from diffusers import PixArtAlphaPipeline, ConsistencyDecoderVAE, AutoencoderKL
+        
+        print(f"Loading SD3 pipeline from {self.model_id}...")
+        self.pipe = PixArtAlphaPipeline.from_pretrained(
+            self.model_id,
+            torch_dtype=self.dtype,
+            use_safetensors=True
+        ).to(self.device)
+        
+        self.transformer = self.pipe.transformer
+        self.vae = self.pipe.vae
+        self.scheduler = self.pipe.scheduler
+        
+        # Text encoders and tokenizers
+
+        #PixArtAlpha uses one T5 Text encoder; We're labeling it as the third text encoder & tokenizer
+        self.text_encoder = self.pipe.text_encoder
+        """self.text_encoder_2 = self.pipe.text_encoder_2
+        self.text_encoder_3 = self.pipe.text_encoder_3"""
+        self.tokenizer = self.pipe.tokenizer
+        """self.tokenizer_2 = self.pipe.tokenizer_2
+        self.tokenizer_3 = self.pipe.tokenizer_3"""
+        
+        # Set to eval mode
+        self.transformer.eval()
+        self.vae.eval()
+        
+        print(f"PixArt loaded. Transformer blocks: {len(self.transformer.transformer_blocks)}")
+    
+    def _encode_null_prompt(self, batch_size: int) -> dict:
+        """Encode empty prompt using the one T5 text encoder."""
+        null_prompt = [""] * batch_size
+        
+        # Tokenize for T5
+        text_inputs_1 = self.tokenizer(
+            null_prompt,
+            padding="max_length",
+            max_length=256,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(self.device)
+        
+
+
+        """# Tokenize for CLIP-G
+        text_inputs_2 = self.tokenizer_2(
+            null_prompt,
+            padding="max_length",
+            max_length=self.tokenizer_2.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(self.device)
+        
+        # Tokenize for T5
+        text_inputs_3 = self.tokenizer_3(
+            null_prompt,
+            padding="max_length",
+            max_length=256,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.to(self.device)"""
+        
+        """# Encode with CLIP-L
+        prompt_embeds_1 = self.text_encoder(text_inputs_1, output_hidden_states=True)
+        pooled_prompt_embeds_1 = prompt_embeds_1[0]
+        prompt_embeds_1 = prompt_embeds_1.hidden_states[-2]
+        
+        
+        # Encode with CLIP-G
+        prompt_embeds_2 = self.text_encoder_2(text_inputs_2, output_hidden_states=True)
+        pooled_prompt_embeds_2 = prompt_embeds_2[0]
+        prompt_embeds_2 = prompt_embeds_2.hidden_states[-2]"""
+        
+        # Encode with T5
+        prompt_embeds_3 = self.text_encoder(text_inputs_1)[0]
+        
+        """# Concatenate CLIP embeddings along feature dimension
+        clip_prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
+        
+        # Pad CLIP embeddings to match T5 dimension
+        clip_prompt_embeds = torch.nn.functional.pad(
+            clip_prompt_embeds,
+            (0, prompt_embeds_3.shape[-1] - clip_prompt_embeds.shape[-1]),
+        )
+        
+        # Concatenate all embeddings along sequence dimension
+        prompt_embeds = torch.cat([clip_prompt_embeds, prompt_embeds_3], dim=-2)
+        pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)"""
+        
+        return {
+            "prompt_embeds": prompt_embeds_3,
+            #"pooled_prompt_embeds": pooled_prompt_embeds,
+        }
+    
+
+
+    def _get_transformer_input(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_embeds: dict,
+    ) -> dict:
+        """Prepare inputs for PixArt transformer."""
+        batch_size = latents.shape[0]
+        
+        return {
+            "hidden_states": latents,
+            "timestep": timestep.expand(batch_size),
+            "encoder_hidden_states": prompt_embeds["prompt_embeds"],
+            
+        }
+    
+    def _get_last_block(self) -> nn.Module:
+        """Return the last MMDiT block."""
+        return self.transformer.transformer_blocks[-1]
 
 # Convenience functions
 def create_sd3_extractor(
@@ -631,6 +773,18 @@ def create_flux_extractor(
         dtype=dtype,
     )
 
+def create_PixArt_extractor(
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    num_steps: int = 15,    
+) -> PixArtActivationExtractor:
+    """creates a PixArt Activation extractor"""
+    return PixArtActivationExtractor(
+        model_id="PixArt-alpha/PixArt-XL-2-1024-MS",
+        num_inference_steps=num_steps,
+        device=device,
+        dtype=dtype,
+    )
 
 if __name__ == "__main__":
     # Example usage

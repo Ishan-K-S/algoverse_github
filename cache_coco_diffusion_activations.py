@@ -17,7 +17,7 @@ from tqdm import tqdm
 from coco_dataset_setup import CocoData
 
 
-from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor
+from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor, PixArtActivationExtractor
 
 from huggingface_hub import login
 login(token="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")
@@ -129,8 +129,11 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Choose ONE:
-    extractor = SD3ActivationExtractor(device=device, num_inference_steps=4)
-    source_name = "SD3"
+    #extractor = SD3ActivationExtractor(device=device, num_inference_steps=4)
+    #source_name = "SD3"
+
+    extractor = PixArtActivationExtractor(device = device, num_inference_steps=15)
+    source_name = "PixArt"
 
     #extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
     #source_name = "FLUX"
