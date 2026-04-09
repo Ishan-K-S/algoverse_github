@@ -144,6 +144,9 @@ if __name__ == '__main__':
     # Configuration
     coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
     path_to_cache = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
+
+    colab_coco_root = "/content/coco_data/val2017"
+    colab_path_to_cache = "/content/cache"
     
     # Select which model to cache (uncomment one)
     
@@ -168,7 +171,7 @@ if __name__ == '__main__':
     cache_model_activations(
         model=model,
         model_name=model_name,
-        coco_root=coco_root,
-        path_to_cache=path_to_cache,
+        coco_root=colab_coco_root,
+        path_to_cache=colab_path_to_cache,
         batch_size=512
     )
