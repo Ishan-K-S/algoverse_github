@@ -740,12 +740,18 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     ) -> dict:
         """Prepare inputs for PixArt transformer."""
         batch_size = latents.shape[0]
+
+
+        added_cond_kwargs=self.pipe.prepare_added_cond_kwargs(
+            prompt_embeds = prompt_embeds["prompt_embeds"],
+
+        )
         
         return {
             "hidden_states": latents,
             "timestep": timestep.expand(batch_size),
             "encoder_hidden_states": prompt_embeds["prompt_embeds"],
-            
+            "added_cond_kwargs": added_cond_kwargs,
         }
     
     def _get_last_block(self) -> nn.Module:
