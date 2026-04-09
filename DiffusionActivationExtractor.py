@@ -86,13 +86,20 @@ class BaseActivationExtractor(ABC, nn.Module):
         with torch.no_grad():
             latents = self.vae.encode(image).latent_dist.sample()
             
-            # Apply VAE scaling
+            shift = getattr(self.vae.config, "shift_factor", None)
+            scale = self.vae.config.scaling_factor
+
+            if shift is not None:
+                latents = (latents - shift) * scale
+            else:
+                latents = latents * scale
+            """ # Apply VAE scaling
             if hasattr(self.vae.config, 'shift_factor'):
                 # SD3/FLUX style: latent = (sample - shift) * scale
                 latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
             else:
                 # Standard VAE scaling
-                latents = latents * self.vae.config.scaling_factor
+                latents = latents * self.vae.config.scaling_factor"""
                 
         return latents
     
