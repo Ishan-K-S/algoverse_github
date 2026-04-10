@@ -642,33 +642,33 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     
     def _load_pipeline(self):
         """Load PixArt pipeline components."""
-        from diffusers import PixArtAlphaPipeline, ConsistencyDecoderVAE, AutoencoderKL
-        
-        print(f"Loading SD3 pipeline from {self.model_id}...")
+        from diffusers import PixArtAlphaPipeline, DDIMScheduler
+
+        print(f"Loading PixArt pipeline from {self.model_id}...")
         self.pipe = PixArtAlphaPipeline.from_pretrained(
             self.model_id,
             torch_dtype=self.dtype,
             use_safetensors=True
         ).to(self.device)
-        
+
         self.transformer = self.pipe.transformer
         self.vae = self.pipe.vae
-        self.scheduler = self.pipe.scheduler
-        
-        # Text encoders and tokenizers
 
-        #PixArtAlpha uses one T5 Text encoder; We're labeling it as the third text encoder & tokenizer
+        # Replace DPMSolverMultistepScheduler with DDIMScheduler.
+        # DPMSolver's convert_model_output tries to broadcast its internal sigma/alpha
+        # tensors against the latent spatial dims after the learned-variance split,
+        # producing a shape mismatch (e.g. "tensor a (4) must match tensor b (8)").
+        # DDIMScheduler handles epsilon-only predictions cleanly without that broadcast.
+        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+
+        # PixArtAlpha uses a single T5 text encoder
         self.text_encoder = self.pipe.text_encoder
-        """self.text_encoder_2 = self.pipe.text_encoder_2
-        self.text_encoder_3 = self.pipe.text_encoder_3"""
         self.tokenizer = self.pipe.tokenizer
-        """self.tokenizer_2 = self.pipe.tokenizer_2
-        self.tokenizer_3 = self.pipe.tokenizer_3"""
-        
+
         # Set to eval mode
         self.transformer.eval()
         self.vae.eval()
-        
+
         print(f"PixArt loaded. Transformer blocks: {len(self.transformer.transformer_blocks)}")
     
     def _encode_null_prompt(self, batch_size: int) -> dict:
@@ -769,8 +769,10 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             "added_cond_kwargs": added_cond_kwargs,
         }
     def _process_model_output(self, model_output, latents):
-        if model_output.shape[1] != latents.shape[1]:
-            return model_output[:, :latents.shape[1]]
+        # PixArt outputs (B, 2*C, H, W): [epsilon | learned_variance_logits].
+        # DDIMScheduler only wants the epsilon half (B, C, H, W).
+        if model_output.shape[1] == 2 * latents.shape[1]:
+            model_output, _ = model_output.chunk(2, dim=1)
         return model_output
 
     def _get_last_block(self) -> nn.Module:

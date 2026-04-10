@@ -52,7 +52,7 @@ def cache_diffusion_activations(
     cache_root: str,
     #split: str = "train",
     batch_size: int = 4,
-    num_workers: int = 8,
+    num_workers: int = 2,
 ):
     """
     extractor: SD3ActivationExtractor or FLUXActivationExtractor.
@@ -147,5 +147,5 @@ if __name__ == "__main__":
         cache_root=colab_path_to_cache,
         #split="train",
         batch_size=2,
-        num_workers=8,
+        num_workers=2,
     )
