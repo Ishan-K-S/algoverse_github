@@ -194,8 +194,11 @@ class BaseActivationExtractor(ABC, nn.Module):
                 transformer_inputs = self._get_transformer_input(latents, t, prompt_embeds)
                 
                 # Forward pass through transformer (hook captures activation)
-                noise_pred = self.transformer(**transformer_inputs, return_dict=False)[0]
-                
+                #noise_pred = self.transformer(**transformer_inputs, return_dict=False)[0]
+                model_output = self.transformer(**transformer_inputs, return_dict=False)[0]
+
+                noise_pred = self._process_model_output(model_output, latents)
+
                 # Record the timestep and sigma
                 timesteps_list.append(t.clone())
                 sigmas_list.append(float(sigmas[i]))
@@ -214,6 +217,9 @@ class BaseActivationExtractor(ABC, nn.Module):
             clean_latents=clean_latents,
             denoised_latents=latents,
         )
+    def _process_model_output(self, model_output, latents):
+        
+        return model_output
 
 
 class SD3ActivationExtractor(BaseActivationExtractor):
@@ -761,7 +767,10 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             "encoder_hidden_states": prompt_embeds["prompt_embeds"],
             "added_cond_kwargs": added_cond_kwargs,
         }
-    
+    def _process_model_output(self, model_output, latents):
+        C = latents.shape[1]
+        return model_output[:, :C]
+
     def _get_last_block(self) -> nn.Module:
         """Return the last MMDiT block."""
         return self.transformer.transformer_blocks[-1]
