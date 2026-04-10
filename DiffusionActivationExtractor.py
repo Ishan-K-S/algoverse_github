@@ -740,12 +740,20 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     ) -> dict:
         """Prepare inputs for PixArt transformer."""
         batch_size = latents.shape[0]
+        B, C, H, W = latents.shape
+        
+
+        added_cond_kwargs = {
+        "resolution": torch.tensor([H, W], device=self.device).unsqueeze(0).repeat(B, 1),
+        "crops_coords_top_left": torch.zeros((B, 2), device=self.device),
+        "target_size": torch.tensor([H, W], device=self.device).unsqueeze(0).repeat(B, 1),
+        }
 
 
-        added_cond_kwargs=self.pipe.prepare_added_cond_kwargs(
+        """added_cond_kwargs=self.pipe.prepare_added_cond_kwargs(
             prompt_embeds = prompt_embeds["prompt_embeds"],
 
-        )
+        )"""
         
         return {
             "hidden_states": latents,
