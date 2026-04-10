@@ -755,6 +755,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         "aspect_ratio": aspect_ratio,
         }
 
+        prompt_embeds["prompt_embeds"] = prompt_embeds["prompt_embeds"].to(self.dtype)
 
         """added_cond_kwargs=self.pipe.prepare_added_cond_kwargs(
             prompt_embeds = prompt_embeds["prompt_embeds"],
@@ -763,13 +764,14 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         
         return {
             "hidden_states": latents,
-            "timestep": timestep.expand(batch_size),
+            "timestep": timestep.expand(batch_size).to(self.dtype),
             "encoder_hidden_states": prompt_embeds["prompt_embeds"],
             "added_cond_kwargs": added_cond_kwargs,
         }
     def _process_model_output(self, model_output, latents):
-        C = latents.shape[1]
-        return model_output[:, :C]
+        if model_output.shape[1] != latents.shape[1]:
+            return model_output[:, :latents.shape[1]]
+        return model_output
 
     def _get_last_block(self) -> nn.Module:
         """Return the last MMDiT block."""
