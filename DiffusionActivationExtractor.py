@@ -779,6 +779,99 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         """Return the last MMDiT block."""
         return self.transformer.transformer_blocks[-1]
 
+    def _get_ddim_sigmas(self) -> list:
+        """
+        DDIMScheduler has no .sigmas attribute. Derive equivalent sigma values
+        from its alphas_cumprod: sigma = sqrt((1 - alpha) / alpha), which is the
+        standard DDPM/DDIM noise level parameterisation.
+        Returns a list of floats, one per scheduled timestep, plus a trailing 0.0
+        to mirror the len(sigmas) == len(timesteps) + 1 convention used by flow
+        schedulers (so sigmas[i] lines up with timestep i throughout the loop).
+        """
+        alphas_cumprod = self.scheduler.alphas_cumprod  # (num_train_timesteps,)
+        timesteps = self.scheduler.timesteps             # scheduled inference steps
+        sigmas = []
+        for t in timesteps:
+            alpha = alphas_cumprod[int(t)].item()
+            sigmas.append(float(((1 - alpha) / alpha) ** 0.5))
+        sigmas.append(0.0)   # terminal sigma (clean image)
+        return sigmas
+
+    @torch.no_grad()
+    def extract_activations(self, image: torch.Tensor) -> ActivationOutput:
+        """
+        Overridden for PixArt / DDIMScheduler, which does not expose .sigmas.
+        The flow-matching noise-addition formula is also replaced by the standard
+        DDPM forward-process: x_t = sqrt(alpha_t)*x_0 + sqrt(1-alpha_t)*eps.
+        """
+        batch_size = image.shape[0]
+        image = image.to(device=self.device, dtype=self.dtype)
+
+        # Step 1: Encode image to latent space
+        clean_latents = self._encode_image(image)
+
+        # Step 2: Get null prompt embeddings
+        prompt_embeds = self._encode_null_prompt(batch_size)
+
+        # Step 3: Set up scheduler timesteps
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+        sigmas = self._get_ddim_sigmas()   # <-- derived, not scheduler.sigmas
+
+        # Step 4: Add noise at the highest noise level using DDPM forward process
+        noise = torch.randn_like(clean_latents)
+        initial_t = int(timesteps[0])
+        alpha = self.scheduler.alphas_cumprod[initial_t].item()
+        noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
+
+        # Step 5: Set up hook to capture activations
+        activations_list = []
+        timesteps_list = []
+        sigmas_list = []
+
+        def hook_fn(module, input, output):
+            if output is None:
+                return
+            if isinstance(output, tuple):
+                activation = None
+                for item in reversed(output):
+                    if item is not None and isinstance(item, torch.Tensor):
+                        activation = item
+                        break
+                if activation is None:
+                    return
+            else:
+                activation = output
+            activations_list.append(activation.clone())
+
+        last_block = self._get_last_block()
+        hook_handle = last_block.register_forward_hook(hook_fn)
+
+        # Step 6: Denoise step by step, capturing activations at each step
+        latents = noisy_latents
+
+        try:
+            for i, t in enumerate(timesteps):
+                transformer_inputs = self._get_transformer_input(latents, t, prompt_embeds)
+                model_output = self.transformer(**transformer_inputs, return_dict=False)[0]
+                noise_pred = self._process_model_output(model_output, latents)
+
+                timesteps_list.append(t.clone())
+                sigmas_list.append(sigmas[i])   # per-step sigma from _get_ddim_sigmas
+
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        finally:
+            hook_handle.remove()
+
+        return ActivationOutput(
+            activations=activations_list,
+            timesteps=timesteps_list,
+            sigmas=sigmas_list,
+            clean_latents=clean_latents,
+            denoised_latents=latents,
+        )
+
+
 # Convenience functions
 def create_sd3_extractor(
     device: str = "cuda",
