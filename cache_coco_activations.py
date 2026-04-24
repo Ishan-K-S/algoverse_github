@@ -145,8 +145,8 @@ if __name__ == '__main__':
     coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
     path_to_cache = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
 
-    colab_coco_root = "content/coco_data/val2017"
-    colab_path_to_cache = "content/cache"
+    colab_coco_root = "/content/coco_data/val2017"
+    colab_path_to_cache = "/content/cache"
     
     # Select which model to cache (uncomment one)
     
