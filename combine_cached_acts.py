@@ -119,7 +119,8 @@ if __name__ == "__main__":
     colab_output_cache = "/content/combined_cache"
 
     # List every source you cached, in any order
-    sources = ["ViT", "DinoV2", "SigLIP", "CLIP", "SD3", "FLUX"]
+    #sources = ["ViT", "DinoV2", "SigLIP", "CLIP", "SD3", "FLUX"]
+    sources = ["DinoV2", "PixArt"]
 
     combine_activations(
         cache_root=colab_cache_root,
