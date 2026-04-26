@@ -116,7 +116,7 @@ def _parse_int_field(x: Any, name: str) -> int:
 
 if __name__ == "__main__":
     # ----- Load config -----
-    config_path = "./algoverse_github/config.yaml"
+    config_path = "/content/algoverse_github/config.yaml"
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 

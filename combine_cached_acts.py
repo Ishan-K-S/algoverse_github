@@ -115,12 +115,16 @@ if __name__ == "__main__":
     cache_root  = "/lambda/nfs/AlgoverseResearchAIJK/cache_path"
     output_root = "/lambda/nfs/AlgoverseResearchAIJK/combined_path"
 
+    colab_cache_root = "/content/cache"
+    colab_output_cache = "/content/combined_cache"
+
     # List every source you cached, in any order
-    sources = ["ViT", "DinoV2", "SigLIP", "CLIP", "SD3", "FLUX"]
+    #sources = ["ViT", "DinoV2", "SigLIP", "CLIP", "SD3", "FLUX"]
+    sources = ["DinoV2", "PixArt"]
 
     combine_activations(
-        cache_root=cache_root,
-        output_root=output_root,
+        cache_root=colab_cache_root,
+        output_root=colab_output_cache,
         sources=sources,
         num_workers=12,
     )

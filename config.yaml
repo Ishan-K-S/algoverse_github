@@ -1,5 +1,5 @@
 global:
-  path_to_cache: "/lambda/nfs/AlgoverseResearchAIJK/combined_path"       # path to your flat cached .npz directory
+  path_to_cache: "/content/combined_cache"      # path to your flat cached .npz directory
   combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
   exp_factor: 16         # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
@@ -31,7 +31,7 @@ global:
   use_soft_topk: false
   device: cuda           # "cuda" or "cpu"
   run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_cross_${nb_epochs}epochs
-  diffusion_models: ["SD3", "FLUX"]
+  diffusion_models: ["SD3", "FLUX", "PixArt"]
   # --- wandb ---
   use_wandb: true
   wandb_project: "universal-sae"
@@ -57,5 +57,6 @@ model_zoo:
   # Diffusion/Flow models
   # SD3:  1024 tokens (32x32 patches), feature dim 1536
   # FLUX: 4096 tokens (64x64 patches), feature dim 3072
-  SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
+  # SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
+  PixArt: {input_shape: 1152, num_tokens: 4096, og_model: PixArt}
   # FLUX:   { input_shape: 3072, num_tokens: 4096, og_model: FLUX }
