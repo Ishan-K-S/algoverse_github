@@ -1,4 +1,4 @@
-"""Cross-model feature overlap: DinoV2 vs SD3 in UniversalSAE latent space."""
+"""Cross-model feature overlap: DinoV2 vs PixArt in UniversalSAE latent space."""
 
 # ---- edit these ----
 REPO_ROOT       = "/content/algoverse_github"
@@ -7,10 +7,10 @@ CONFIG_PATH     = "/content/algoverse_github/config.yaml"
 CHECKPOINT_PATH = "/content/checkpoints/usae_epoch_29.pth"
 CKPT_SEARCH_ROOT = "/content"
 
-SOURCES          = ["DinoV2", "SD3"]
-TOP_K            = 64
-MAX_IMAGES       = 500
-SD3_TIMESTEP_IDX = -1
+SOURCES             = ["DinoV2", "PixArt"]
+TOP_K               = 64
+MAX_IMAGES          = 500
+PIXART_TIMESTEP_IDX = -1
 DEVICE           = "cuda"
 OUT_DIR          = "/content/overlap_results"
 # --------------------
@@ -133,31 +133,31 @@ def run():
     print(f"using {n_use}/{len(ds)} images")
 
     jaccard_scores = []
-    count_dino, count_sd3, count_both = Counter(), Counter(), Counter()
+    count_dino, count_pixart, count_both = Counter(), Counter(), Counter()
 
     t0 = time.time()
     for i in range(n_use):
         (acts, meta), _ = ds[i]
-        x_dino = acts["DinoV2"]
-        x_sd3  = acts["SD3"]
+        x_dino   = acts["DinoV2"]
+        x_pixart = acts["PixArt"]
 
-        T = x_sd3.shape[0]
-        t_idx = SD3_TIMESTEP_IDX if SD3_TIMESTEP_IDX >= 0 else T + SD3_TIMESTEP_IDX
-        x_sd3_slice = x_sd3[t_idx]
+        T = x_pixart.shape[0]
+        t_idx = PIXART_TIMESTEP_IDX if PIXART_TIMESTEP_IDX >= 0 else T + PIXART_TIMESTEP_IDX
+        x_pixart_slice = x_pixart[t_idx]
 
         sig_map = meta.get("sigmas_by_model", {})
-        sigmas_sd3 = sig_map.get("SD3", meta.get("sigmas"))
-        if sigmas_sd3 is None:
-            raise KeyError("No SD3 sigma in metadata")
-        sigma_sd3 = sigmas_sd3.view(-1)[t_idx]
+        sigmas_pixart = sig_map.get("PixArt", meta.get("sigmas"))
+        if sigmas_pixart is None:
+            raise KeyError("No PixArt sigma in metadata")
+        sigma_pixart = sigmas_pixart.view(-1)[t_idx]
 
-        top_dino = top_feature_set(model, x_dino,      "DinoV2", None,      TOP_K, device)
-        top_sd3  = top_feature_set(model, x_sd3_slice, "SD3",    sigma_sd3, TOP_K, device)
+        top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device)
+        top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device)
 
-        jaccard_scores.append(jaccard(top_dino, top_sd3))
+        jaccard_scores.append(jaccard(top_dino, top_pixart))
         count_dino.update(top_dino.tolist())
-        count_sd3.update(top_sd3.tolist())
-        count_both.update(set(top_dino.tolist()) & set(top_sd3.tolist()))
+        count_pixart.update(top_pixart.tolist())
+        count_both.update(set(top_dino.tolist()) & set(top_pixart.tolist()))
 
         if (i + 1) % 25 == 0 or (i + 1) == n_use:
             print(f"  [{i+1}/{n_use}] mean Jaccard = {np.mean(jaccard_scores):.4f}  "
@@ -171,7 +171,7 @@ def run():
     print("\nTop-20 co-active features:")
     for rank, (fid, cnt) in enumerate(top20, 1):
         print(f"  {rank:2d}. feat {fid:<6d}  both={cnt:4d}  "
-              f"dino={count_dino.get(fid,0):4d}  sd3={count_sd3.get(fid,0):4d}")
+              f"dino={count_dino.get(fid,0):4d}  pixart={count_pixart.get(fid,0):4d}")
 
     np.savez(
         os.path.join(OUT_DIR, "overlap_stats.npz"),
@@ -184,7 +184,7 @@ def run():
     ax1.hist(jaccard_scores, bins=40, edgecolor="black", alpha=0.85)
     ax1.axvline(jaccard_scores.mean(), color="red", linestyle="--",
                 label=f"mean = {jaccard_scores.mean():.3f}")
-    ax1.set_xlabel(f"Per-image Jaccard(top-{TOP_K} DinoV2, top-{TOP_K} SD3)")
+    ax1.set_xlabel(f"Per-image Jaccard(top-{TOP_K} DinoV2, top-{TOP_K} PixArt)")
     ax1.set_ylabel("Image count")
     ax1.set_title("Cross-model top-k feature overlap")
     ax1.legend()
