@@ -6,7 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
-import wandb
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -125,17 +131,17 @@ def _pick_diffusion_slice(
     timestep_idx: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
-    Select one diffusion timestep slice
+    Select one diffusion timestep slice for a TIDE-style training step.
+
+    TIDE trains on activations from sampled timesteps; it does not need to
+    iterate over every timestep in the same optimization step.
     """
     if x.dim() != 4:
         raise ValueError(f"Expected diffusion activations shaped (B, T, N, D), got {tuple(x.shape)}")
 
     _, total_steps, _, _ = x.shape
     if timestep_idx is None:
-            #Old code:
-        #timestep_idx = random.randrange(total_steps)
-            #For now, we're always using the last timestep, as done below:
-        timestep_idx = total_steps - 1
+        timestep_idx = random.randrange(total_steps)
     return x[:, timestep_idx], t_bt[:, timestep_idx], timestep_idx
 
 
@@ -143,7 +149,7 @@ def _pick_temporal_neighbor_idx(timestep_idx: int, total_steps: int) -> Optional
     """
     Pick a neighboring timestep index for temporal consistency.
 
-    Prefers an adjacent step because temporal consistency objective is
+    Prefers an adjacent step because TIDE's temporal consistency objective is
     meant to smooth nearby timesteps along the denoising trajectory.
     """
     if total_steps <= 1:
@@ -314,23 +320,39 @@ def train_universal_sae(
     log_every: int = 50,
     temporal_consistency_weight: float = 0.1,
     cosine_weight: float = 0.0,
-    sparsity_weight: float = 1e-2,
-    orthogonality_weight: float = 0,
+    sparsity_weight: float = 1e-4,
+    orthogonality_weight: float = 1e-3,
+    curriculum_epochs: int = 0,
+    curriculum_self_only: bool = False,
+    balanced_sources: bool = False,
 ):
     """
-    Train a Universal SAE with Temporal Awareness
+    Train a Universal SAE with TIDE-style timestep conditioning.
+
+    Key differences from the earlier loop:
+      - Treat metadata values as timesteps/noise-level conditioning, not opaque
+        sigmas.
+      - Sample one source timestep per diffusion batch, which matches the
+        paper's "extract activation layers from different timesteps each time"
+        setup more closely than summing every timestep in one step.
+      - Align target diffusion timesteps by nearest actual conditioning value.
+      - Pass timestep conditioning through encode/decode consistently.
+      - Add a temporal consistency term over neighboring diffusion timesteps.
+      - Add cosine reconstruction and explicit sparsity penalties.
     """
     model.train()
 
     diffusion_models = set(diffusion_models)
     cross_weight = 2.0
     self_weight = 1.0
+    del balanced_sources
 
     warmup_steps = 1000
     base_lr = optimizer.param_groups[0]["lr"]
 
     global_step = epoch * len(dataloader)
     last_loss = torch.tensor(0.0, device=device)
+    in_curriculum = epoch < curriculum_epochs
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         source = random.choice(list(acts.keys()))
@@ -394,6 +416,9 @@ def train_universal_sae(
             per_target_losses[f"{source}_orthogonality"] = source_ortho.item()
 
         for target, x_target in acts.items():
+            if in_curriculum and curriculum_self_only and target != source:
+                continue
+
             x_target = x_target.to(device)
 
             if target in diffusion_models:
@@ -453,6 +478,7 @@ def train_universal_sae(
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
+                "train/in_curriculum": float(in_curriculum),
             }
             for pair, value in per_target_losses.items():
                 safe_key = pair.replace("->", "_to_")
