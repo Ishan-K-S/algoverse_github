@@ -1,4 +1,4 @@
-"""Cross-model feature overlap: DinoV2 vs PixArt in UniversalSAE latent space."""
+"""cross-model feature overlap: dinov2 vs pixart in universalsae latent space."""
 
 # ---- edit these ----
 REPO_ROOT       = "/content/algoverse_github"
@@ -29,6 +29,7 @@ from data import CocoActivationDataset
 from universal_sae import UniversalSAE
 
 
+# walk a tree and list every checkpoint file with size + mtime
 def find_checkpoints(root, extensions=(".pt", ".ckpt", ".pth")):
     if not os.path.isdir(root):
         print(f"root does not exist: {root}")
@@ -51,6 +52,7 @@ def find_checkpoints(root, extensions=(".pt", ".ckpt", ".pth")):
     return hits
 
 
+# rebuild universalsae from ckpt fields, fill rest from config.yaml
 def load_universal_sae(ckpt_path, config_path, device):
     print(f"loading ckpt: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -61,6 +63,7 @@ def load_universal_sae(ckpt_path, config_path, device):
     sae_p  = cfg_file.get("sae_params", {})
     g_ckpt = (ckpt.get("config") or {}).get("global", {}) if isinstance(ckpt.get("config"), dict) else {}
 
+    # ckpt config wins, then yaml, then default
     def pick(key, default=None):
         if key in g_ckpt: return g_ckpt[key]
         if key in g_file: return g_file[key]
@@ -89,6 +92,7 @@ def load_universal_sae(ckpt_path, config_path, device):
     return model.to(device).eval(), cfg_file
 
 
+# encode one image, score features by mean |z| across tokens, return top-k indices
 @torch.no_grad()
 def top_feature_set(model, x, source, sigma, top_k, device):
     x = x.to(device).unsqueeze(0).float()
@@ -100,6 +104,7 @@ def top_feature_set(model, x, source, sigma, top_k, device):
     return idx.cpu().numpy()
 
 
+# set jaccard over two index arrays
 def jaccard(a, b):
     sa, sb = set(a.tolist()), set(b.tolist())
     u = sa | sb
@@ -109,6 +114,7 @@ def jaccard(a, b):
 def run():
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    # show available checkpoints, then load the configured one
     print("=" * 60)
     find_checkpoints(CKPT_SEARCH_ROOT)
     if not os.path.isfile(CHECKPOINT_PATH):
@@ -118,6 +124,7 @@ def run():
     model, cfg = load_universal_sae(CHECKPOINT_PATH, CONFIG_PATH, device)
     g = cfg.get("global", {})
 
+    # combined npz so we can pull pixart sigmas from metadata
     ds = CocoActivationDataset(
         cache_root=CACHE_ROOT,
         sources=SOURCES,
@@ -141,10 +148,12 @@ def run():
         x_dino   = acts["DinoV2"]
         x_pixart = acts["PixArt"]
 
+        # pick one diffusion timestep slice
         T = x_pixart.shape[0]
         t_idx = PIXART_TIMESTEP_IDX if PIXART_TIMESTEP_IDX >= 0 else T + PIXART_TIMESTEP_IDX
         x_pixart_slice = x_pixart[t_idx]
 
+        # matching sigma for that timestep
         sig_map = meta.get("sigmas_by_model", {})
         sigmas_pixart = sig_map.get("PixArt", meta.get("sigmas"))
         if sigmas_pixart is None:
@@ -154,6 +163,7 @@ def run():
         top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device)
         top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device)
 
+        # per-image overlap + running per-feature counts
         jaccard_scores.append(jaccard(top_dino, top_pixart))
         count_dino.update(top_dino.tolist())
         count_pixart.update(top_pixart.tolist())
@@ -173,6 +183,7 @@ def run():
         print(f"  {rank:2d}. feat {fid:<6d}  both={cnt:4d}  "
               f"dino={count_dino.get(fid,0):4d}  pixart={count_pixart.get(fid,0):4d}")
 
+    # raw arrays for downstream use
     np.savez(
         os.path.join(OUT_DIR, "overlap_stats.npz"),
         jaccard_scores=jaccard_scores,
@@ -180,6 +191,7 @@ def run():
         both_counts=np.array([c for _, c in top20], dtype=np.int64),
     )
 
+    # histogram of per-image jaccard
     fig1, ax1 = plt.subplots(figsize=(7, 4))
     ax1.hist(jaccard_scores, bins=40, edgecolor="black", alpha=0.85)
     ax1.axvline(jaccard_scores.mean(), color="red", linestyle="--",
@@ -192,6 +204,7 @@ def run():
     fig1.savefig(os.path.join(OUT_DIR, "jaccard_histogram.png"), dpi=150)
     plt.show()
 
+    # top-20 universally co-active features
     if top20:
         ids, cnts = [str(f) for f, _ in top20], [c for _, c in top20]
         fig2, ax2 = plt.subplots(figsize=(9, 4.5))
