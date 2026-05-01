@@ -247,13 +247,19 @@ class CocoActivationDataset(Dataset):
         """
         if self.combined_npz:
             path = os.path.join(self.cache_root, f"{self.stems[index]}_combined.npz")
-            npz = np.load(path, mmap_mode="r")
+            try:
+                npz = np.load(path, mmap_mode="r")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load combined npz: {path}. The file may be corrupted or was interrupted during saving.") from e
             raw = _read_npz_key(npz, source)
             if raw is None:
                 raise KeyError(f"Key '{source}' missing in combined npz: {path}")
         else:
             path = self.source_paths[source][index]
-            npz = np.load(path, mmap_mode="r")
+            try:
+                npz = np.load(path, mmap_mode="r")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load source npz: {path}. The file may be corrupted or was interrupted during saving.") from e
             raw = _read_npz_key(npz, "activation")
             if raw is None:
                 raise KeyError(f"Key 'activation' missing in npz: {path}")
@@ -263,7 +269,10 @@ class CocoActivationDataset(Dataset):
     def _load_combined_npz_full(self, index: int) -> Dict[str, torch.Tensor]:
         """Load every key from the combined npz as a dict of tensors."""
         path = os.path.join(self.cache_root, f"{self.stems[index]}_combined.npz")
-        npz = np.load(path, mmap_mode="r")
+        try:
+            npz = np.load(path, mmap_mode="r")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load combined npz: {path}. The file may be corrupted or was interrupted during saving.") from e
         return {key: torch.from_numpy(npz[key].copy()) for key in npz.files}
 
     # ---------------------------------------------------------------------- #

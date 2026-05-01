@@ -63,7 +63,7 @@ def cache_diffusion_activations(
     """
     #print(f"[diffusion-cache] source={source_name} split={split}")
 
-    ds = CocoData(coco_root, transform=extractor.preprocess)
+    ds = CocoData(coco_root, transform=extractor.preprocess, max_images=350)
 
     dl = torch.utils.data.DataLoader(
         ds,

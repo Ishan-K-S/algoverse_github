@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 
 class CocoData(Dataset):
 
-    def __init__(self, path_to_data, transform):
+    def __init__(self, path_to_data, transform, max_images=None):
         self.path_to_data = path_to_data
         self.transform = transform
 
@@ -16,6 +16,8 @@ class CocoData(Dataset):
                        ]
         
         self.images.sort()
+        if max_images is not None:
+            self.images = self.images[:max_images]
 
     def __len__(self):
         return len(self.images)
