@@ -58,5 +58,5 @@ model_zoo:
   # SD3:  1024 tokens (32x32 patches), feature dim 1536
   # FLUX: 4096 tokens (64x64 patches), feature dim 3072
   # SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
-  PixArt: {input_shape: 1152, num_tokens: 4096, og_model: PixArt}
+  PixArt: {input_shape: 1152, num_tokens: 1024, og_model: PixArt}
   # FLUX:   { input_shape: 3072, num_tokens: 4096, og_model: FLUX }
