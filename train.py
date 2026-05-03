@@ -199,6 +199,11 @@ def _sample_layer_index(num_layers: int) -> int:
     return random.randrange(num_layers)
 
 
+def _set_optimizer_lr(optimizer, lr: float) -> None:
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+
 def _extract_source_slice(
     x: torch.Tensor,
     is_diffusion: bool,
@@ -355,10 +360,19 @@ def train_universal_sae(
     in_curriculum = epoch < curriculum_epochs
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
+        global_step_actual = global_step + batch_idx
+        if warmup_steps > 0:
+            warmup_scale = min((global_step_actual + 1) / warmup_steps, 1.0)
+            _set_optimizer_lr(optimizer, base_lr * warmup_scale)
+        else:
+            _set_optimizer_lr(optimizer, base_lr)
+
         source = random.choice(list(acts.keys()))
         optimizer.zero_grad()
 
         loss = torch.tensor(0.0, device=device)
+        reconstruction_loss = torch.tensor(0.0, device=device)
+        reconstruction_weight_total = 0.0
         per_target_losses: Dict[str, float] = {}
         batch_sparsity_loss = None
 
@@ -457,20 +471,18 @@ def train_universal_sae(
                 target_total_loss = target_total_loss + cosine_weight * target_cosine_loss
                 per_target_losses[f"{source}->{target}_cosine"] = target_cosine_loss.item()
 
-            loss = loss + weight * target_total_loss
+            reconstruction_loss = reconstruction_loss + weight * target_total_loss
+            reconstruction_weight_total += weight
             per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
+
+        if reconstruction_weight_total > 0:
+            loss = loss + (reconstruction_loss / reconstruction_weight_total)
 
         loss.backward()
         optimizer.step()
         if hasattr(model, "normalize_decoder_dictionaries_"):
             model.normalize_decoder_dictionaries_()
         last_loss = loss.detach()
-
-        global_step_actual = global_step + batch_idx
-        if global_step_actual < warmup_steps:
-            warmup_lr = base_lr * (global_step_actual / warmup_steps)
-            for pg in optimizer.param_groups:
-                pg["lr"] = warmup_lr
 
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
             log_dict = {
