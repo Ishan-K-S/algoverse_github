@@ -322,8 +322,8 @@ def train_universal_sae(
     cosine_weight: float = 0.0,
     sparsity_weight: float = 1e-4,
     orthogonality_weight: float = 1e-3,
-    curriculum_epochs: int = 0,
-    curriculum_self_only: bool = False,
+    curriculum_epochs: int = 5,
+    curriculum_self_only: bool = True,
     balanced_sources: bool = False,
 ):
     """

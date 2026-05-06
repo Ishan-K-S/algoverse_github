@@ -7,6 +7,7 @@ global:
   batch_size: 16
   num_workers: 8        # DataLoader worker processes
   nb_epochs: 30
+  #curriculum_epochs: 5  #incrased from default 2 to 5
   save_every: 5         # save a checkpoint every N epochs
   standardize: true     # standardise activations (mean=0, std=1)
   divide_norm: false    # normalise by L2 norm instead of standardising
