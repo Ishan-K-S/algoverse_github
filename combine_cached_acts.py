@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     # List every source you cached, in any order
     #sources = ["ViT", "DinoV2", "SigLIP", "CLIP", "SD3", "FLUX"]
-    sources = ["DinoV2", "PixArt"]
+    sources = ["DinoV2"]
 
     combine_activations(
         cache_root=colab_cache_root,
