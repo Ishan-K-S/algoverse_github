@@ -182,7 +182,7 @@ class BaseActivationExtractor(ABC, nn.Module):
             activations_list.append(activation.clone())
         
         # Register hook on the last transformer block
-        last_block = self._get_last_block()
+        last_block = self._get_last_block().attn2
         hook_handle = last_block.register_forward_hook(hook_fn)
         
         # Step 6: Denoise step by step, capturing activations at each step
