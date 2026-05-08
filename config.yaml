@@ -20,7 +20,7 @@ global:
   lr: 0.0003
   final_lr: 1.0e-06
   weight_decay: 1.0e-05
-  warmup_steps: 44
+  warmup_steps: 33
   # Token interpolation mode for pooling/unpooling operations
   # Options: "bilinear" (default), "nearest", "bicubic"
   interpolation_mode: bilinear
