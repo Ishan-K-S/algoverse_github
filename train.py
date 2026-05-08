@@ -199,9 +199,17 @@ def _sample_layer_index(num_layers: int) -> int:
     return random.randrange(num_layers)
 
 
-def _set_optimizer_lr(optimizer, lr: float) -> None:
+def _set_optimizer_warmup_lr(optimizer, warmup_scale: float) -> None:
     for pg in optimizer.param_groups:
-        pg["lr"] = lr
+        initial_lr = pg.setdefault("initial_lr", pg["lr"])
+        pg["lr"] = initial_lr * warmup_scale
+
+
+def _pick_source(acts: Dict[str, torch.Tensor], step: int, balanced_sources: bool) -> str:
+    source_names = sorted(acts.keys())
+    if balanced_sources:
+        return source_names[step % len(source_names)]
+    return random.choice(source_names)
 
 
 def _extract_source_slice(
@@ -330,6 +338,8 @@ def train_universal_sae(
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
+    warmup_steps: int = 1000,
+    ema_decay: float = 0.98,
 ):
     """
     Train a Universal SAE with TIDE-style timestep conditioning.
@@ -350,24 +360,19 @@ def train_universal_sae(
     diffusion_models = set(diffusion_models)
     cross_weight = 2.0
     self_weight = 1.0
-    del balanced_sources
-
-    warmup_steps = 1000
-    base_lr = optimizer.param_groups[0]["lr"]
 
     global_step = epoch * len(dataloader)
     last_loss = torch.tensor(0.0, device=device)
+    ema_loss = getattr(model, "_train_loss_ema", None)
     in_curriculum = epoch < curriculum_epochs
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         global_step_actual = global_step + batch_idx
-        if warmup_steps > 0:
-            warmup_scale = min((global_step_actual + 1) / warmup_steps, 1.0)
-            _set_optimizer_lr(optimizer, base_lr * warmup_scale)
-        else:
-            _set_optimizer_lr(optimizer, base_lr)
+        if 0 < global_step_actual + 1 <= warmup_steps:
+            warmup_scale = (global_step_actual + 1) / warmup_steps
+            _set_optimizer_warmup_lr(optimizer, warmup_scale)
 
-        source = random.choice(list(acts.keys()))
+        source = _pick_source(acts, global_step_actual, balanced_sources)
         optimizer.zero_grad()
 
         loss = torch.tensor(0.0, device=device)
@@ -484,9 +489,14 @@ def train_universal_sae(
             model.normalize_decoder_dictionaries_()
         last_loss = loss.detach()
 
+        loss_value = loss.item()
+        ema_loss = loss_value if ema_loss is None else (ema_decay * ema_loss + (1.0 - ema_decay) * loss_value)
+        model._train_loss_ema = ema_loss
+
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
             log_dict = {
-                "train/total_loss": loss.item(),
+                "train/total_loss": loss_value,
+                "train/total_loss_ema": ema_loss,
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
