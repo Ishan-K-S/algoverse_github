@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from data import CocoActivationDataset
 from universal_sae import UniversalSAE
-from train_universal_sae_balanced import train_universal_sae
+from train import train_universal_sae
 
 # ---------------------------------------------------------------------------
 # wandb setup
