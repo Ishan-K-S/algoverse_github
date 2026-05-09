@@ -28,7 +28,7 @@ from train import train_universal_sae
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
+WANDB_API_KEY = "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" 
 
 try:
     import wandb
