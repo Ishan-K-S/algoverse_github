@@ -2,7 +2,7 @@ global:
   path_to_cache: "/content/combined_cache"      # path to your flat cached .npz directory
   combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
-  exp_factor: 16         # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
+  exp_factor: 32  # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
   input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
   batch_size: 16
   num_workers: 8        # DataLoader worker processes
