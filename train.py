@@ -357,6 +357,28 @@ def train_universal_sae(
     """
     model.train()
 
+    if epoch == 0:
+        print("\n" + "="*60)
+        print("ACTIVATION STATISTICS CHECK")
+        print("="*60)
+        
+        # Get one batch
+        for (acts, meta), _y in dataloader:
+            for source_name, source_acts in acts.items():
+                source_acts = source_acts.to(device)
+                
+                # Flatten for stats
+                flat = source_acts.reshape(source_acts.shape[0], -1)
+                
+                print(f"{source_name:12s} - "
+                      f"min: {flat.min():.4f}, "
+                      f"max: {flat.max():.4f}, "
+                      f"mean: {flat.mean():.4f}, "
+                      f"std: {flat.std():.4f}")
+            
+            print("="*60 + "\n")
+            break  # Only check first batch
+
     diffusion_models = set(diffusion_models)
     cross_weight = 2.0
     self_weight = 1.0
