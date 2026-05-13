@@ -531,6 +531,25 @@ def train_universal_sae(
             with torch.no_grad():
                 log_dict["train/latent_sparsity"] = (z == 0).float().mean().item()
 
+                active_per_sample = (z != 0).float()
+                feature_active_rate = active_per_sample.mean(dim=tuple(range(active_per_sample.dim() - 1)))
+                active_mask = (feature_active_rate > 1e-3)
+                num_active = int(active_mask.sum().item())
+                log_dict[f"train/active_features_{source}"] = num_active
+
+                prev_masks = getattr(model, "_active_feature_masks", {})
+                prev_masks[source] = active_mask.detach().cpu()
+                model._active_feature_masks = prev_masks
+                if len(prev_masks) >= 2:
+                    keys = list(prev_masks.keys())
+                    a, b = prev_masks[keys[0]], prev_masks[keys[1]]
+                    intersection = int((a & b).sum().item())
+                    union = int((a | b).sum().item())
+                    jaccard = intersection / union if union > 0 else 0.0
+                    log_dict["train/feature_overlap_intersection"] = intersection
+                    log_dict["train/feature_overlap_union"] = union
+                    log_dict["train/feature_overlap_jaccard"] = jaccard
+
             wandb.log(log_dict, step=global_step_actual)
 
     return last_loss
