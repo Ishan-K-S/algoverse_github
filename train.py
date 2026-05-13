@@ -14,6 +14,8 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+SAVE_MODEL_PATH = "./models/universal_sae_final.pt"
+
 
 def mse_flat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
@@ -340,6 +342,7 @@ def train_universal_sae(
     balanced_sources: bool = False,
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
+    save_model_path: str = SAVE_MODEL_PATH,
 ):
     """
     Train a Universal SAE with TIDE-style timestep conditioning.
@@ -552,4 +555,15 @@ def train_universal_sae(
 
             wandb.log(log_dict, step=global_step_actual)
 
+
+    os.makedirs(
+        os.path.dirname(save_model_path) or ".",
+        exist_ok=True,
+    )
+
+    torch.save(model, save_model_path)
+
+    print("\n[save] Full model saved:")
+    print(f"       {save_model_path}\n")
+    
     return last_loss
