@@ -10,6 +10,13 @@ import torch
 import yaml
 from tqdm import tqdm
 
+# THESE ARE WHAT TO FILL IN
+
+CACHE_ROOT = "/path/to/cache_root"
+CONFIG_PATH = "config.yaml"
+CHECKPOINT_PATH = "/path/to/checkpoint.pt"
+SOURCE = "DinoV2"
+OUTPUT_PATH = "top_activations.json"
 
 MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
 
