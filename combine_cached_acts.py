@@ -19,12 +19,15 @@ Combined npz keys:
   <MODEL>__sigmas    – (T,) float32 array, diffusion models only
   <MODEL>__timesteps – (T,) int64 array,  diffusion models only
 """
-
+import shutil
 import os
 import glob
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
+from google.colab import files
+
+
 
 DIFF_META_FIELDS = ("sigmas", "timesteps")
 
@@ -128,3 +131,7 @@ if __name__ == "__main__":
         sources=sources,
         num_workers=12,
     )
+
+    shutil.make_archive("combined_cache1", 'zip', colab_output_cache)
+    files.download("combined_cache1.zip")
+
