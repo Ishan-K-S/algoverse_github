@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
-CHECKPOINT_PATH = "/content/algoverse_github/.ipynb_checkpoints/universal_sae-checkpoint.py"
+CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_30.pth"
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/top_activations.json"
 
