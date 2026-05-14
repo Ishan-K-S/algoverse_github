@@ -12,11 +12,11 @@ from tqdm import tqdm
 
 # THESE ARE WHAT TO FILL IN
 
-CACHE_ROOT = "/path/to/cache_root"
-CONFIG_PATH = "config.yaml"
-CHECKPOINT_PATH = "/path/to/checkpoint.pt"
+CACHE_ROOT = "/content/combined_cache"
+CONFIG_PATH = "/content/algoverse_github/config.yaml"
+CHECKPOINT_PATH = "/content/algoverse_github/.ipynb_checkpoints/universal_sae-checkpoint.py"
 SOURCE = "DinoV2"
-OUTPUT_PATH = "top_activations.json"
+OUTPUT_PATH = "/top_activations.json"
 
 MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
 
