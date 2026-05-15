@@ -2,9 +2,10 @@
 
 # ---- edit these ----
 REPO_ROOT       = "/content/algoverse_github"
-CACHE_ROOT      = "/content/cache"
+CACHE_ROOT      = "/content/combined_cache"
 CONFIG_PATH     = "/content/algoverse_github/config.yaml"
-CHECKPOINT_PATH = "/content/checkpoints/usae_epoch_29.pth"
+WEIGHTS_DIR     = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
+CHECKPOINT_PATH = "/content/algoverse_github/weights/ex32_bs16_topk64_LR0.0003_cross_30epochs/usae_epoch_29.pth"  # fallback if auto-search fails
 CKPT_SEARCH_ROOT = "/content"
 
 SOURCES             = ["DinoV2", "PixArt"]
@@ -13,9 +14,10 @@ MAX_IMAGES          = 500
 PIXART_TIMESTEP_IDX = -1
 DEVICE           = "cuda"
 OUT_DIR          = "/content/overlap_results"
+DRIVE_SAVE_DIR   = "/content/drive/My Drive/algoverse_results"
 # --------------------
 
-import os, sys, time
+import os, sys, time, glob, shutil
 import numpy as np
 import torch
 import yaml
@@ -50,6 +52,40 @@ def find_checkpoints(root, extensions=(".pt", ".ckpt", ".pth")):
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
         print(f"  {st.st_size / 1048576:>10.2f}   {mtime:<20}   {p}")
     return hits
+
+
+# return the most recently modified .pth file under a directory
+def find_latest_checkpoint(weights_dir):
+    candidates = glob.glob(os.path.join(weights_dir, "**", "*.pth"), recursive=True)
+    if not candidates:
+        raise FileNotFoundError(f"No .pth checkpoints found under {weights_dir}")
+    latest = max(candidates, key=os.path.getmtime)
+    print(f"[ckpt] Auto-selected: {latest}")
+    return latest
+
+
+# copy the overlap result files to google drive so they survive runtime resets
+def save_to_drive(out_dir, drive_dir):
+    try:
+        from google.colab import drive as _colab_drive
+        if not os.path.isdir("/content/drive/My Drive"):
+            print("[drive] Mounting Google Drive...")
+            _colab_drive.mount("/content/drive")
+    except ImportError:
+        print("[drive] Not running in Colab — skipping Drive upload.")
+        return
+
+    os.makedirs(drive_dir, exist_ok=True)
+    if not os.path.isdir(out_dir):
+        print(f"[drive] Warning: {out_dir} not found — skipping.")
+        return
+    for fname in os.listdir(out_dir):
+        src = os.path.join(out_dir, fname)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(drive_dir, fname)
+        shutil.copy2(src, dst)
+        print(f"[drive] Saved: {dst}")
 
 
 # rebuild universalsae from ckpt fields, fill rest from config.yaml
@@ -114,14 +150,28 @@ def jaccard(a, b):
 def run():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # show available checkpoints, then load the configured one
+    # path diagnostics
     print("=" * 60)
+    print(f"[overlap] cache_root  : {CACHE_ROOT}  exists={os.path.isdir(CACHE_ROOT)}")
+    print(f"[overlap] config      : {CONFIG_PATH}  exists={os.path.isfile(CONFIG_PATH)}")
+    print(f"[overlap] checkpoint  : {CHECKPOINT_PATH}  exists={os.path.isfile(CHECKPOINT_PATH)}")
+    if not os.path.isdir(CACHE_ROOT):
+        raise FileNotFoundError(
+            f"[overlap] Combined cache not found: {CACHE_ROOT}\n"
+            "  Run combine_cached_acts.py first."
+        )
+    if not os.path.isfile(CONFIG_PATH):
+        raise FileNotFoundError(f"[overlap] config.yaml not found: {CONFIG_PATH}")
+
+    # show available checkpoints, then load the configured one (auto-search if missing)
     find_checkpoints(CKPT_SEARCH_ROOT)
-    if not os.path.isfile(CHECKPOINT_PATH):
-        raise FileNotFoundError(f"CHECKPOINT_PATH not found: {CHECKPOINT_PATH}")
+    checkpoint = CHECKPOINT_PATH
+    if not os.path.isfile(checkpoint):
+        print(f"[overlap] Checkpoint not found at {checkpoint!r}, searching {WEIGHTS_DIR}...")
+        checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
 
     device = DEVICE if (DEVICE != "cuda" or torch.cuda.is_available()) else "cpu"
-    model, cfg = load_universal_sae(CHECKPOINT_PATH, CONFIG_PATH, device)
+    model, cfg = load_universal_sae(checkpoint, CONFIG_PATH, device)
     g = cfg.get("global", {})
 
     # combined npz so we can pull pixart sigmas from metadata
@@ -216,6 +266,8 @@ def run():
         fig2.tight_layout()
         fig2.savefig(os.path.join(OUT_DIR, "top20_coactive_features.png"), dpi=150)
         plt.show()
+
+    save_to_drive(OUT_DIR, DRIVE_SAVE_DIR)
 
     return jaccard_scores, top20
 
