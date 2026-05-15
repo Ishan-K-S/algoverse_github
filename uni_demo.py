@@ -115,8 +115,18 @@ def _parse_int_field(x: Any, name: str) -> int:
 
 
 if __name__ == "__main__":
+    # ----- Startup checks -----
+    print(f"[uni_demo] ---- Starting training ----")
+    print(f"[uni_demo] GPU available : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[uni_demo] GPU           : {torch.cuda.get_device_name(0)}")
+        print(f"[uni_demo] VRAM          : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
     # ----- Load config -----
     config_path = "/content/algoverse_github/config.yaml"
+    print(f"[uni_demo] config_path   : {config_path}  exists={os.path.isfile(config_path)}")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"[uni_demo] config.yaml not found: {config_path}")
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -130,6 +140,12 @@ if __name__ == "__main__":
 
     # ----- Required paths -----
     cache_root = _require_nonempty(CONFIG, "path_to_cache")
+    print(f"[uni_demo] cache_root    : {cache_root}  exists={os.path.isdir(cache_root)}")
+    if not os.path.isdir(cache_root):
+        raise FileNotFoundError(
+            f"[uni_demo] Combined cache not found: {cache_root}\n"
+            "  Run combine_cached_acts.py first, or update path_to_cache in config.yaml."
+        )
 
     # ----- Sources + diffusion models -----
     sources = list(MODEL_ZOO.keys())
@@ -181,6 +197,8 @@ if __name__ == "__main__":
         # num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
         pin_memory=True,
     )
+    print(f"[uni_demo] Dataset size  : {len(dataset)} images")
+    print(f"[uni_demo] Dataloader    : {len(dataloader)} batches  (batch_size={CONFIG.get('batch_size', 32)})")
 
     # ----- Build UniversalSAE -----
     exp_factor = _parse_int_field(CONFIG.get("exp_factor", 8), "CONFIG.global.exp_factor")

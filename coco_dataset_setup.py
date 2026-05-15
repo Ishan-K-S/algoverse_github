@@ -10,14 +10,28 @@ class CocoData(Dataset):
         self.path_to_data = path_to_data
         self.transform = transform
 
+        if not os.path.isdir(path_to_data):
+            raise RuntimeError(
+                f"[CocoData] Image directory not found: {path_to_data}\n"
+                "  Make sure you downloaded COCO val2017 and extracted it to this path."
+            )
+
         self.images = [
                     f for f in os.listdir(path_to_data)
                     if f.lower().endswith(('.jpg', '.png', '.jpeg'))
                        ]
-        
+
+        if len(self.images) == 0:
+            raise RuntimeError(
+                f"[CocoData] No images (.jpg/.png/.jpeg) found in: {path_to_data}"
+            )
+
         self.images.sort()
         if max_images is not None:
             self.images = self.images[:max_images]
+
+        print(f"[CocoData] Found {len(self.images)} images in {path_to_data}"
+              + (f" (capped at {max_images})" if max_images is not None else ""))
 
     def __len__(self):
         return len(self.images)

@@ -1,8 +1,10 @@
 """Rank cached images by SAE feature activation and write top-K per feature to JSON."""
 
 import argparse
+import glob
 import json
 import os
+import shutil
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -10,15 +12,49 @@ import torch
 import yaml
 from tqdm import tqdm
 
+
 # THESE ARE WHAT TO FILL IN
 
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
-CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_30.pth"
+WEIGHTS_DIR = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
+CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_29.pth"  # fallback if auto-search fails
 SOURCE = "DinoV2"
-OUTPUT_PATH = "/top_activations.json"
+OUTPUT_PATH = "/content/top_activations.json"
+DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
 
 MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
+
+
+def find_latest_checkpoint(weights_dir: str) -> str:
+    """Return the most recently modified .pth file under weights_dir."""
+    candidates = glob.glob(os.path.join(weights_dir, "**", "*.pth"), recursive=True)
+    if not candidates:
+        raise FileNotFoundError(f"No .pth checkpoints found under {weights_dir}")
+    latest = max(candidates, key=os.path.getmtime)
+    print(f"[ckpt] Auto-selected: {latest}")
+    return latest
+
+
+def save_to_drive(output_path: str, checkpoint_path: str, drive_dir: str) -> None:
+    """Copy the results JSON and SAE checkpoint to Google Drive."""
+    try:
+        from google.colab import drive as _colab_drive
+        if not os.path.isdir("/content/drive/My Drive"):
+            print("[drive] Mounting Google Drive...")
+            _colab_drive.mount("/content/drive")
+    except ImportError:
+        print("[drive] Not running in Colab — skipping Drive upload.")
+        return
+
+    os.makedirs(drive_dir, exist_ok=True)
+    for src in (output_path, checkpoint_path):
+        if not os.path.isfile(src):
+            print(f"[drive] Warning: {src} not found — skipping.")
+            continue
+        dst = os.path.join(drive_dir, os.path.basename(src))
+        shutil.copy2(src, dst)
+        print(f"[drive] Saved: {dst}")
 
 
 def load_combined_npz(path: str) -> Dict[str, np.ndarray]:
@@ -223,11 +259,11 @@ def compute_top_activations(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--cache_root", required=True)
-    p.add_argument("--config", required=True)
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--source", required=True)
-    p.add_argument("--output", required=True)
+    p.add_argument("--cache_root", default=CACHE_ROOT)
+    p.add_argument("--config", default=CONFIG_PATH)
+    p.add_argument("--checkpoint", default=CHECKPOINT_PATH)
+    p.add_argument("--source", default=SOURCE)
+    p.add_argument("--output", default=OUTPUT_PATH)
     p.add_argument("--top_pct", type=float, default=0.1)
     p.add_argument("--timestep_idx", type=int, default=-1)
     p.add_argument("--use_cls", action="store_true")
@@ -240,7 +276,29 @@ def parse_args():
 def main():
     args = parse_args()
 
-    model, cfg = load_universal_sae(args.checkpoint, args.config, args.device)
+    print(f"[top-act] ---- Starting top_activating_images ----")
+    print(f"[top-act] cache_root  : {args.cache_root}  exists={os.path.isdir(args.cache_root)}")
+    print(f"[top-act] config      : {args.config}  exists={os.path.isfile(args.config)}")
+    print(f"[top-act] checkpoint  : {args.checkpoint}  exists={os.path.isfile(args.checkpoint)}")
+    print(f"[top-act] source      : {args.source}")
+    print(f"[top-act] output      : {args.output}")
+    print(f"[top-act] device      : {args.device}")
+    if not os.path.isdir(args.cache_root):
+        raise FileNotFoundError(
+            f"[top-act] Combined cache not found: {args.cache_root}\n"
+            "  Run combine_cached_acts.py first."
+        )
+    if not os.path.isfile(args.config):
+        raise FileNotFoundError(
+            f"[top-act] config.yaml not found: {args.config}"
+        )
+
+    checkpoint = args.checkpoint
+    if not os.path.isfile(checkpoint):
+        print(f"[top-act] Checkpoint not found at {checkpoint!r}, searching {WEIGHTS_DIR}...")
+        checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
+
+    model, cfg = load_universal_sae(checkpoint, args.config, args.device)
     diffusion_models = set(cfg.get("global", {}).get("diffusion_models", []))
 
     if args.source in diffusion_models:
@@ -262,6 +320,8 @@ def main():
         device=args.device,
         max_images=args.max_images,
     )
+
+    save_to_drive(args.output, checkpoint, DRIVE_SAVE_DIR)
 
 
 if __name__ == "__main__":

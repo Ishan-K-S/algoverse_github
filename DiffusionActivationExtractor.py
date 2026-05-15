@@ -863,6 +863,14 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         finally:
             hook_handle.remove()
 
+        if not activations_list:
+            raise RuntimeError(
+                f"[PixArt] No activations captured after {self.num_inference_steps} steps. "
+                "The forward hook may not have fired — check that attn2 exists on the last transformer block."
+            )
+        print(f"[PixArt] Captured {len(activations_list)} activations, "
+              f"each shape {tuple(activations_list[0].shape)}")
+
         return ActivationOutput(
             activations=activations_list,
             timesteps=timesteps_list,

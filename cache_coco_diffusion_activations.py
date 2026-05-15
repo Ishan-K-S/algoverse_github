@@ -61,7 +61,17 @@ def cache_diffusion_activations(
       activations (list of (B,N,D)), sigmas(list[float]), timesteps(list[tensor]).
       (This matches your DiffusionActivationExtractor.py.) :contentReference[oaicite:4]{index=4}
     """
-    #print(f"[diffusion-cache] source={source_name} split={split}")
+    print(f"[diffusion-cache] ---- Starting diffusion caching ----")
+    print(f"[diffusion-cache] source     : {source_name}")
+    print(f"[diffusion-cache] coco_root  : {coco_root}  exists={os.path.isdir(coco_root)}")
+    print(f"[diffusion-cache] cache_root : {cache_root}  exists={os.path.isdir(cache_root)}")
+    print(f"[diffusion-cache] device     : {extractor.device}")
+    if not os.path.isdir(coco_root):
+        raise RuntimeError(f"[diffusion-cache] COCO root not found: {coco_root}\n"
+                           "  Download COCO val2017 first: wget http://images.cocodataset.org/zips/val2017.zip")
+    if not os.path.isdir(cache_root):
+        raise RuntimeError(f"[diffusion-cache] Cache directory not found: {cache_root}\n"
+                           "  Create it first: os.makedirs('/content/cache', exist_ok=True)")
 
     ds = CocoData(coco_root, transform=extractor.preprocess, max_images=500)
 
@@ -83,13 +93,20 @@ def cache_diffusion_activations(
 
         # match your vision script’s way of mapping batch indices -> file paths :contentReference[oaicite:5]{index=5}
         #image_paths = dl.dataset.samples[i * dl.batch_size : (i + 1) * dl.batch_size]
-        
+
+        if i == 0:
+            print(f"[diffusion-cache] First batch image shape : {tuple(x.shape)}")
 
         out = extractor.extract_activations(x)
         # out.activations: list length T, each (B,N,D)
         # stack -> (T,B,N,D) -> (B,T,N,D)
         acts_t = torch.stack([a.detach().cpu() for a in out.activations], dim=0)
         acts_btnd = acts_t.permute(1, 0, 2, 3).contiguous()
+
+        if i == 0:
+            print(f"[diffusion-cache] First batch activation shape (B,T,N,D) : {tuple(acts_btnd.shape)}")
+            print(f"[diffusion-cache] Timesteps ({len(out.timesteps)}): {[int(t.item()) for t in out.timesteps]}")
+            print(f"[diffusion-cache] Sigmas    ({len(out.sigmas)}): {[round(s, 4) for s in out.sigmas]}")
 
         # out.sigmas: list[float], out.timesteps: list[tensor] length T
         sigmas = out.sigmas
@@ -119,7 +136,8 @@ def cache_diffusion_activations(
                 timesteps=timesteps,
                 filename=cache_filename,
             )
-    print(f"caching complete")
+    n_written = len([f for f in os.listdir(cache_root) if f.endswith(f"_{source_name}.npz")])
+    print(f"[diffusion-cache] Caching complete. Files written: {n_written} in {cache_root}")
 
 if __name__ == "__main__":
     coco_root = "/lambda/nfs/AlgoverseResearchAIJK/coco_data/train2017"
@@ -129,6 +147,9 @@ if __name__ == "__main__":
     colab_path_to_cache = "/content/cache"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[diffusion-cache] GPU available : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[diffusion-cache] GPU           : {torch.cuda.get_device_name(0)}")
 
     # Choose ONE:
     #extractor = SD3ActivationExtractor(device=device, num_inference_steps=4)

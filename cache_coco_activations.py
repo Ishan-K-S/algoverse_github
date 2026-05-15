@@ -83,6 +83,8 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
         #x are images, y are filenames
         x, y = batch
         x = x.cuda()
+        if i == 0:
+            print(f"[cache] First batch image shape : {tuple(x.shape)}")
         #y = y.cpu()
 
         # Retrieve batch filenames from the dataset
@@ -106,6 +108,8 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
                 output_features = model.forward_features(x)
 
         output_features = output_features.cpu()
+        if i == 0:
+            print(f"[cache] First batch activation shape : {tuple(output_features.shape)}")
 
         # Loop through each sample in the batch
         for j in range(x.size(0)):
@@ -138,7 +142,8 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
                 tensors=(output_features[j].detach()),  #.clone(), y[j].detach().clone()),
                 filename = filename,
             )
-    print(f"Caching Complete!")
+    n_written = len([f for f in os.listdir(path_to_cache) if f.endswith(f"_{model_name}.npz")])
+    print(f"[cache] Caching complete. Files written: {n_written} in {path_to_cache}")
 
 if __name__ == '__main__':
     # Configuration
@@ -147,6 +152,18 @@ if __name__ == '__main__':
 
     colab_coco_root = "/content/coco_data/val2017"
     colab_path_to_cache = "/content/cache"
+
+    print(f"[cache] GPU available : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[cache] GPU           : {torch.cuda.get_device_name(0)}")
+    print(f"[cache] coco_root     : {colab_coco_root}  exists={os.path.isdir(colab_coco_root)}")
+    print(f"[cache] cache dir     : {colab_path_to_cache}  exists={os.path.isdir(colab_path_to_cache)}")
+    if not os.path.isdir(colab_coco_root):
+        raise RuntimeError(f"[cache] COCO root not found: {colab_coco_root}\n"
+                           "  Download COCO val2017 first: wget http://images.cocodataset.org/zips/val2017.zip")
+    if not os.path.isdir(colab_path_to_cache):
+        raise RuntimeError(f"[cache] Cache directory not found: {colab_path_to_cache}\n"
+                           "  Create it first: os.makedirs('/content/cache', exist_ok=True)")
     
     # Select which model to cache (uncomment one)
     

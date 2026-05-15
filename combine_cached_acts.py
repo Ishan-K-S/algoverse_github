@@ -79,7 +79,29 @@ def combine_activations(
     sources     : ordered list of model names, e.g. ["ViT", "DinoV2", "SD3"]
     num_workers : multiprocessing worker count
     """
+    print(f"[combine] ---- Starting combine step ----")
+    print(f"[combine] cache_root   : {cache_root}  exists={os.path.isdir(cache_root)}")
+    print(f"[combine] output_root  : {output_root}")
+    print(f"[combine] sources      : {sources}")
+    print(f"[combine] num_workers  : {num_workers}")
+    if not os.path.isdir(cache_root):
+        raise RuntimeError(
+            f"[combine] cache_root not found: {cache_root}\n"
+            "  Run cache_coco_activations.py and cache_coco_diffusion_activations.py first."
+        )
+    for src in sources:
+        n = len([f for f in os.listdir(cache_root) if f.endswith(f"_{src}.npz")])
+        print(f"[combine]   {src}: {n} cached files found")
+        if n == 0:
+            raise RuntimeError(
+                f"[combine] No '{src}' npz files found in {cache_root}.\n"
+                f"  Expected files ending in '_{src}.npz'. "
+                f"Did the caching script for '{src}' complete successfully?"
+            )
     os.makedirs(output_root, exist_ok=True)
+    already_done = len([f for f in os.listdir(output_root) if f.endswith("_combined.npz")])
+    if already_done > 0:
+        print(f"[combine] {already_done} combined files already exist in {output_root} (will overwrite)")
 
     # Discover image stems from the first source
     anchor_suffix = f"_{sources[0]}.npz"
@@ -111,7 +133,8 @@ def combine_activations(
         for args in tqdm(args_list, desc="Combining activations"):
             _process_one_image(args)
 
-    print("[combine] Done.")
+    n_out = len([f for f in os.listdir(output_root) if f.endswith("_combined.npz")])
+    print(f"[combine] Done. Combined files in {output_root}: {n_out}")
 
 
 if __name__ == "__main__":
@@ -132,6 +155,6 @@ if __name__ == "__main__":
         num_workers=12,
     )
 
-    shutil.make_archive("combined_cache1", 'zip', colab_output_cache)
-    files.download("combined_cache1.zip")
+    #shutil.make_archive("combined_cache1", 'zip', colab_output_cache)
+    #files.download("combined_cache1.zip")
 
