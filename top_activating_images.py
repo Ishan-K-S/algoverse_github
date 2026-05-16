@@ -24,7 +24,7 @@ WEIGHTS_DIR = "/content/algoverse_github/weights"   # searched automatically for
 CHECKPOINT_PATH = "/content/usae_epoch_29.pth"  
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
-DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
+DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_inference_results"
 
 COCO_ANNOTATIONS_DIR = "/content/coco_annotations"
 COCO_ANNOTATIONS_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"

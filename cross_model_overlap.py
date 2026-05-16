@@ -14,7 +14,7 @@ MAX_IMAGES          = 500
 PIXART_TIMESTEP_IDX = -1
 DEVICE           = "cuda"
 OUT_DIR          = "/content/overlap_results"
-DRIVE_SAVE_DIR   = "/content/drive/My Drive/algoverse_results"
+DRIVE_SAVE_DIR   = "/content/drive/My Drive/algoverse_inference_results"
 # --------------------
 
 import os, sys, time, glob, shutil
