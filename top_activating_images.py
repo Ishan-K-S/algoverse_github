@@ -5,8 +5,11 @@ import glob
 import json
 import os
 import shutil
-from typing import Dict, List, Optional
-import os
+import urllib.request
+import zipfile
+from collections import defaultdict
+from typing import Dict, List, Optional, Set
+
 import numpy as np
 import torch
 import yaml
@@ -18,10 +21,14 @@ from tqdm import tqdm
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
 WEIGHTS_DIR = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
-CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_29.pth"  # fallback if auto-search fails
+CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_29.pth"  
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
 DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
+
+COCO_ANNOTATIONS_DIR = "/content/coco_annotations"
+COCO_ANNOTATIONS_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+COCO_SPLIT = "val2017"
 
 MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
 
@@ -44,13 +51,13 @@ def save_to_drive(output_path: str, checkpoint_path: str, drive_dir: str) -> Non
             print("[drive] Mounting Google Drive...")
             _colab_drive.mount("/content/drive")
     except ImportError:
-        print("[drive] Not running in Colab — skipping Drive upload.")
+        print("[drive] Not running in Colab - skipping Drive upload.")
         return
 
     os.makedirs(drive_dir, exist_ok=True)
     for src in (output_path, checkpoint_path):
         if not os.path.isfile(src):
-            print(f"[drive] Warning: {src} not found — skipping.")
+            print(f"[drive] Warning: {src} not found - skipping.")
             continue
         dst = os.path.join(drive_dir, os.path.basename(src))
         shutil.copy2(src, dst)
@@ -71,6 +78,95 @@ def discover_stems(cache_root: str) -> List[str]:
             "Run combine_cached_acts.py first."
         )
     return sorted(f[: -len(suffix)] for f in files)
+
+
+def download_coco_annotations(annotations_dir: str) -> None:
+    """Download and extract COCO 2017 annotations if they are not already present."""
+    os.makedirs(annotations_dir, exist_ok=True)
+    zip_path = os.path.join(annotations_dir, "annotations_trainval2017.zip")
+
+    if not os.path.isfile(zip_path):
+        print(f"[coco] Downloading annotations from {COCO_ANNOTATIONS_URL}")
+        urllib.request.urlretrieve(COCO_ANNOTATIONS_URL, zip_path)
+
+    expected = os.path.join(annotations_dir, "annotations")
+    if not os.path.isdir(expected):
+        print(f"[coco] Extracting annotations to {annotations_dir}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(annotations_dir)
+
+
+def coco_annotation_path(annotations_dir: str, split: str) -> str:
+    """Return the local instances annotation path, downloading COCO 2017 if needed."""
+    split = split.replace("instances_", "").replace(".json", "")
+    path = os.path.join(annotations_dir, "annotations", f"instances_{split}.json")
+    if not os.path.isfile(path):
+        download_coco_annotations(annotations_dir)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Could not find COCO annotations for split {split!r} at {path}"
+        )
+    return path
+
+
+def _coco_lookup_keys(filename: str, image_id: Optional[int]) -> Set[str]:
+    basename = os.path.basename(filename)
+    stem, ext = os.path.splitext(basename)
+    keys = {filename, basename, stem}
+    if ext:
+        keys.add(basename.lower())
+    if image_id is not None:
+        keys.update({
+            str(image_id),
+            f"{image_id:012d}",
+            f"{image_id:012d}.jpg",
+        })
+    return keys
+
+
+def build_coco_label_lookup(annotations_path: str) -> Dict[str, List[str]]:
+    """Build a cache-stem-friendly lookup from COCO image filename/id to labels."""
+    print(f"[coco] Loading labels from {annotations_path}")
+    with open(annotations_path) as f:
+        coco = json.load(f)
+
+    category_by_id = {cat["id"]: cat["name"] for cat in coco["categories"]}
+    image_by_id = {img["id"]: img for img in coco["images"]}
+    labels_by_image_id: Dict[int, Set[str]] = defaultdict(set)
+
+    for ann in coco["annotations"]:
+        image_id = ann["image_id"]
+        category = category_by_id.get(ann["category_id"])
+        if category is not None:
+            labels_by_image_id[image_id].add(category)
+
+    lookup: Dict[str, List[str]] = {}
+    for image_id, image in image_by_id.items():
+        labels = sorted(labels_by_image_id.get(image_id, set()))
+        for key in _coco_lookup_keys(image["file_name"], image_id):
+            lookup[key] = labels
+
+    print(f"[coco] Indexed labels for {len(image_by_id)} images")
+    return lookup
+
+
+def labels_for_stem(stem: str, coco_labels: Optional[Dict[str, List[str]]]) -> List[str]:
+    if coco_labels is None:
+        return []
+
+    basename = os.path.basename(stem)
+    bare, ext = os.path.splitext(basename)
+    keys = [stem, basename, bare]
+    if not ext:
+        keys.append(f"{basename}.jpg")
+    if bare.isdigit():
+        image_id = int(bare)
+        keys.extend([str(image_id), f"{image_id:012d}", f"{image_id:012d}.jpg"])
+
+    for key in keys:
+        if key in coco_labels:
+            return coco_labels[key]
+    return []
 
 
 def load_universal_sae(checkpoint_path: str, config_path: str, device: str):
@@ -166,6 +262,7 @@ def compute_top_activations(
     batch_size: int = 32,
     device: str = "cuda",
     max_images: Optional[int] = None,
+    coco_labels: Optional[Dict[str, List[str]]] = None,
 ):
     is_diffusion = source in diffusion_models
     stems = discover_stems(cache_root)
@@ -234,7 +331,10 @@ def compute_top_activations(
         for rank in range(top_n):
             img_idx = int(top_indices[rank, feat_id].item())
             score = float(top_values[rank, feat_id].item())
-            entries.append({"filename": stems[img_idx], "score": score})
+            entry = {"filename": stems[img_idx], "score": score}
+            if rank == 0:
+                entry["coco_labels"] = labels_for_stem(stems[img_idx], coco_labels)
+            entries.append(entry)
         results[str(feat_id)] = entries
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -248,6 +348,8 @@ def compute_top_activations(
         "top_pct": top_pct,
         "top_n_per_feature": top_n,
         "scoring": "mean_abs_across_tokens",
+        "coco_labels": coco_labels is not None,
+        "coco_labels_scope": "rank_0_entry_per_feature",
     }
     output_obj = {"metadata": metadata, "top_activations": results}
     with open(output_path, "w") as f:
@@ -270,6 +372,9 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_images", type=int, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--coco_annotations_dir", default=COCO_ANNOTATIONS_DIR)
+    p.add_argument("--coco_split", default=COCO_SPLIT, choices=("train2017", "val2017"))
+    p.add_argument("--skip_coco_labels", action="store_true")
     return p.parse_args()
 
 
@@ -298,6 +403,11 @@ def main():
         print(f"[top-act] Checkpoint not found at {checkpoint!r}, searching {WEIGHTS_DIR}...")
         checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
 
+    coco_labels = None
+    if not args.skip_coco_labels:
+        annotations_path = coco_annotation_path(args.coco_annotations_dir, args.coco_split)
+        coco_labels = build_coco_label_lookup(annotations_path)
+
     model, cfg = load_universal_sae(checkpoint, args.config, args.device)
     diffusion_models = set(cfg.get("global", {}).get("diffusion_models", []))
 
@@ -319,6 +429,7 @@ def main():
         batch_size=args.batch_size,
         device=args.device,
         max_images=args.max_images,
+        coco_labels=coco_labels,
     )
 
     save_to_drive(args.output, checkpoint, DRIVE_SAVE_DIR)
