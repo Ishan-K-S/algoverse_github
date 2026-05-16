@@ -25,11 +25,40 @@ import glob
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
-from google.colab import files
+DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results/combined_cache"
 
 
 
 DIFF_META_FIELDS = ("sigmas", "timesteps")
+
+
+def save_combined_cache_to_drive(combined_cache_dir: str, drive_dir: str) -> None:
+    """Copy the entire combined cache directory to Google Drive."""
+    try:
+        from google.colab import drive as _colab_drive
+        if not os.path.isdir("/content/drive/My Drive"):
+            print("[drive] Mounting Google Drive...")
+            _colab_drive.mount("/content/drive")
+    except ImportError:
+        print("[drive] Not running in Colab — skipping Drive upload.")
+        return
+
+    if not os.path.isdir(combined_cache_dir):
+        print(f"[drive] Warning: {combined_cache_dir} not found — skipping.")
+        return
+
+    files = [f for f in os.listdir(combined_cache_dir) if f.endswith("_combined.npz")]
+    if not files:
+        print(f"[drive] No combined npz files found in {combined_cache_dir} — skipping.")
+        return
+
+    os.makedirs(drive_dir, exist_ok=True)
+    print(f"[drive] Copying {len(files)} combined npz files to {drive_dir} ...")
+    for fname in tqdm(files, desc="Saving to Drive"):
+        src = os.path.join(combined_cache_dir, fname)
+        dst = os.path.join(drive_dir, fname)
+        shutil.copy2(src, dst)
+    print(f"[drive] Done. {len(files)} files saved to {drive_dir}")
 
 
 def _process_one_image(args):
@@ -155,6 +184,5 @@ if __name__ == "__main__":
         num_workers=12,
     )
 
-    #shutil.make_archive("combined_cache1", 'zip', colab_output_cache)
-    #files.download("combined_cache1.zip")
+    save_combined_cache_to_drive(colab_output_cache, DRIVE_SAVE_DIR)
 

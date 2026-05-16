@@ -5,7 +5,7 @@ REPO_ROOT       = "/content/algoverse_github"
 CACHE_ROOT      = "/content/combined_cache"
 CONFIG_PATH     = "/content/algoverse_github/config.yaml"
 WEIGHTS_DIR     = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
-CHECKPOINT_PATH = "/content/algoverse_github/weights/ex32_bs16_topk64_LR0.0003_cross_30epochs/usae_epoch_29.pth"  # fallback if auto-search fails
+CHECKPOINT_PATH = "/content/usae_epoch_29.pth"  # fallback if auto-search fails
 CKPT_SEARCH_ROOT = "/content"
 
 SOURCES             = ["DinoV2", "PixArt"]
