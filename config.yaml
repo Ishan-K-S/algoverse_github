@@ -14,7 +14,7 @@ global:
   divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
   num_tokens: 196
-  latent_dim: exp_factor * input_shape
+  latent_dim: 12288
   shared_latent_tokens: 1024   # canonical token count in the shared latent space
   timestep_dim: 256           # dimension of timestep/sigma embeddings (diffusion only)
   loss_criterion: L1
