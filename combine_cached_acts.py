@@ -19,27 +19,57 @@ Combined npz keys:
   <MODEL>__sigmas    – (T,) float32 array, diffusion models only
   <MODEL>__timesteps – (T,) int64 array,  diffusion models only
 """
-import shutil
 import os
 import glob
+import time
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
-DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results/combined_cache"
+DRIVE_SAVE_DIR = "/content/drive/MyDrive/algoverse_results/combined_cache"
 
 
 
 DIFF_META_FIELDS = ("sigmas", "timesteps")
 
 
-def save_combined_cache_to_drive(combined_cache_dir: str, drive_dir: str) -> None:
-    """Copy the entire combined cache directory to Google Drive."""
+def _mount_drive(retries: int = 3) -> bool:
+    """Mount Google Drive, returning True on success."""
     try:
         from google.colab import drive as _colab_drive
-        if not os.path.isdir("/content/drive/My Drive"):
-            print("[drive] Mounting Google Drive...")
-            _colab_drive.mount("/content/drive")
     except ImportError:
+        return False
+    for attempt in range(retries):
+        try:
+            _colab_drive.mount("/content/drive", force_remount=(attempt > 0))
+            if os.path.isdir("/content/drive/MyDrive"):
+                return True
+        except Exception as e:
+            print(f"[drive] Mount attempt {attempt + 1} failed: {e}")
+        time.sleep(5)
+    return False
+
+
+def _robust_copy(src: str, dst: str, retries: int = 3) -> None:
+    """Copy a file using explicit read/write to avoid FUSE sendfile() failures."""
+    for attempt in range(retries):
+        try:
+            with open(src, "rb") as fsrc:
+                data = fsrc.read()
+            with open(dst, "wb") as fdst:
+                fdst.write(data)
+            return
+        except OSError as e:
+            if attempt < retries - 1:
+                print(f"\n[drive] OSError on {os.path.basename(src)} (errno {e.errno}), remounting...")
+                _mount_drive()
+                time.sleep(5)
+            else:
+                raise
+
+
+def save_combined_cache_to_drive(combined_cache_dir: str, drive_dir: str) -> None:
+    """Copy the entire combined cache directory to Google Drive."""
+    if not _mount_drive():
         print("[drive] Not running in Colab — skipping Drive upload.")
         return
 
@@ -55,10 +85,30 @@ def save_combined_cache_to_drive(combined_cache_dir: str, drive_dir: str) -> Non
     os.makedirs(drive_dir, exist_ok=True)
     print(f"[drive] Copying {len(files)} combined npz files to {drive_dir} ...")
     for fname in tqdm(files, desc="Saving to Drive"):
-        src = os.path.join(combined_cache_dir, fname)
-        dst = os.path.join(drive_dir, fname)
-        shutil.copy2(src, dst)
+        _robust_copy(os.path.join(combined_cache_dir, fname), os.path.join(drive_dir, fname))
     print(f"[drive] Done. {len(files)} files saved to {drive_dir}")
+
+
+def load_combined_cache_from_drive(drive_dir: str, local_dir: str) -> None:
+    """Copy combined npz files from Google Drive to a local Colab directory."""
+    if not _mount_drive():
+        print("[drive] Not running in Colab — skipping Drive download.")
+        return
+
+    if not os.path.isdir(drive_dir):
+        print(f"[drive] Warning: {drive_dir} not found on Drive — skipping.")
+        return
+
+    files = [f for f in os.listdir(drive_dir) if f.endswith("_combined.npz")]
+    if not files:
+        print(f"[drive] No combined npz files found in {drive_dir} — skipping.")
+        return
+
+    os.makedirs(local_dir, exist_ok=True)
+    print(f"[drive] Copying {len(files)} files from Drive to {local_dir} ...")
+    for fname in tqdm(files, desc="Loading from Drive"):
+        _robust_copy(os.path.join(drive_dir, fname), os.path.join(local_dir, fname))
+    print(f"[drive] Done. {len(files)} files copied to {local_dir}")
 
 
 def _process_one_image(args):
