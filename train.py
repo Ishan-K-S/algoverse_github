@@ -42,21 +42,6 @@ def cosine_reconstruction_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
     return (1.0 - F.cosine_similarity(a_flat, b_flat, dim=-1)).mean()
 
 
-def decoder_orthogonality_loss(decoder: nn.Linear) -> torch.Tensor:
-    """
-    Encourage decoder atoms to be less entangled.
-
-    For a decoder mapping latent_dim -> activation_dim, each latent feature is a
-    decoder column. We penalize off-diagonal cosine similarities between atoms.
-    """
-    weight = decoder.weight
-    atoms = F.normalize(weight.t(), dim=-1)
-    gram = atoms @ atoms.t()
-    eye = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
-    off_diag = gram - eye
-    return off_diag.pow(2).mean()
-
-
 def _ensure_bt(values: torch.Tensor, batch_size: int) -> torch.Tensor:
     """
     Ensure per-batch timesteps/noise levels are shaped (B, T).
@@ -103,7 +88,7 @@ def _get_sigmas_bt(meta, model_name: str, batch_size: int, device: torch.device)
 
 def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     """
-    Map timestep index from source schedule to target schedule if lengths differ.
+    Map layer index from source layout to target layout if layer counts differ.
     Uses proportional mapping [0..Tsrc-1] -> [0..Ttgt-1].
     """
     if t_tgt_len <= 1:
@@ -113,87 +98,112 @@ def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     return int(round(t_src * (t_tgt_len - 1) / (t_src_len - 1)))
 
 
-def _nearest_timestep_idx(
-    src_timestep_value: torch.Tensor,
-    tgt_timestep_values: torch.Tensor,
-) -> int:
-    """
-    Align timesteps by actual conditioning value rather than proportional index.
-
-    Uses the batch-mean timestep/noise level as a robust summary when values are
-    provided per example.
-    """
-    src_value = src_timestep_value.float().mean()
-    tgt_values = tgt_timestep_values.float().mean(dim=0)
-    return int(torch.argmin((tgt_values - src_value).abs()).item())
-
-
 def _pick_diffusion_slice(
     x: torch.Tensor,
     t_bt: torch.Tensor,
     timestep_idx: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
-    Select one diffusion timestep slice for a TIDE-style training step.
+    Select one diffusion timestep slice for training.
 
-    TIDE trains on activations from sampled timesteps; it does not need to
-    iterate over every timestep in the same optimization step.
+    By default, train only on the final diffusion timestep.
     """
     if x.dim() != 4:
         raise ValueError(f"Expected diffusion activations shaped (B, T, N, D), got {tuple(x.shape)}")
 
     _, total_steps, _, _ = x.shape
     if timestep_idx is None:
-        timestep_idx = random.randrange(total_steps)
+        timestep_idx = total_steps - 1
     return x[:, timestep_idx], t_bt[:, timestep_idx], timestep_idx
 
 
-def _pick_temporal_neighbor_idx(timestep_idx: int, total_steps: int) -> Optional[int]:
+def _attention_to_wandb_image(attn: torch.Tensor, caption: str, max_size: int = 512):
     """
-    Pick a neighboring timestep index for temporal consistency.
-
-    Prefers an adjacent step because TIDE's temporal consistency objective is
-    meant to smooth nearby timesteps along the denoising trajectory.
+    Convert a cached attention matrix to a compact W&B heatmap image.
     """
-    if total_steps <= 1:
+    if not WANDB_AVAILABLE:
         return None
-    if timestep_idx == 0:
-        return 1
-    if timestep_idx == total_steps - 1:
-        return total_steps - 2
-    return timestep_idx - 1 if random.random() < 0.5 else timestep_idx + 1
+
+    image = attn.detach().float().cpu()
+    while image.dim() > 2:
+        image = image.mean(dim=0)
+    if image.dim() != 2:
+        return None
+
+    height, width = image.shape
+    scale = min(1.0, max_size / max(height, width))
+    if scale < 1.0:
+        image = F.interpolate(
+            image[None, None],
+            size=(max(1, round(height * scale)), max(1, round(width * scale))),
+            mode="area",
+        )[0, 0]
+
+    image = image - image.min()
+    image = image / image.max().clamp_min(1e-8)
+    image = (image * 255).to(torch.uint8)
+    image = image.unsqueeze(-1).expand(-1, -1, 3).numpy()
+    return wandb.Image(image, caption=caption)
 
 
-def temporal_consistency_loss(
-    z_curr: torch.Tensor,
-    z_neigh: torch.Tensor,
-    t_curr: torch.Tensor,
-    t_neigh: torch.Tensor,
-) -> torch.Tensor:
+def _iter_attention_modules(model: nn.Module):
+    candidate_groups = ("token_poolers", "token_unpoolers", "attention_modules", "attn_modules")
+    for group_name in candidate_groups:
+        module_group = getattr(model, group_name, None)
+        if module_group is None:
+            continue
+
+        for module_name, module in module_group.items():
+            yield group_name, module_name, module
+
+
+def attention_component_loss(model: nn.Module) -> Optional[torch.Tensor]:
     """
-    Encourage neighboring timesteps to have smoothly varying sparse features.
+    Diagnostic loss for the attention reshape modules.
 
-    This is a local continuity penalty between adjacent or near-adjacent
-    diffusion steps. We avoid inverse timestep weighting because that can make
-    gradients unstable when the step spacing is very small.
+    This is logged separately from the SAE reconstruction loss; it is not added
+    to the training objective.
     """
-    if z_curr.shape != z_neigh.shape:
-        raise ValueError(
-            f"Temporal consistency shape mismatch: {tuple(z_curr.shape)} vs {tuple(z_neigh.shape)}"
-        )
+    losses = []
+    for _group_name, _module_name, module in _iter_attention_modules(model):
+        params = [param.float().pow(2).mean() for param in module.parameters() if param.numel() > 0]
+        if params:
+            losses.append(torch.stack(params).mean())
 
-    del t_curr, t_neigh
-    return F.mse_loss(z_curr, z_neigh)
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
 
 
-def sparsity_loss(z: torch.Tensor, delta: float = 0.1) -> torch.Tensor:
+def _attention_module_wandb_logs(model: nn.Module) -> Dict[str, object]:
     """
-    Huber-style sparsity penalty on the latent activations.
+    Build W&B plots for attention reshape modules.
 
-    This keeps the explicit sparse objective even when top-k masking is already
-    present in the encoder.
+    If attention modules cache maps as last_attn1/last_attn2, those maps are
+    logged as heatmap images. Their learned parameters are also logged as
+    histograms so attention modules show up in W&B even when maps are not cached.
     """
-    return F.huber_loss(z, torch.zeros_like(z), delta=delta, reduction="mean")
+    if not WANDB_AVAILABLE:
+        return {}
+
+    logs: Dict[str, object] = {}
+    for group_name, module_name, module in _iter_attention_modules(model):
+        for attn_name in ("last_attn1", "last_attn2", "last_attention", "attention_weights"):
+            attn = getattr(module, attn_name, None)
+            if attn is None:
+                continue
+            caption = f"{group_name}/{module_name}/{attn_name}"
+            image = _attention_to_wandb_image(attn, caption=caption)
+            if image is not None:
+                logs[f"train/attention/{caption}"] = image
+
+        for param_name, param in module.named_parameters():
+            if param.numel() == 0:
+                continue
+            key = f"train/attention_params/{group_name}/{module_name}/{param_name}"
+            logs[key] = wandb.Histogram(param.detach().float().cpu().flatten().numpy())
+
+    return logs
 
 
 def _sample_layer_index(num_layers: int) -> int:
@@ -272,16 +282,15 @@ def _extract_target_slice(
     x: torch.Tensor,
     is_diffusion: bool,
     timestep_values_bt: Optional[torch.Tensor],
-    source_timestep_values: Optional[torch.Tensor],
     source_layer_idx: Optional[int],
     source_total_layers: Optional[int],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
     """
     Normalize target activation layouts into one comparison slice.
 
-    Layer alignment uses the same layer index when possible, with proportional
-    fallback if source and target expose different numbers of layers.
-    Diffusion timestep alignment uses nearest actual timestep/noise level.
+    Diffusion targets always use the final timestep. Layer alignment uses the
+    same layer index when possible, with proportional fallback if source and
+    target expose different numbers of layers.
     """
     layer_idx = None
     if is_diffusion:
@@ -301,11 +310,7 @@ def _extract_target_slice(
         if timestep_values_bt is None:
             raise ValueError("Diffusion target requires timestep values.")
 
-        if source_timestep_values is None:
-            timestep_idx = random.randrange(x.shape[1])
-        else:
-            timestep_idx = _nearest_timestep_idx(source_timestep_values, timestep_values_bt)
-
+        timestep_idx = x.shape[1] - 1
         return x[:, timestep_idx], timestep_values_bt[:, timestep_idx], layer_idx, timestep_idx
 
     if x.dim() == 4:
@@ -334,10 +339,7 @@ def train_universal_sae(
     epoch: int = 0,
     use_wandb: bool = False,
     log_every: int = 50,
-    temporal_consistency_weight: float = 0.1,
     cosine_weight: float = 0.0,
-    sparsity_weight: float = 1e-4,
-    orthogonality_weight: float = 1e-3,
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
@@ -346,42 +348,42 @@ def train_universal_sae(
     save_model_path: str = SAVE_MODEL_PATH,
 ):
     """
-    Train a Universal SAE with TIDE-style timestep conditioning.
+    Train a Universal SAE using only the final diffusion timestep.
 
-    Key differences from the earlier loop:
-      - Treat metadata values as timesteps/noise-level conditioning, not opaque
-        sigmas.
-      - Sample one source timestep per diffusion batch, which matches the
-        paper's "extract activation layers from different timesteps each time"
-        setup more closely than summing every timestep in one step.
-      - Align target diffusion timesteps by nearest actual conditioning value.
-      - Pass timestep conditioning through encode/decode consistently.
-      - Add a temporal consistency term over neighboring diffusion timesteps.
-      - Add cosine reconstruction and explicit sparsity penalties.
+    Compared to the pasted version:
+      - Diffusion sources and targets use the final timestep only.
+      - Temporal consistency loss is removed.
+      - Sparsity loss is removed.
+      - Decoder orthogonality loss is removed.
+      - SAE reconstruction loss and attention component loss are logged
+        separately to W&B.
+      - W&B logs include attention module heatmaps when cached and parameter
+        histograms for attention reshape modules.
     """
+    del model_tokens
     model.train()
 
     if epoch == 0:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ACTIVATION STATISTICS CHECK")
-        print("="*60)
-        
-        # Get one batch
+        print("=" * 60)
+
         for (acts, meta), _y in dataloader:
+            del meta
             for source_name, source_acts in acts.items():
                 source_acts = source_acts.to(device)
-                
-                # Flatten for stats
                 flat = source_acts.reshape(source_acts.shape[0], -1)
-                
-                print(f"{source_name:12s} - "
-                      f"min: {flat.min():.4f}, "
-                      f"max: {flat.max():.4f}, "
-                      f"mean: {flat.mean():.4f}, "
-                      f"std: {flat.std():.4f}")
-            
-            print("="*60 + "\n")
-            break  # Only check first batch
+
+                print(
+                    f"{source_name:12s} - "
+                    f"min: {flat.min():.4f}, "
+                    f"max: {flat.max():.4f}, "
+                    f"mean: {flat.mean():.4f}, "
+                    f"std: {flat.std():.4f}"
+                )
+
+            print("=" * 60 + "\n")
+            break
 
     diffusion_models = set(diffusion_models)
     cross_weight = 2.0
@@ -405,7 +407,6 @@ def train_universal_sae(
         reconstruction_loss = torch.tensor(0.0, device=device)
         reconstruction_weight_total = 0.0
         per_target_losses: Dict[str, float] = {}
-        batch_sparsity_loss = None
 
         if source in diffusion_models:
             x_src_full = acts[source].to(device)
@@ -417,48 +418,24 @@ def train_universal_sae(
                     f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
                 )
 
-            x_src, t_src_values, source_layer_idx, t_src_idx, source_total_layers, source_total_steps = _extract_source_slice(
-                x_src_full,
-                is_diffusion=True,
-                timestep_values_bt=src_timesteps_bt,
+            x_src, t_src_values, source_layer_idx, _t_src_idx, source_total_layers, _source_total_steps = (
+                _extract_source_slice(
+                    x_src_full,
+                    is_diffusion=True,
+                    timestep_values_bt=src_timesteps_bt,
+                )
             )
             _z_pre, z = model.encode(x_src, source=source, sigma=t_src_values)
-
-            neighbor_idx = _pick_temporal_neighbor_idx(t_src_idx, source_total_steps)
-            temporal_loss_value = None
-            if neighbor_idx is not None and temporal_consistency_weight > 0:
-                if x_src_full.dim() == 5 and source_layer_idx is not None:
-                    x_neighbor = x_src_full[:, source_layer_idx, neighbor_idx]
-                else:
-                    x_neighbor = x_src_full[:, neighbor_idx]
-                t_neighbor_values = src_timesteps_bt[:, neighbor_idx]
-                _z_pre_neighbor, z_neighbor = model.encode(x_neighbor, source=source, sigma=t_neighbor_values)
-                temporal_loss_value = temporal_consistency_loss(
-                    z,
-                    z_neighbor,
-                    t_src_values,
-                    t_neighbor_values,
-                )
-                loss = loss + temporal_consistency_weight * temporal_loss_value
-                per_target_losses[f"{source}_temporal"] = temporal_loss_value.item()
         else:
             x_src = acts[source].to(device)
             batch_size = x_src.shape[0]
-            x_src, _unused_t, source_layer_idx, t_src_idx, source_total_layers, source_total_steps = _extract_source_slice(
-                x_src,
-                is_diffusion=False,
+            x_src, _unused_t, source_layer_idx, _t_src_idx, source_total_layers, _source_total_steps = (
+                _extract_source_slice(
+                    x_src,
+                    is_diffusion=False,
+                )
             )
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
-
-        if sparsity_weight > 0:
-            batch_sparsity_loss = sparsity_loss(z)
-            loss = loss + sparsity_weight * batch_sparsity_loss
-            per_target_losses[f"{source}_sparsity"] = batch_sparsity_loss.item()
-
-        if orthogonality_weight > 0:
-            source_ortho = decoder_orthogonality_loss(model.saes[source].dec)
-            loss = loss + orthogonality_weight * source_ortho
-            per_target_losses[f"{source}_orthogonality"] = source_ortho.item()
 
         for target, x_target in acts.items():
             if in_curriculum and curriculum_self_only and target != source:
@@ -474,11 +451,10 @@ def train_universal_sae(
                         f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
                     )
 
-                x_target_t, t_tgt_values, _target_layer_idx, t_tgt_idx = _extract_target_slice(
+                x_target_t, t_tgt_values, _target_layer_idx, _t_tgt_idx = _extract_target_slice(
                     x_target,
                     is_diffusion=True,
                     timestep_values_bt=tgt_timesteps_bt,
-                    source_timestep_values=t_src_values if source in diffusion_models else None,
                     source_layer_idx=source_layer_idx,
                     source_total_layers=source_total_layers,
                 )
@@ -488,7 +464,6 @@ def train_universal_sae(
                     x_target,
                     is_diffusion=False,
                     timestep_values_bt=None,
-                    source_timestep_values=None,
                     source_layer_idx=source_layer_idx,
                     source_total_layers=source_total_layers,
                 )
@@ -506,8 +481,10 @@ def train_universal_sae(
             reconstruction_weight_total += weight
             per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
 
+        sae_loss = None
         if reconstruction_weight_total > 0:
-            loss = loss + (reconstruction_loss / reconstruction_weight_total)
+            sae_loss = reconstruction_loss / reconstruction_weight_total
+            loss = loss + sae_loss
 
         loss.backward()
         optimizer.step()
@@ -523,6 +500,7 @@ def train_universal_sae(
             log_dict = {
                 "train/total_loss": loss_value,
                 "train/total_loss_ema": ema_loss,
+                "train/sae_loss": sae_loss.item() if sae_loss is not None else 0.0,
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
@@ -534,28 +512,12 @@ def train_universal_sae(
 
             with torch.no_grad():
                 log_dict["train/latent_sparsity"] = (z == 0).float().mean().item()
-
-                active_per_sample = (z != 0).float()
-                feature_active_rate = active_per_sample.mean(dim=tuple(range(active_per_sample.dim() - 1)))
-                active_mask = (feature_active_rate > 1e-3)
-                num_active = int(active_mask.sum().item())
-                log_dict[f"train/active_features_{source}"] = num_active
-
-                prev_masks = getattr(model, "_active_feature_masks", {})
-                prev_masks[source] = active_mask.detach().cpu()
-                model._active_feature_masks = prev_masks
-                if len(prev_masks) >= 2:
-                    keys = list(prev_masks.keys())
-                    a, b = prev_masks[keys[0]], prev_masks[keys[1]]
-                    intersection = int((a & b).sum().item())
-                    union = int((a | b).sum().item())
-                    jaccard = intersection / union if union > 0 else 0.0
-                    log_dict["train/feature_overlap_intersection"] = intersection
-                    log_dict["train/feature_overlap_union"] = union
-                    log_dict["train/feature_overlap_jaccard"] = jaccard
+                attn_loss = attention_component_loss(model)
+                if attn_loss is not None:
+                    log_dict["train/attention_component_loss"] = attn_loss.item()
+                log_dict.update(_attention_module_wandb_logs(model))
 
             wandb.log(log_dict, step=global_step_actual)
-
 
     os.makedirs(
         os.path.dirname(save_model_path) or ".",
@@ -566,5 +528,5 @@ def train_universal_sae(
 
     print("\n[save] Full model saved:")
     print(f"       {save_model_path}\n")
-    
+
     return last_loss
