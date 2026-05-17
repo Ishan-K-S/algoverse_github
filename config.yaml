@@ -49,7 +49,7 @@ sae_params:
   dictionary_initializer: null
   data_initializer: null
   dictionary_normalization: l2
-  top_k: 64
+  top_k: 256
 model_zoo:
   # Vision encoders - all produce 196 tokens (14x14 patches, 224x224 input)
   #ViT:    { input_shape: 768,  num_tokens: 196, og_model: ViT }
