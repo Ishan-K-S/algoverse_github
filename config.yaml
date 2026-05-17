@@ -2,7 +2,7 @@ global:
   path_to_cache: "/content/combined_cache"      # path to your flat cached .npz directory
   combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
-  exp_factor: 32  # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
+  exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
   input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
   batch_size: 16
   num_workers: 8        # DataLoader worker processes
@@ -14,7 +14,7 @@ global:
   divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
   num_tokens: 196
-  latent_dim: 6144
+  latent_dim: exp_factor * input_shape
   shared_latent_tokens: 1024   # canonical token count in the shared latent space
   timestep_dim: 256           # dimension of timestep/sigma embeddings (diffusion only)
   loss_criterion: L1
