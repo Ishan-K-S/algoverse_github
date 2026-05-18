@@ -26,7 +26,7 @@ global:
   # Options: "bilinear" (default), "nearest", "bicubic"
   interpolation_mode: bilinear
   # Token reshape strategy: "interpolation" or "attention"
-  token_reshape_mode: attention
+  token_reshape_mode: interpolation
   # Attention reshape settings (only used when token_reshape_mode: attention)
   attention_heads: 8
   attention_dropout: 0.0
