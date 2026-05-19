@@ -328,6 +328,16 @@ def _extract_target_slice(
 
     return x, None, layer_idx, None
 
+def _pool_target_for_loss(model, x_target_t):
+    """Apply the same pooling the encoder applies, so target shape matches x_hat."""
+    mode = getattr(model, "cls_pool_mode", "none")
+    if mode == "none":
+        return x_target_t
+    if mode == "mean":
+        return x_target_t.mean(dim=1, keepdim=True)
+    if mode == "first":
+        return x_target_t[:, :1]
+    raise ValueError(f"Unknown cls_pool_mode={mode!r}")
 
 def train_universal_sae(
     model: nn.Module,
@@ -440,9 +450,13 @@ def train_universal_sae(
         for target, x_target in acts.items():
             if in_curriculum and curriculum_self_only and target != source:
                 continue
-
+ 
+            # NEW: skip cross-model targets we structurally can't reconstruct
+            if not model.can_cross_reconstruct(source, target):
+                continue
+ 
             x_target = x_target.to(device)
-
+ 
             if target in diffusion_models:
                 tgt_timesteps_bt = _get_sigmas_bt(meta, target, batch_size, x_target.device)
                 if tgt_timesteps_bt is None:
@@ -450,7 +464,7 @@ def train_universal_sae(
                         f"Missing timestep metadata for diffusion target '{target}'. "
                         f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
                     )
-
+ 
                 x_target_t, t_tgt_values, _target_layer_idx, _t_tgt_idx = _extract_target_slice(
                     x_target,
                     is_diffusion=True,
@@ -468,7 +482,10 @@ def train_universal_sae(
                     source_total_layers=source_total_layers,
                 )
                 x_hat = model.decode(z, target=target, sigma=None)
-
+ 
+            # NEW: pool the target if encoder pools the source
+            x_target_t = _pool_target_for_loss(model, x_target_t)
+ 
             target_mse_loss = mse_flat(x_hat, x_target_t)
             target_cosine_loss = cosine_reconstruction_loss(x_hat, x_target_t) if cosine_weight > 0 else None
             weight = cross_weight if source != target else self_weight
@@ -476,7 +493,7 @@ def train_universal_sae(
             if target_cosine_loss is not None:
                 target_total_loss = target_total_loss + cosine_weight * target_cosine_loss
                 per_target_losses[f"{source}->{target}_cosine"] = target_cosine_loss.item()
-
+ 
             reconstruction_loss = reconstruction_loss + weight * target_total_loss
             reconstruction_weight_total += weight
             per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
