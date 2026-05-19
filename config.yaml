@@ -13,6 +13,8 @@ global:
   standardize: true     # standardise activations (mean=0, std=1)
   divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
+  cls_pool_mode: none   # 'none' for per-token (start here), 'mean' for cross-recon
+  use_tide: false       # off — single-timestep training makes TIDE a no-op
   num_tokens: 196
   latent_dim: 12288
   shared_latent_tokens: 1024   # canonical token count in the shared latent space
