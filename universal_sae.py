@@ -1,13 +1,43 @@
+"""
+UniversalSAE — stripped-down rewrite following:
+  - Gao et al. "Scaling and evaluating sparse autoencoders" (TopK SAE)
+  - Thasarathan et al. "Universal Sparse Autoencoders" (USAE), arXiv:2502.03714
+
+Key changes vs. the previous architecture:
+  - NO token pooling / unpooling. Encoder and decoder are pure linear maps R^d <-> R^m.
+  - TopK is applied directly to the encoder pre-activation (no ReLU before TopK).
+  - Per-model learnable mean b_pre is subtracted on encode and added back on decode.
+  - Cross-model decoding (source != target) is only allowed when token counts match.
+    For mismatched token counts (e.g. DinoV2:256 vs PixArt:1024), set
+    cls_pool_mode='mean' to pool each model's tokens to a single CLS-like vector
+    per image. This matches the paper's per-sample formulation.
+  - Diffusion timestep modulation is still available for diffusion sources but is
+    disabled-by-default since with a single-timestep training run it learns a
+    constant affine and does no useful work.
+
+Public interface (unchanged from previous version, so train.py / inference.py /
+cross_model_overlap.py keep working):
+    model.encode(x, source, sigma=None) -> (z_pre, z)
+    model.decode(z, target, sigma=None) -> x_hat
+    model.forward(x, source, target, sigma_src=None, sigma_tgt=None) -> (z_pre, z, x_hat)
+    model.normalize_decoder_dictionaries_()
+    model.diffusion_models : Set[str]
+"""
+
+from __future__ import annotations
+
 import math
 from typing import Dict, Literal, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
-# Type alias for the token reshape strategy
-TokenReshapeMode = Literal["interpolation", "attention"]
+
+# ---------------------------------------------------------------------------
+# Optional diffusion timestep modulation (TIDE-style). Kept for compatibility
+# but its use is gated by `use_tide=False` by default — see UniversalSAE init.
+# ---------------------------------------------------------------------------
 
 
 class TimestepEmbedding(nn.Module):
@@ -16,7 +46,6 @@ class TimestepEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (B,)
         half = self.dim // 2
         scale = math.log(10000) / (half - 1)
         freqs = torch.exp(torch.arange(half, device=t.device) * -scale)
@@ -25,12 +54,7 @@ class TimestepEmbedding(nn.Module):
 
 
 class TIDETemporalModulation(nn.Module):
-    """
-    Timestep-conditioned per-channel affine used by TIDE:
-      x_mod = x * (1 + scale(t)) + shift(t)
-
-    Works for x shaped (B,D) or (B,N,D).
-    """
+    """Per-channel affine conditioned on diffusion timestep."""
 
     def __init__(self, dim: int, tdim: int = 256):
         super().__init__()
@@ -44,209 +68,114 @@ class TIDETemporalModulation(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     @staticmethod
-    def _flatten_timestep(timestep: torch.Tensor) -> torch.Tensor:
-        if timestep.dim() == 0:
-            return timestep.unsqueeze(0).float()
-        if timestep.dim() == 1:
-            return timestep.float()
-        return timestep.flatten(start_dim=1)[:, 0].float()
+    def _flatten_timestep(t: torch.Tensor) -> torch.Tensor:
+        if t.dim() == 0:
+            return t.unsqueeze(0).float()
+        if t.dim() == 1:
+            return t.float()
+        return t.flatten(start_dim=1)[:, 0].float()
 
-    def init_from_adaln(
-        self,
-        scale_weight: torch.Tensor,
-        scale_bias: torch.Tensor,
-        shift_weight: torch.Tensor,
-        shift_bias: torch.Tensor,
-    ) -> None:
-        final = self.mlp[-1]
-        with torch.no_grad():
-            final.weight.copy_(torch.cat([scale_weight, shift_weight], dim=0))
-            final.bias.copy_(torch.cat([scale_bias, shift_bias], dim=0))
-
-    def forward(self, x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        # timestep may arrive as (B,), (B,1), (B,1,1), etc. - flatten to (B,)
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
-        timestep = self._flatten_timestep(timestep)
-        if timestep.shape[0] != B:
-            raise ValueError(
-                f"Timestep batch mismatch: got {tuple(timestep.shape)} for activations "
-                f"with batch size {B}."
-            )
-        h = self.t_embed(timestep)
-        scale, shift = self.mlp(h).chunk(2, dim=-1)  # (B,D), (B,D)
+        t = self._flatten_timestep(t)
+        if t.shape[0] != B:
+            raise ValueError(f"Timestep batch mismatch: {tuple(t.shape)} for B={B}")
+        h = self.t_embed(t)
+        scale, shift = self.mlp(h).chunk(2, dim=-1)  # (B, D), (B, D)
         if x.dim() == 3:
             return x * (1 + scale[:, None, :]) + shift[:, None, :]
         return x * (1 + scale) + shift
 
 
-def interpolate_tokens(
-    x: torch.Tensor,
-    src_tokens: int,
-    tgt_tokens: int,
-    mode: str = "bilinear",
-) -> torch.Tensor:
+# ---------------------------------------------------------------------------
+# Per-model TopK SAE (Gao et al. style)
+# ---------------------------------------------------------------------------
+
+
+class PerModelTopKSAE(nn.Module):
     """
-    Spatially interpolate tokens from src_tokens to tgt_tokens.
+    Encoder/decoder pair for one source model, following Gao et al.:
 
-    Assumes tokens are arranged in a square grid (sqrt(N) x sqrt(N)).
+        z_pre = W_enc (x - b_pre)
+        z     = TopK(z_pre)        # NO ReLU before TopK; TopK selects largest signed pre-acts
+        x_hat = W_dec z + b_pre
 
-    Args:
-        x: (B, N_src, D) tensor
-        src_tokens: number of source tokens (must be a perfect square)
-        tgt_tokens: number of target tokens (must be a perfect square)
-        mode: interpolation mode ("bilinear", "nearest", "bicubic")
-
-    Returns:
-        (B, N_tgt, D) tensor
-    """
-    if src_tokens == tgt_tokens:
-        return x
-
-    # Validate actual tensor shape vs declared src_tokens
-    actual_tokens = x.shape[1]
-    if actual_tokens != src_tokens:
-        raise ValueError(
-            f"interpolate_tokens: declared src_tokens={src_tokens} but tensor has "
-            f"{actual_tokens} tokens (shape {tuple(x.shape)}). "
-            f"Check that model_tokens in config matches the cached activation shape, "
-            f"or that shared_latent_tokens is set correctly."
-        )
-
-    src_h = int(math.sqrt(src_tokens))
-    tgt_h = int(math.sqrt(tgt_tokens))
-
-    if src_h * src_h != src_tokens:
-        raise ValueError(
-            f"interpolate_tokens: src_tokens={src_tokens} is not a perfect square. "
-            f"Cannot reshape to a 2-D grid for interpolation."
-        )
-    if tgt_h * tgt_h != tgt_tokens:
-        raise ValueError(
-            f"interpolate_tokens: tgt_tokens={tgt_tokens} is not a perfect square. "
-            f"Cannot reshape to a 2-D grid for interpolation."
-        )
-
-    # (B, N, D) -> (B, D, H, W)
-    x = rearrange(x, "b (h w) d -> b d h w", h=src_h, w=src_h)
-
-    # Interpolate spatially
-    x = F.interpolate(x, size=(tgt_h, tgt_h), mode=mode, align_corners=False if mode != "nearest" else None)
-
-    # (B, D, H, W) -> (B, N, D)
-    x = rearrange(x, "b d h w -> b (h w) d")
-
-    return x
-
-
-class GlobalAttentionReshape(nn.Module):
-    """
-    Learned token reshaping via stacked cross-attention.
-
-    To pool (N_src -> N_tgt where N_tgt < N_src):
-      - N_tgt learned query tokens attend over N_src input tokens
-      - Each output position learns to aggregate relevant input tokens
-
-    To unpool (N_src -> N_tgt where N_tgt > N_src):
-      - N_tgt learned query tokens attend over N_src input tokens
-      - Each output position learns to interpolate from compressed representation
-
-    Both directions use the same cross-attention mechanism; the distinction is
-    just whether N_tgt < or > N_src. The queries are fixed learned embeddings
-    (not input-dependent), making this a form of learned spatial resampling.
-
-    Args:
-        dim: Feature dimension (D)
-        src_tokens: Number of input tokens
-        tgt_tokens: Number of output tokens
-        num_heads: Number of attention heads (default: 8)
-        dropout: Attention dropout (default: 0.0)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        src_tokens: int,
-        tgt_tokens: int,
-        num_heads: int = 8,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.src_tokens = src_tokens
-        self.tgt_tokens = tgt_tokens
-        self.dim = dim
-
-        self.queries = nn.Parameter(torch.randn(1, tgt_tokens, dim) * 0.02)
-
-        self.attn1 = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.attn2 = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, N_src, D)
-        Returns:
-            (B, N_tgt, D)
-        """
-        B = x.shape[0]
-        q = self.queries.expand(B, -1, -1)  # (B, N_tgt, D)
-
-        out1, _ = self.attn1(query=q, key=x, value=x)  # (B, N_tgt, D)
-        if self.src_tokens == self.tgt_tokens:
-            out1 = self.norm1(out1 + x)
-        else:
-            out1 = self.norm1(out1 + q)
-        out2, _ = self.attn2(query=out1, key=x, value=x)  # (B, N_tgt, D)
-        out = self.norm2(out2 + out1)
-
-        return out
-
-
-class PerModelSAE(nn.Module):
-    """
-    Just the linear encoder/decoder pair for one source.
+    The same b_pre is shared between encode and decode (paper's exact formulation).
+    Decoder columns are unit-normalized after each step via
+    `normalize_decoder_columns_`, called from UniversalSAE.
     """
 
     def __init__(self, in_dim: int, latent_dim: int):
         super().__init__()
-        self.enc = nn.Linear(in_dim, latent_dim)
-        self.dec = nn.Linear(latent_dim, in_dim)
-        nn.init.zeros_(self.enc.bias)
-        nn.init.zeros_(self.dec.bias)
+        self.in_dim = in_dim
+        self.latent_dim = latent_dim
+
+        self.b_pre = nn.Parameter(torch.zeros(in_dim))
+        self.W_enc = nn.Linear(in_dim, latent_dim, bias=False)
+        self.W_dec = nn.Linear(latent_dim, in_dim, bias=False)
+
+        # Tie decoder to encoder transpose at init (Gao et al. suggestion)
+        with torch.no_grad():
+            self.W_dec.weight.copy_(self.W_enc.weight.t())
+        self.normalize_decoder_columns_()
 
     def encode_pre(self, x: torch.Tensor) -> torch.Tensor:
-        return self.enc(x)
+        """x: (..., in_dim) -> (..., latent_dim). Subtracts per-model mean first."""
+        return self.W_enc(x - self.b_pre)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.dec(z)
+        """z: (..., latent_dim) -> (..., in_dim). Adds per-model mean back."""
+        return self.W_dec(z) + self.b_pre
 
     @torch.no_grad()
     def normalize_decoder_columns_(self, eps: float = 1e-8) -> None:
-        """
-        Normalize decoder atoms to unit norm.
+        # For nn.Linear(latent_dim -> in_dim), each latent feature is one column
+        # of self.W_dec.weight, shaped (in_dim, latent_dim). Columns = dim=0.
+        w = self.W_dec.weight.data
+        norms = w.norm(dim=0, keepdim=True).clamp_min(eps)
+        self.W_dec.weight.data = w / norms
 
-        For nn.Linear(latent_dim -> in_dim), each latent feature corresponds to
-        one decoder column.
-        """
-        weight = self.dec.weight.data
-        norms = weight.norm(dim=0, keepdim=True).clamp_min(eps)
-        self.dec.weight.data = weight / norms
+
+# ---------------------------------------------------------------------------
+# UniversalSAE
+# ---------------------------------------------------------------------------
+
+
+CLSPoolMode = Literal["none", "mean", "first"]
 
 
 class UniversalSAE(nn.Module):
     """
-    Separate encoder/decoder per model -> shared latent space.
+    Per-model linear encoder/decoder pairs sharing a feature index space.
+
+    Cross-model concept alignment emerges from:
+      (a) the shared dictionary index k (feature k means the same concept across
+          all decoders), enforced by joint training, and
+      (b) cross-model reconstruction when token counts match (or when CLS-pooling
+          is enabled).
+
+    There is no token reshaping. Each model operates in its own native token grid.
+
+    Args:
+        model_dims: model_name -> feature dim D_i
+        latent_dim: shared dictionary size m (same for all models)
+        diffusion_models: set of model names that are diffusion/flow models
+        model_tokens: model_name -> token count N_i (kept for diagnostics; not
+            used to reshape activations any more)
+        top_k: K for TopK sparsity. Operates along the feature axis.
+        cls_pool_mode:
+            'none'  -> per-token operation. Cross-model decode is only allowed
+                       when source and target have the same N. (Default.)
+            'mean'  -> mean-pool tokens to a single (B, D) vector per model
+                       before encoding. Use this when token counts differ but
+                       you want full cross-model reconstruction (matches the
+                       USAE paper's per-sample formulation).
+            'first' -> take the first token (CLS) only.
+        use_tide: whether to apply a TIDE-style timestep affine on diffusion
+            sources/targets. Disabled by default — with a single-timestep
+            training run it learns a constant affine and does no useful work.
+        tide_modulation_location: 'pre' | 'post' | 'both' (only used if use_tide).
+        timestep_dim: TIDE embedding dim.
     """
 
     def __init__(
@@ -255,163 +184,114 @@ class UniversalSAE(nn.Module):
         latent_dim: int,
         diffusion_models: Set[str],
         model_tokens: Optional[Dict[str, int]] = None,
-        shared_latent_tokens: int = 256,
-        timestep_dim: int = 256,
         top_k: Optional[int] = None,
+        cls_pool_mode: CLSPoolMode = "none",
+        use_tide: bool = False,
+        tide_modulation_location: Literal["pre", "post", "both"] = "pre",
+        timestep_dim: int = 256,
+        # Legacy kwargs accepted for backward compatibility but ignored:
+        shared_latent_tokens: Optional[int] = None,
         topk_temperature: float = 0.1,
-        use_soft_topk: bool = True,
+        use_soft_topk: bool = False,
         interpolation_mode: str = "bilinear",
-        token_reshape_mode: TokenReshapeMode = "attention",
+        token_reshape_mode: str = "none",
         attention_heads: int = 8,
         attention_dropout: float = 0.0,
-        tide_modulation_location: Literal["pre", "post", "both"] = "pre",
     ):
-        """
-        Args:
-            model_dims: Dict mapping model name -> feature dimension (D)
-            latent_dim: Shared latent dimension for all models
-            diffusion_models: Set of model names that are diffusion/flow models
-            model_tokens: Dict mapping model name -> number of tokens (N).
-                          Required for pooling/unpooling operations.
-            shared_latent_tokens: Canonical number of tokens in the shared latent space.
-                                  All models are pooled to this size before encoding.
-            timestep_dim: Dimension for timestep embeddings (diffusion only)
-            top_k: If set, apply top-k sparsity to latent z
-            topk_temperature: Temperature for soft top-k
-            use_soft_topk: Use soft (differentiable) top-k vs hard top-k
-            interpolation_mode: Mode for spatial interpolation ("bilinear", "nearest", "bicubic").
-                                 Only used when token_reshape_mode="interpolation".
-            token_reshape_mode: Strategy for reshaping token counts between model space and
-                                 shared latent space.
-                                 - "interpolation": bilinear/nearest/bicubic spatial interpolation.
-                                   Fast, parameter-free, assumes tokens are on a spatial grid.
-                                 - "attention": learned cross-attention pooling/unpooling.
-                                   Adds per-model learned query parameters. More expressive
-                                   but slower and uses more memory, especially for FLUX (4096 tokens).
-            attention_heads: Number of heads for GlobalAttentionReshape (only used when
-                             token_reshape_mode="attention").
-            attention_dropout: Dropout for GlobalAttentionReshape attention weights.
-        """
         super().__init__()
-        self.model_names = list(model_dims.keys())
-        self.diffusion_models = set(diffusion_models)
-        self.model_dims = model_dims
-        self.model_tokens = model_tokens or {}
-        self.shared_latent_tokens = shared_latent_tokens
-        self.interpolation_mode = interpolation_mode
-        self.token_reshape_mode = token_reshape_mode
-        self.tide_modulation_location = tide_modulation_location
 
+        # Soft-topk was always a hack around hard-topk gradient flow; we just
+        # use hard TopK now. If the caller asked for soft, warn once.
+        if use_soft_topk:
+            import warnings
+            warnings.warn(
+                "use_soft_topk is ignored in the stripped-down UniversalSAE; "
+                "hard TopK is used (matches Gao et al. and the USAE paper).",
+                stacklevel=2,
+            )
+        if token_reshape_mode not in ("none",) and shared_latent_tokens is not None:
+            import warnings
+            warnings.warn(
+                f"token_reshape_mode={token_reshape_mode!r} and "
+                f"shared_latent_tokens={shared_latent_tokens} are ignored — "
+                "this UniversalSAE does not pool tokens. Set "
+                "cls_pool_mode='mean' if you need to align different token counts.",
+                stacklevel=2,
+            )
+
+        self.model_names = list(model_dims.keys())
+        self.model_dims = dict(model_dims)
+        self.model_tokens = dict(model_tokens or {})
+        self.diffusion_models = set(diffusion_models)
         self.latent_dim = latent_dim
         self.top_k = top_k
-        self.topk_temperature = topk_temperature
-        self.use_soft_topk = use_soft_topk
+        self.cls_pool_mode = cls_pool_mode
+        self.use_tide = bool(use_tide)
+        self.tide_modulation_location = tide_modulation_location
 
-        # Validate that all models have token counts specified
-        for name in self.model_names:
-            if name not in self.model_tokens:
-                raise ValueError(
-                    f"Model '{name}' missing from model_tokens. "
-                    f"All models must have token counts specified for fixed-size shared latent."
-                )
+        # Per-model SAEs (linear encoder + linear decoder + shared b_pre)
+        self.saes = nn.ModuleDict({
+            name: PerModelTopKSAE(in_dim=dim, latent_dim=latent_dim)
+            for name, dim in model_dims.items()
+        })
 
-        self.saes = nn.ModuleDict({k: PerModelSAE(v, latent_dim) for k, v in model_dims.items()})
-
-        if token_reshape_mode == "attention":
-            # Each model needs a pooler (src_tokens -> shared_latent_tokens)
-            # and an unpooler (shared_latent_tokens -> src_tokens)
-            # We build these only when src_tokens != shared_latent_tokens
-            self.token_poolers = nn.ModuleDict()
-            self.token_unpoolers = nn.ModuleDict()
-            for name, dim in model_dims.items():
-                src_tokens = self.model_tokens[name]
-                if src_tokens != shared_latent_tokens:
-                    self.token_poolers[name] = GlobalAttentionReshape(
-                        dim=dim,
-                        src_tokens=src_tokens,
-                        tgt_tokens=shared_latent_tokens,
-                        num_heads=attention_heads,
-                        dropout=attention_dropout,
-                    )
-                    self.token_unpoolers[name] = GlobalAttentionReshape(
-                        dim=dim,
-                        src_tokens=shared_latent_tokens,
-                        tgt_tokens=src_tokens,
-                        num_heads=attention_heads,
-                        dropout=attention_dropout,
-                    )
-
-        # diffusion-only adapters
+        # Optional diffusion timestep adapters
         self.pre = nn.ModuleDict()
         self.post = nn.ModuleDict()
         for name, dim in model_dims.items():
-            if name in self.diffusion_models:
+            if self.use_tide and name in self.diffusion_models:
                 self.pre[name] = TIDETemporalModulation(dim, tdim=timestep_dim)
                 self.post[name] = TIDETemporalModulation(dim, tdim=timestep_dim)
             else:
                 self.pre[name] = nn.Identity()
                 self.post[name] = nn.Identity()
 
-    def _reshape_tokens(
-        self,
-        x: torch.Tensor,
-        model_name: str,
-        src_tokens: int,
-        tgt_tokens: int,
-        direction: Literal["pool", "unpool"],
-    ) -> torch.Tensor:
+    # -----------------------------------------------------------------------
+    # TopK sparsity
+    # -----------------------------------------------------------------------
+
+    def apply_topk(self, z_pre: torch.Tensor) -> torch.Tensor:
         """
-        Reshape token count from src_tokens to tgt_tokens using the configured strategy.
+        Hard TopK on the last dim. Operates on the *signed* pre-activation,
+        following Gao et al. — no ReLU before TopK.
 
-        Args:
-            x: (B, src_tokens, D)
-            model_name: Model name (used to look up attention modules)
-            src_tokens: Number of input tokens
-            tgt_tokens: Number of output tokens
-            direction: "pool" (downsampling toward shared latent) or
-                       "unpool" (upsampling toward model space)
-        Returns:
-            (B, tgt_tokens, D)
+        Uses the standard straight-through trick so gradients flow through z_pre
+        on the selected indices.
         """
-        if src_tokens == tgt_tokens:
-            return x
-
-        if self.token_reshape_mode == "interpolation":
-            return interpolate_tokens(
-                x,
-                src_tokens=src_tokens,
-                tgt_tokens=tgt_tokens,
-                mode=self.interpolation_mode,
-            )
-
-        if self.token_reshape_mode == "attention":
-            if direction == "pool":
-                return self.token_poolers[model_name](x)
-            return self.token_unpoolers[model_name](x)
-
-        raise ValueError(
-            f"Unknown token_reshape_mode: {self.token_reshape_mode!r}. "
-            "Expected 'interpolation' or 'attention'."
-        )
-
-    def apply_topk(self, z: torch.Tensor) -> torch.Tensor:
         if self.top_k is None:
-            return z
+            return z_pre
+        K = min(self.top_k, z_pre.shape[-1])
 
-        if self.use_soft_topk:
-            # soft mask around kth value threshold
-            # kthvalue requires k in [1, latent_dim]; clamp so top_k <= latent_dim is safe
-            k_index = max(0, z.shape[-1] - self.top_k)
-            k = max(1, k_index + 1)
-            thr = torch.kthvalue(z, k, dim=-1, keepdim=True).values
-            mask = torch.sigmoid((z - thr) / self.topk_temperature)
-            return z * mask
-
-        # hard topk
-        mask = torch.zeros_like(z)
-        _, idx = torch.topk(z, self.top_k, dim=-1)
+        # Top-K on signed pre-activations
+        _, idx = torch.topk(z_pre, k=K, dim=-1)
+        mask = torch.zeros_like(z_pre)
         mask.scatter_(-1, idx, 1.0)
-        return z * mask + (z * mask - z).detach()
+        # Straight-through: forward = z_pre * mask, backward grad reaches z_pre at masked positions
+        return z_pre * mask
+
+    # -----------------------------------------------------------------------
+    # CLS-pool helper (only used if cls_pool_mode != "none")
+    # -----------------------------------------------------------------------
+
+    def _maybe_cls_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, N, D). Returns (B, 1, D) if pooling is enabled, else x unchanged.
+        """
+        if self.cls_pool_mode == "none":
+            return x
+        if x.dim() != 3:
+            raise ValueError(
+                f"_maybe_cls_pool expected (B, N, D), got {tuple(x.shape)}"
+            )
+        if self.cls_pool_mode == "mean":
+            return x.mean(dim=1, keepdim=True)
+        if self.cls_pool_mode == "first":
+            return x[:, :1]
+        raise ValueError(f"Unknown cls_pool_mode={self.cls_pool_mode!r}")
+
+    # -----------------------------------------------------------------------
+    # Encode / decode
+    # -----------------------------------------------------------------------
 
     def encode(
         self,
@@ -420,48 +300,33 @@ class UniversalSAE(nn.Module):
         sigma: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode activations from a source model into the shared latent space.
-
-        Args:
-            x: (B, N_src, D) activations from the source model
-            source: Name of the source model
-            sigma: (B,) diffusion timestep / noise level (required for diffusion models)
-
+        x: (B, N_src, D_src)
         Returns:
-            z_pre: Pre-activation latent (before ReLU and top-k) - (B, shared_latent_tokens, latent_dim)
-            z: Final sparse latent representation - (B, shared_latent_tokens, latent_dim)
+            z_pre: (B, N_eff, latent_dim)
+            z:     (B, N_eff, latent_dim)  — TopK applied along the last dim
+        where N_eff = N_src if cls_pool_mode='none' else 1.
         """
-        if source in self.diffusion_models and self.tide_modulation_location in {"pre", "both"}:
-            assert sigma is not None, f"sigma required for diffusion source '{source}'"
+        if x.dim() != 3:
+            raise ValueError(
+                f"encode expects (B, N, D), got {tuple(x.shape)} for source={source!r}"
+            )
+
+        # Optional diffusion pre-modulation
+        if (
+            self.use_tide
+            and source in self.diffusion_models
+            and self.tide_modulation_location in {"pre", "both"}
+        ):
+            if sigma is None:
+                raise ValueError(f"sigma required for diffusion source {source!r}")
             x = self.pre[source](x, sigma)
 
-        actual_tokens = x.shape[1]
-        declared_tokens = self.model_tokens[source]
-        if actual_tokens != declared_tokens:
-            import warnings
+        # Optional CLS-pool (only when token counts differ between models)
+        x = self._maybe_cls_pool(x)
 
-            warnings.warn(
-                f"[UniversalSAE] model_tokens['{source}'] is {declared_tokens} in config "
-                f"but actual tensor has {actual_tokens} tokens. "
-                f"Auto-correcting to {actual_tokens}. "
-                f"Please update num_tokens in config.yaml to suppress this warning.",
-                stacklevel=2,
-            )
-            self.model_tokens[source] = actual_tokens
-
-        # Pool to canonical token count
-        src_tokens = self.model_tokens[source]
-        x = self._reshape_tokens(
-            x,
-            model_name=source,
-            src_tokens=src_tokens,
-            tgt_tokens=self.shared_latent_tokens,
-            direction="pool",
-        )
-
-        z_pre = self.saes[source].encode_pre(x)  # (B, shared_latent_tokens, latent_dim)
-        z = F.relu(z_pre)
-        z = self.apply_topk(z)  # Top-k now operates on consistent grid
+        # Linear encode (per-token if not pooled, per-image if pooled)
+        z_pre = self.saes[source].encode_pre(x)
+        z = self.apply_topk(z_pre)
         return z_pre, z
 
     def decode(
@@ -469,36 +334,27 @@ class UniversalSAE(nn.Module):
         z: torch.Tensor,
         target: str,
         sigma: Optional[torch.Tensor] = None,
-        source: Optional[str] = None,  
+        source: Optional[str] = None,  # accepted for backward compat; unused
     ) -> torch.Tensor:
         """
-        Decode from shared latent space to a target model's activation space.
-
-        Args:
-            z: (B, shared_latent_tokens, latent_dim) latent representation
-            target: Name of the target model
-            sigma: (B,) diffusion timestep / noise level (required for diffusion targets
-                   when post/both modulation is enabled)
-            source: DEPRECATED - no longer used since z is always canonical size
-
+        z: (B, N_eff, latent_dim)
         Returns:
-            x_hat: (B, N_tgt, D_tgt) reconstructed activations
+            x_hat: (B, N_eff, D_target) if cls_pool_mode='none'
+                   (B, 1, D_target) if pooling is enabled
+        Caller is responsible for ensuring N_eff matches the target's expected
+        token count when cross-decoding.
         """
-        # z is always (B, shared_latent_tokens, latent_dim)
-        x_hat = self.saes[target].decode(z)  # (B, shared_latent_tokens, D_tgt)
+        del source
 
-        # Unpool to target token count
-        tgt_tokens = self.model_tokens[target]
-        x_hat = self._reshape_tokens(
-            x_hat,
-            model_name=target,
-            src_tokens=self.shared_latent_tokens,
-            tgt_tokens=tgt_tokens,
-            direction="unpool",
-        )
+        x_hat = self.saes[target].decode(z)
 
-        if target in self.diffusion_models and self.tide_modulation_location in {"post", "both"}:
-            assert sigma is not None, f"sigma required for diffusion target '{target}'"
+        if (
+            self.use_tide
+            and target in self.diffusion_models
+            and self.tide_modulation_location in {"post", "both"}
+        ):
+            if sigma is None:
+                raise ValueError(f"sigma required for diffusion target {target!r}")
             x_hat = self.post[target](x_hat, sigma)
 
         return x_hat
@@ -511,29 +367,28 @@ class UniversalSAE(nn.Module):
         sigma_src: Optional[torch.Tensor] = None,
         sigma_tgt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full encode-decode pass from source to target model space.
-
-        Args:
-            x: (B, N_src, D_src) source activations
-            source: Source model name
-            target: Target model name
-            sigma_src: Source sigma (for diffusion sources)
-            sigma_tgt: Target sigma (for diffusion targets)
-
-        Returns:
-            z_pre: Pre-activation latent
-            z: Sparse latent
-            x_hat: Reconstructed activations in target space
-        """
         z_pre, z = self.encode(x, source, sigma_src)
-        x_hat = self.decode(z, target, sigma_tgt, source=source)
+        x_hat = self.decode(z, target, sigma_tgt)
         return z_pre, z, x_hat
 
     @torch.no_grad()
     def normalize_decoder_dictionaries_(self) -> None:
-        """
-        Keep every per-model decoder dictionary on the unit sphere.
-        """
         for sae in self.saes.values():
             sae.normalize_decoder_columns_()
+
+    # -----------------------------------------------------------------------
+    # Helper for train.py: can we compute a cross-model reconstruction loss?
+    # -----------------------------------------------------------------------
+
+    def can_cross_reconstruct(self, source: str, target: str) -> bool:
+        """
+        True when source's z can be decoded into target's space. With CLS-pooling
+        enabled, always True. Without pooling, requires matching token counts.
+        """
+        if source == target:
+            return True
+        if self.cls_pool_mode != "none":
+            return True
+        n_src = self.model_tokens.get(source)
+        n_tgt = self.model_tokens.get(target)
+        return (n_src is not None) and (n_tgt is not None) and (n_src == n_tgt)
