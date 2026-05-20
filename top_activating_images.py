@@ -8,7 +8,7 @@ import shutil
 import urllib.request
 import zipfile
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Literal, Optional, Set
 
 import numpy as np
 import torch
@@ -21,16 +21,17 @@ from tqdm import tqdm
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
 WEIGHTS_DIR = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
-CHECKPOINT_PATH = "/content/usae_epoch_29.pth"  
+CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_29.pth"  
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
-DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_inference_results"
+DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
 
 COCO_ANNOTATIONS_DIR = "/content/coco_annotations"
 COCO_ANNOTATIONS_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
 COCO_SPLIT = "val2017"
 
 MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
+FeaturePoolMode = Literal["max", "max_abs"]
 
 
 def find_latest_checkpoint(weights_dir: str) -> str:
@@ -249,6 +250,25 @@ def load_activation_for_image(
     return act, sigma
 
 
+def pool_feature_scores(z: torch.Tensor, mode: FeaturePoolMode) -> torch.Tensor:
+    """
+    Collapse token-level SAE activations into one feature vector per image.
+
+    The SAE returns one latent vector per token/canonical token. This function
+    answers "did this image activate the feature?" instead of "which token did?"
+    by reducing over the token axis.
+    """
+    if z.dim() == 2:
+        return z.abs() if mode.endswith("_abs") else z
+    if z.dim() != 3:
+        raise ValueError(f"Unexpected latent shape from SAE: {z.shape}")
+
+    values = z.abs() if mode.endswith("_abs") else z
+    if mode in {"max", "max_abs"}:
+        return values.max(dim=1).values
+    raise ValueError(f"Unknown feature pool mode: {mode!r}")
+
+
 @torch.no_grad()
 def compute_top_activations(
     cache_root: str,
@@ -263,6 +283,7 @@ def compute_top_activations(
     device: str = "cuda",
     max_images: Optional[int] = None,
     coco_labels: Optional[Dict[str, List[str]]] = None,
+    feature_pool: FeaturePoolMode = "max",
 ):
     is_diffusion = source in diffusion_models
     stems = discover_stems(cache_root)
@@ -297,16 +318,7 @@ def compute_top_activations(
 
         _, z = sae_model.encode(x, source=source, sigma=sigma_batch)
 
-        # Per-image, per-feature score: mean |z| across tokens.
-        # Matches inference.py's z.abs().mean(dim=(0, 1)) reduction when B=1.
-        if z.dim() == 3:
-            per_image_scores = z.abs().mean(dim=1)
-        elif z.dim() == 2:
-            per_image_scores = z.abs()
-        else:
-            raise ValueError(f"Unexpected latent shape from SAE: {z.shape}")
-
-        per_image_scores = per_image_scores.cpu()
+        per_image_scores = pool_feature_scores(z, feature_pool).cpu()
 
         if scores_matrix is None:
             K = per_image_scores.shape[1]
@@ -347,7 +359,7 @@ def compute_top_activations(
         "n_features": K,
         "top_pct": top_pct,
         "top_n_per_feature": top_n,
-        "scoring": "mean_abs_across_tokens",
+        "scoring": f"{feature_pool}_across_tokens",
         "coco_labels": coco_labels is not None,
         "coco_labels_scope": "rank_0_entry_per_feature",
     }
@@ -371,6 +383,16 @@ def parse_args():
     p.add_argument("--use_cls", action="store_true")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_images", type=int, default=None)
+    p.add_argument(
+        "--feature_pool",
+        default="max",
+        choices=("max", "max_abs"),
+        help=(
+            "How to collapse token-level SAE activations into one image-level "
+            "feature score. The default max finds images where a feature fires "
+            "strongly anywhere."
+        ),
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--coco_annotations_dir", default=COCO_ANNOTATIONS_DIR)
     p.add_argument("--coco_split", default=COCO_SPLIT, choices=("train2017", "val2017"))
@@ -430,6 +452,7 @@ def main():
         device=args.device,
         max_images=args.max_images,
         coco_labels=coco_labels,
+        feature_pool=args.feature_pool,
     )
 
     save_to_drive(args.output, checkpoint, DRIVE_SAVE_DIR)
