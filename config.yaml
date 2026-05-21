@@ -50,7 +50,7 @@ sae_params:
   encoder_module: mlp_bn_1
   dictionary_initializer: null
   data_initializer: null
-  dictionary_normalization: l2
+  dictionary_normalization: l1
   top_k: 256
 model_zoo:
   # Vision encoders - all produce 196 tokens (14x14 patches, 224x224 input)
