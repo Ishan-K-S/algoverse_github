@@ -29,6 +29,7 @@ if REPO_ROOT not in sys.path:
 
 from data import CocoActivationDataset
 from universal_sae import UniversalSAE
+from spatial_align import build_spatial_aligner_from_config
 
 
 # walk a tree and list every checkpoint file with size + mtime
@@ -105,33 +106,45 @@ def load_universal_sae(ckpt_path, config_path, device):
         if key in g_file: return g_file[key]
         return default
 
+    # The ckpt stores POST-alignment token counts under "model_tokens" and
+    # pre-alignment counts under "model_tokens_native" (if it was saved by
+    # the patched uni_demo.py). Falls back to "model_tokens" for old ckpts.
+    model_tokens_effective = ckpt["model_tokens"]
+    model_tokens_native = ckpt.get("model_tokens_native", model_tokens_effective)
+
     model = UniversalSAE(
         model_dims=ckpt["model_dims"],
         latent_dim=ckpt["latent_dim"],
         diffusion_models=set(ckpt.get("diffusion_models", g_file.get("diffusion_models", []))),
-        model_tokens=ckpt["model_tokens"],
-        shared_latent_tokens=ckpt["shared_latent_tokens"],
+        model_tokens=model_tokens_effective,
         timestep_dim=int(pick("timestep_dim", 256)),
         top_k=int(sae_p.get("top_k", pick("top_k", TOP_K))),
-        topk_temperature=float(pick("topk_temperature", 0.1)),
-        use_soft_topk=bool(pick("use_soft_topk", False)),
-        interpolation_mode=str(pick("interpolation_mode", "bilinear")),
-        token_reshape_mode=str(pick("token_reshape_mode", "attention")),
-        attention_heads=int(pick("attention_heads", 8)),
-        attention_dropout=float(pick("attention_dropout", 0.0)),
+        cls_pool_mode=str(pick("cls_pool_mode", "none")),
+        use_tide=bool(pick("use_tide", False)),
     )
 
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
     if missing:    print(f"missing keys: {len(missing)}")
     if unexpected: print(f"unexpected keys: {len(unexpected)}")
 
-    return model.to(device).eval(), cfg_file
+    # Build the spatial aligner from saved config so eval matches training.
+    align_to = ckpt.get("spatial_align_to", pick("spatial_align_to", None))
+    aligner_cfg = {"spatial_align_to": align_to}
+    aligner = build_spatial_aligner_from_config(aligner_cfg, model_tokens_native)
+    if aligner is not None:
+        print(f"[overlap] spatial alignment ON: target grid {aligner.target_grid_size}x{aligner.target_grid_size}")
+    else:
+        print(f"[overlap] spatial alignment OFF")
+
+    return model.to(device).eval(), cfg_file, aligner
 
 
 # encode one image, score features by mean |z| across tokens, return top-k indices
 @torch.no_grad()
-def top_feature_set(model, x, source, sigma, top_k, device):
+def top_feature_set(model, x, source, sigma, top_k, device, aligner=None):
     x = x.to(device).unsqueeze(0).float()
+    if aligner is not None:
+        x = aligner.align(x, source=source)
     if sigma is not None:
         sigma = sigma.to(device).float().view(1)
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
@@ -171,7 +184,7 @@ def run():
         checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
 
     device = DEVICE if (DEVICE != "cuda" or torch.cuda.is_available()) else "cpu"
-    model, cfg = load_universal_sae(checkpoint, CONFIG_PATH, device)
+    model, cfg, aligner = load_universal_sae(checkpoint, CONFIG_PATH, device)
     g = cfg.get("global", {})
 
     # combined npz so we can pull pixart sigmas from metadata
@@ -210,8 +223,8 @@ def run():
             raise KeyError("No PixArt sigma in metadata")
         sigma_pixart = sigmas_pixart.view(-1)[t_idx]
 
-        top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device)
-        top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device)
+        top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device, aligner=aligner)
+        top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device, aligner=aligner)
 
         # per-image overlap + running per-feature counts
         jaccard_scores.append(jaccard(top_dino, top_pixart))

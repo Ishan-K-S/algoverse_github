@@ -125,6 +125,7 @@ def top_features_from_activations(
     timestep_values: Optional[torch.Tensor] = None,
     timestep_idx: Optional[int] = None,
     layer_idx: Optional[int] = None,
+    spatial_aligner=None,
 ) -> Tuple[List[Dict[str, float]], torch.Tensor]:
     """
     Run Universal SAE inference on precomputed image activations and return the
@@ -143,6 +144,9 @@ def top_features_from_activations(
             Defaults to the final timestep in image_activations.
         layer_idx: Optional layer index for multi-layer activation tensors.
             Defaults to layer 0.
+        spatial_aligner: Optional SpatialAligner used during training. Must be
+            passed at eval time if it was used at training time, or features
+            won't match the trained dictionary.
 
     Returns:
         features: List of {"feature_idx": int, "score": float}
@@ -160,6 +164,8 @@ def top_features_from_activations(
         timestep_idx=timestep_idx,
         layer_idx=layer_idx,
     )
+    if spatial_aligner is not None:
+        x = spatial_aligner.align(x, source=source)
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
 
     scores = _score_latents(z)
@@ -186,6 +192,7 @@ def top_features_from_image(
     device: str = "cuda",
     timestep_idx: Optional[int] = None,
     layer_idx: Optional[int] = None,
+    spatial_aligner=None,
 ) -> Tuple[List[Dict[str, float]], torch.Tensor]:
     """
     End-to-end inference for a raw image tensor.
@@ -236,6 +243,7 @@ def top_features_from_image(
         timestep_values=timestep_values,
         timestep_idx=timestep_idx,
         layer_idx=layer_idx,
+        spatial_aligner=spatial_aligner,
     )
 
 

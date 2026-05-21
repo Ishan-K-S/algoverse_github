@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from data import CocoActivationDataset
 from universal_sae import UniversalSAE
 from train import train_universal_sae
+from spatial_align import build_spatial_aligner_from_config
 
 # ---------------------------------------------------------------------------
 # wandb setup
@@ -208,25 +209,30 @@ if __name__ == "__main__":
         CONFIG.get("latent_dim", CONFIG.get("nb_components", default_latent)),
         "CONFIG.global.latent_dim",
     )
-    shared_latent_tokens = _parse_int_field(
-        CONFIG.get("shared_latent_tokens", 256),
-        "CONFIG.global.shared_latent_tokens",
-    )
+
+    # Build spatial aligner from config (None if disabled).
+    # When enabled, model_tokens is rewritten to post-alignment counts so
+    # the model and any downstream consumers see the effective token grid.
+    spatial_aligner = build_spatial_aligner_from_config(CONFIG, model_tokens)
+    if spatial_aligner is not None:
+        effective_tokens = spatial_aligner.effective_token_counts()
+        print(f"[spatial-align] enabled: pooling all models to N={spatial_aligner.target_n_tokens}")
+        for m_name in model_tokens:
+            print(f"  {m_name:10s}: native={model_tokens[m_name]:5d}  effective={effective_tokens[m_name]:5d}")
+        model_tokens_effective = dict(effective_tokens)
+    else:
+        print(f"[spatial-align] disabled (no spatial_align_to in config)")
+        model_tokens_effective = dict(model_tokens)
 
     model = UniversalSAE(
         model_dims=model_dims,
         latent_dim=latent_dim,
         diffusion_models=diffusion_models,
-        model_tokens=model_tokens,
-        shared_latent_tokens=shared_latent_tokens,
+        model_tokens=model_tokens_effective,
         timestep_dim=_parse_int_field(CONFIG.get("timestep_dim", 256), "CONFIG.global.timestep_dim"),
         top_k=_parse_int_field(SAE_PARAMS.get("top_k", CONFIG.get("top_k", 32)), "sae_params.top_k"),
-        topk_temperature=float(CONFIG.get("topk_temperature", 0.1)),
-        use_soft_topk=bool(CONFIG.get("use_soft_topk", True)),
-        interpolation_mode=str(CONFIG.get("interpolation_mode", "bilinear")),
-        token_reshape_mode=str(CONFIG.get("token_reshape_mode", "interpolation")),
-        attention_heads=_parse_int_field(CONFIG.get("attention_heads", 8), "CONFIG.global.attention_heads"),
-        attention_dropout=float(CONFIG.get("attention_dropout", 0.0)),
+        cls_pool_mode=str(CONFIG.get("cls_pool_mode", "none")),
+        use_tide=bool(CONFIG.get("use_tide", False)),
     )
 
     device = str(CONFIG.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
@@ -234,44 +240,36 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[model] UniversalSAE created with latent_dim={latent_dim}")
-    print(f"[model] Shared latent tokens   : {shared_latent_tokens}")
-    print(f"[model] Token reshape mode     : {CONFIG.get('token_reshape_mode', 'interpolation')}")
+    print(f"[model] cls_pool_mode          : {CONFIG.get('cls_pool_mode', 'none')}")
+    print(f"[model] use_tide               : {CONFIG.get('use_tide', False)}")
     print(f"[model] Total parameters       : {total_params:,}")
 
     if use_wandb and WANDB_AVAILABLE:
         wandb.config.update({
             "total_params": total_params,
             "latent_dim": latent_dim,
-            "shared_latent_tokens": shared_latent_tokens,
             "model_dims": model_dims,
-            "model_tokens": model_tokens,
+            "model_tokens_native": model_tokens,
+            "model_tokens_effective": model_tokens_effective,
+            "spatial_align_to": CONFIG.get("spatial_align_to", None),
+            "cls_pool_mode": CONFIG.get("cls_pool_mode", "none"),
             "diffusion_models": sorted(list(diffusion_models)),
             "device": device,
         }, allow_val_change=True)
 
     # ----- Optimizer -----
-    # Poolers/unpoolers get 10x higher LR to compensate for gradient starvation
-    # (they receive ~10x weaker gradients than SAE layers due to the long backprop chain)
     base_lr = float(CONFIG.get("lr", 3e-4))
-    pooler_lr = base_lr * 10
     weight_decay = float(CONFIG.get("weight_decay", 1e-5))
 
-    pooler_params = list(model.token_poolers.parameters()) if hasattr(model, "token_poolers") else []
-    unpooler_params = list(model.token_unpoolers.parameters()) if hasattr(model, "token_unpoolers") else []
-    pooler_param_ids = {id(p) for p in pooler_params + unpooler_params}
-    rest_params = [p for p in model.parameters() if id(p) not in pooler_param_ids]
-
     optimizer = optim.AdamW(
-        [
-            {"params": pooler_params, "lr": pooler_lr, "initial_lr": pooler_lr},
-            {"params": unpooler_params, "lr": pooler_lr, "initial_lr": pooler_lr},
-            {"params": rest_params, "lr": base_lr, "initial_lr": base_lr},
-        ],
+        model.parameters(),
+        lr=base_lr,
         weight_decay=weight_decay,
     )
-    print(f"[optim] base_lr={base_lr:.2e}  pooler_lr={pooler_lr:.2e}"
-          f"  pooler_params={len(pooler_params)}  unpooler_params={len(unpooler_params)}"
-          f"  rest_params={len(rest_params)}")
+    # train.py reads initial_lr off each group for warmup_scale logic, so set it.
+    for pg in optimizer.param_groups:
+        pg["initial_lr"] = pg["lr"]
+    print(f"[optim] lr={base_lr:.2e}  params={total_params:,}")
 
     # ----- LR scheduler (cosine decay to final_lr) -----
     nb_epochs = _parse_int_field(CONFIG.get("nb_epochs", 1), "CONFIG.global.nb_epochs")
@@ -296,7 +294,7 @@ if __name__ == "__main__":
             dataloader=dataloader,
             optimizer=optimizer,
             diffusion_models=diffusion_models,
-            model_tokens=model_tokens,
+            model_tokens=model_tokens_effective,
             device=device,
             epoch=epoch,
             use_wandb=use_wandb,
@@ -306,6 +304,7 @@ if __name__ == "__main__":
             balanced_sources=bool(CONFIG.get("balanced_sources", True)),
             warmup_steps=warmup_steps,
             ema_decay=float(CONFIG.get("ema_decay", 0.98)),
+            spatial_aligner=spatial_aligner,
         )
 
         steps_seen = (epoch + 1) * len(dataloader)
@@ -332,8 +331,9 @@ if __name__ == "__main__":
                     "run_name": run_name,
                     "diffusion_models": sorted(list(diffusion_models)),
                     "model_dims": model_dims,
-                    "model_tokens": model_tokens,
-                    "shared_latent_tokens": shared_latent_tokens,
+                    "model_tokens": model_tokens_effective,   # post-alignment
+                    "model_tokens_native": model_tokens,       # pre-alignment
+                    "spatial_align_to": CONFIG.get("spatial_align_to", None),
                     "latent_dim": latent_dim,
                 },
                 ckpt_path,

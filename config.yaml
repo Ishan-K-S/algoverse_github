@@ -2,41 +2,42 @@ global:
   path_to_cache: "/content/combined_cache"      # path to your flat cached .npz directory
   combined_npz: true    # whether activations from all models are stored together per image
   debug: 1
-  exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape (e.g. 8*768=6144)
+  exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape
   input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
   batch_size: 16
   num_workers: 8        # DataLoader worker processes
   nb_epochs: 30
   balanced_sources: true
-  #curriculum_epochs: 5  #incrased from default 2 to 5
+  curriculum_epochs: 0  # 0 disables curriculum; cross-recon active from step 1
   save_every: 5         # save a checkpoint every N epochs
   standardize: true     # standardise activations (mean=0, std=1)
   divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
-  cls_pool_mode: none   # 'none' for per-token (start here), 'mean' for cross-recon
-  use_tide: false       # off — single-timestep training makes TIDE a no-op
   num_tokens: 196
   latent_dim: 12288
-  shared_latent_tokens: 1024   # canonical token count in the shared latent space
-  timestep_dim: 256           # dimension of timestep/sigma embeddings (diffusion only)
-  loss_criterion: L1
-  lr: 0.0003
+  timestep_dim: 256           # dimension of timestep/sigma embeddings (only used if use_tide=true)
+  lr: 0.0005                  # bumped from 3e-4 since the simpler architecture has no gradient-starvation
   final_lr: 1.0e-06
   weight_decay: 1.0e-05
-  warmup_steps: 125
-  # Token interpolation mode for pooling/unpooling operations
-  # Options: "bilinear" (default), "nearest", "bicubic"
-  interpolation_mode: bilinear
-  # Token reshape strategy: "interpolation" or "attention"
-  token_reshape_mode: interpolation
-  # Attention reshape settings (only used when token_reshape_mode: attention)
-  attention_heads: 8
-  attention_dropout: 0.0
-  topk_temperature: 0.1
-  use_soft_topk: false
+  warmup_steps: 50            # shorter warmup for the simpler architecture
+
+  # --- Universal SAE behaviour ---
+  cls_pool_mode: none         # 'none' = per-token (start here, paired with spatial_align_to).
+                              # 'mean' = pool to one vector per image (paper's per-sample setup).
+  use_tide: false             # diffusion timestep modulation. Off — single-timestep run makes it a no-op.
+
+  # --- Spatial alignment (Option B1) ---
+  # When set, every model's token grid is average-pooled down to the named
+  # model's native grid before encoding. DinoV2 (16x16=256) is the smallest
+  # grid here, so all models will be pooled to 16x16.
+  # Set to null/empty to disable (per-token DinoV2->DinoV2 self-recon only;
+  # cross-model recon is then automatically skipped for mismatched grids).
+  spatial_align_to: DinoV2
+
   device: cuda           # "cuda" or "cpu"
-  run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_cross_${nb_epochs}epochs
-  diffusion_models: ["SD3", "FLUX", "PixArt"]
+  run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_align${spatial_align_to}_${nb_epochs}ep
+  diffusion_models: ["PixArt"]   # only models that actually live in model_zoo
+
   # --- wandb ---
   use_wandb: true
   wandb_project: "universal-sae"
@@ -47,21 +48,10 @@ viz:
   sample_size: 5000
   set: val
 sae_params:
-  encoder_module: mlp_bn_1
-  dictionary_initializer: null
-  data_initializer: null
-  dictionary_normalization: l1
-  top_k: 256
+  top_k: 256                  # K out of latent_dim=12288 -> 2.08% density per token.
+                              # Once self-recon is healthy, try sweeping down to 64.
 model_zoo:
-  # Vision encoders - all produce 196 tokens (14x14 patches, 224x224 input)
-  #ViT:    { input_shape: 768,  num_tokens: 196, og_model: ViT }
-  #CLIP:   { input_shape: 768,  num_tokens: 196, og_model: CLIP }
-  #SigLIP: { input_shape: 768,  num_tokens: 196, og_model: SigLIP }
-  DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }
-
+  # Vision encoders
+  DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid
   # Diffusion/Flow models
-  # SD3:  1024 tokens (32x32 patches), feature dim 1536
-  # FLUX: 4096 tokens (64x64 patches), feature dim 3072
-  # SD3:    { input_shape: 1536, num_tokens: 1024, og_model: SD3 }
-  PixArt: {input_shape: 1152, num_tokens: 1024, og_model: PixArt}
-  # FLUX:   { input_shape: 3072, num_tokens: 4096, og_model: FLUX }
+  PixArt: { input_shape: 1152, num_tokens: 1024, og_model: PixArt }    # 32x32 patch grid

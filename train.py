@@ -356,6 +356,7 @@ def train_universal_sae(
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
+    spatial_aligner=None,  # NEW: optional SpatialAligner; pools tokens to a common grid
 ):
     """
     Train a Universal SAE using only the final diffusion timestep.
@@ -435,6 +436,8 @@ def train_universal_sae(
                     timestep_values_bt=src_timesteps_bt,
                 )
             )
+            if spatial_aligner is not None:
+                x_src = spatial_aligner.align(x_src, source=source)
             _z_pre, z = model.encode(x_src, source=source, sigma=t_src_values)
         else:
             x_src = acts[source].to(device)
@@ -445,6 +448,8 @@ def train_universal_sae(
                     is_diffusion=False,
                 )
             )
+            if spatial_aligner is not None:
+                x_src = spatial_aligner.align(x_src, source=source)
             _z_pre, z = model.encode(x_src, source=source, sigma=None)
 
         for target, x_target in acts.items():
@@ -472,6 +477,8 @@ def train_universal_sae(
                     source_layer_idx=source_layer_idx,
                     source_total_layers=source_total_layers,
                 )
+                if spatial_aligner is not None:
+                    x_target_t = spatial_aligner.align(x_target_t, source=target)
                 x_hat = model.decode(z, target=target, sigma=t_tgt_values)
             else:
                 x_target_t, _unused_tgt_t, _target_layer_idx, _unused_tgt_idx = _extract_target_slice(
@@ -481,6 +488,8 @@ def train_universal_sae(
                     source_layer_idx=source_layer_idx,
                     source_total_layers=source_total_layers,
                 )
+                if spatial_aligner is not None:
+                    x_target_t = spatial_aligner.align(x_target_t, source=target)
                 x_hat = model.decode(z, target=target, sigma=None)
  
             # NEW: pool the target if encoder pools the source
