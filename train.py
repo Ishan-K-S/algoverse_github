@@ -522,6 +522,22 @@ def train_universal_sae(
         ema_loss = loss_value if ema_loss is None else (ema_decay * ema_loss + (1.0 - ema_decay) * loss_value)
         model._train_loss_ema = ema_loss
 
+        # ---- Per-feature usage EMA tracking (partition diagnostic) ----
+        # For each model, track an EMA of per-feature firing rate over training
+        # batches. At log time we derive: how many features fire for *every*
+        # model vs only one. A healthy shared dictionary has most features
+        # firing for both models; a partitioned dictionary has features
+        # firing exclusively for one model.
+        with torch.no_grad():
+            usage_now = (z != 0).float().mean(dim=tuple(range(z.dim() - 1)))  # (K,)
+            attr = f"_usage_ema_{source}"
+            prev = getattr(model, attr, None)
+            if prev is None or prev.shape != usage_now.shape:
+                setattr(model, attr, usage_now.clone())
+            else:
+                # EMA: usage_decay ~ 0.95 -> effective window ~20 batches per source
+                getattr(model, attr).mul_(0.95).add_(0.05 * usage_now)
+
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
             log_dict = {
                 "train/total_loss": loss_value,
@@ -542,6 +558,51 @@ def train_universal_sae(
                 if attn_loss is not None:
                     log_dict["train/attention_component_loss"] = attn_loss.item()
                 log_dict.update(_attention_module_wandb_logs(model))
+
+                # ---- Partition diagnostic logging ----
+                # Need EMAs from BOTH models to compute. If only one has been
+                # seen so far (e.g. very early in training), skip.
+                ema_attrs = {
+                    name.removeprefix("_usage_ema_"): getattr(model, name)
+                    for name in dir(model) if name.startswith("_usage_ema_")
+                }
+                if len(ema_attrs) >= 2:
+                    # Threshold: feature is "used" if EMA firing rate > 1e-3
+                    # (i.e. fires on at least 0.1% of tokens averaged over recent batches).
+                    used_per_model = {n: (e > 1e-3) for n, e in ema_attrs.items()}
+                    model_names = sorted(used_per_model.keys())
+                    used_stack = torch.stack([used_per_model[n] for n in model_names])  # (M, K)
+
+                    used_by_all = used_stack.all(dim=0).sum().item()
+                    used_by_none = (~used_stack.any(dim=0)).sum().item()
+                    K_total = used_stack.shape[1]
+
+                    log_dict["partition/used_by_all_models"] = used_by_all
+                    log_dict["partition/used_by_none"] = used_by_none
+                    log_dict["partition/frac_shared"] = used_by_all / K_total
+                    for n in model_names:
+                        only_this = (used_per_model[n] & ~torch.stack(
+                            [used_per_model[m] for m in model_names if m != n]
+                        ).any(dim=0)).sum().item()
+                        log_dict[f"partition/used_by_{n}_only"] = only_this
+
+                    # Partition score: max exclusive count / shared count.
+                    # >1.0 means more features are exclusive to some model than shared.
+                    max_excl = max(
+                        log_dict[f"partition/used_by_{n}_only"] for n in model_names
+                    )
+                    log_dict["partition/score"] = max_excl / max(used_by_all, 1)
+
+                    # Per-feature firing-rate cosine across models — continuous
+                    # version of frac_shared. 1 = identical usage profile,
+                    # 0 = orthogonal (disjoint feature sets).
+                    if len(model_names) == 2:
+                        e0 = ema_attrs[model_names[0]]
+                        e1 = ema_attrs[model_names[1]]
+                        cos = torch.nn.functional.cosine_similarity(
+                            e0.unsqueeze(0), e1.unsqueeze(0)
+                        ).item()
+                        log_dict[f"partition/usage_cosine_{model_names[0]}_vs_{model_names[1]}"] = cos
 
             wandb.log(log_dict, step=global_step_actual)
 
