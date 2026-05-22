@@ -47,23 +47,36 @@ import torch
 import yaml
 
 
+CHECKPOINT_PATH = "/content/algoverse_github/weights/ex16_bs16_topk256_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"
+CACHE_ROOT      = "/content/combined_cache"
+CONFIG_PATH     = "/content/algoverse_github/config.yaml"
+REPO_ROOT       = "/content/algoverse_github"
+OUT_PATH        = "/content/dict_diag.npz"
+PLOT_PATH       = "/content/dict_diag.png"
+N_IMAGES        = 500
+TOP_K           = 64
+PIXART_TIMESTEP = -1
+DEVICE          = "cuda"
+# --------------------
+
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
 def _parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="Path to usae_epoch_*.pth")
-    p.add_argument("--cache", required=True, help="Path to combined activation cache dir")
-    p.add_argument("--config", required=True, help="Path to config.yaml")
-    p.add_argument("--repo_root", default=None,
+    p.add_argument("--ckpt",            default=CHECKPOINT_PATH, help="Path to usae_epoch_*.pth")
+    p.add_argument("--cache",           default=CACHE_ROOT,      help="Path to combined activation cache dir")
+    p.add_argument("--config",          default=CONFIG_PATH,     help="Path to config.yaml")
+    p.add_argument("--repo_root",       default=REPO_ROOT,
                    help="Path to the algoverse repo (added to sys.path). Default: dirname(config).")
-    p.add_argument("--n_images", type=int, default=200, help="How many images to analyze")
-    p.add_argument("--top_k", type=int, default=64, help="K for the Jaccard scoring comparison")
-    p.add_argument("--pixart_timestep", type=int, default=-1, help="Which diffusion timestep to use")
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--out", default="dict_diag.npz", help="Where to save raw arrays")
-    p.add_argument("--plot", default="dict_diag.png", help="Where to save the diagnostic plot")
+    p.add_argument("--n_images",        type=int,   default=N_IMAGES,        help="How many images to analyze")
+    p.add_argument("--top_k",           type=int,   default=TOP_K,           help="K for the Jaccard scoring comparison")
+    p.add_argument("--pixart_timestep", type=int,   default=PIXART_TIMESTEP, help="Which diffusion timestep to use")
+    p.add_argument("--device",                      default=DEVICE)
+    p.add_argument("--out",                         default=OUT_PATH,        help="Where to save raw arrays")
+    p.add_argument("--plot",                        default=PLOT_PATH,       help="Where to save the diagnostic plot")
     return p.parse_args()
 
 
