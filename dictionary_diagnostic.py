@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections import Counter
 from typing import Tuple
 
@@ -57,6 +58,7 @@ N_IMAGES        = 500
 TOP_K           = 64
 PIXART_TIMESTEP = -1
 DEVICE          = "cuda"
+DRIVE_SAVE_DIR  = "/content/drive/MyDrive/DictionaryDiagnosticResults"
 # --------------------
 
 
@@ -78,6 +80,57 @@ def _parse_args():
     p.add_argument("--out",                         default=OUT_PATH,        help="Where to save raw arrays")
     p.add_argument("--plot",                        default=PLOT_PATH,       help="Where to save the diagnostic plot")
     return p.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Drive helpers
+# -----------------------------------------------------------------------------
+
+def _mount_drive(retries: int = 3) -> bool:
+    try:
+        from google.colab import drive as _colab_drive
+    except ImportError:
+        return False
+    for attempt in range(retries):
+        try:
+            _colab_drive.mount("/content/drive", force_remount=(attempt > 0))
+            if os.path.isdir("/content/drive/MyDrive"):
+                return True
+        except Exception as e:
+            print(f"[drive] Mount attempt {attempt + 1} failed: {e}")
+        time.sleep(5)
+    return False
+
+
+def _robust_copy(src: str, dst: str, retries: int = 3) -> None:
+    for attempt in range(retries):
+        try:
+            with open(src, "rb") as f:
+                data = f.read()
+            with open(dst, "wb") as f:
+                f.write(data)
+            return
+        except OSError as e:
+            if attempt < retries - 1:
+                print(f"[drive] OSError on {os.path.basename(src)} (errno {e.errno}), remounting...")
+                _mount_drive()
+                time.sleep(5)
+            else:
+                raise
+
+
+def save_to_drive(file_paths: list, drive_dir: str) -> None:
+    if not _mount_drive():
+        print("[drive] Not running in Colab — skipping Drive upload.")
+        return
+    os.makedirs(drive_dir, exist_ok=True)
+    for path in file_paths:
+        if not os.path.isfile(path):
+            print(f"[drive] Skipping missing file: {path}")
+            continue
+        dst = os.path.join(drive_dir, os.path.basename(path))
+        _robust_copy(path, dst)
+        print(f"[drive] Saved: {dst}")
 
 
 # -----------------------------------------------------------------------------
@@ -358,6 +411,8 @@ def main():
         print(f"[diag] saved plot to: {args.plot}")
     except ImportError:
         print("[diag] matplotlib not available, skipping plot")
+
+    save_to_drive([args.out, args.plot], DRIVE_SAVE_DIR)
 
 
 if __name__ == "__main__":
