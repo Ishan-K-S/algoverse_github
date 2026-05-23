@@ -35,13 +35,31 @@ FeaturePoolMode = Literal["max", "max_abs"]
 
 
 def find_latest_checkpoint(weights_dir: str) -> str:
-    """Return the most recently modified .pth file under weights_dir."""
+    """Return the most recently modified valid .pth file under weights_dir.
+
+    Validates each candidate by attempting to open it as a zip archive before
+    returning it. Falls back to the next most recent file if the latest is
+    corrupted (e.g. truncated by a mid-save runtime crash).
+    """
+    import zipfile
     candidates = glob.glob(os.path.join(weights_dir, "**", "*.pth"), recursive=True)
     if not candidates:
         raise FileNotFoundError(f"No .pth checkpoints found under {weights_dir}")
-    latest = max(candidates, key=os.path.getmtime)
-    print(f"[ckpt] Auto-selected: {latest}")
-    return latest
+
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    for path in candidates:
+        size_mb = os.path.getsize(path) / 1_048_576
+        try:
+            with zipfile.ZipFile(path, "r"):
+                pass
+            print(f"[ckpt] Auto-selected (valid, {size_mb:.1f} MB): {path}")
+            return path
+        except zipfile.BadZipFile:
+            print(f"[ckpt] Skipping corrupted checkpoint ({size_mb:.1f} MB): {path}")
+
+    raise FileNotFoundError(
+        f"All .pth files under {weights_dir} are corrupted. Re-run training to produce a valid checkpoint."
+    )
 
 
 def save_to_drive(output_path: str, checkpoint_path: str, drive_dir: str) -> None:
@@ -180,7 +198,7 @@ def load_universal_sae(checkpoint_path: str, config_path: str, device: str):
         ) from e
 
     print(f"[sae] Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

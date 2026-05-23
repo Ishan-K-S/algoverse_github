@@ -92,7 +92,7 @@ def save_to_drive(out_dir, drive_dir):
 # rebuild universalsae from ckpt fields, fill rest from config.yaml
 def load_universal_sae(ckpt_path, config_path, device):
     print(f"loading ckpt: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     with open(config_path, "r") as f:
         cfg_file = yaml.safe_load(f)

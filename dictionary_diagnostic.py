@@ -152,7 +152,7 @@ def main():
 
     # ----- Load checkpoint and rebuild the model -----
     print(f"[diag] loading ckpt: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     with open(args.config) as f:
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
