@@ -195,18 +195,12 @@ def load_universal_sae(checkpoint_path: str, config_path: str, device: str):
     model = UniversalSAE(
         model_dims=ckpt["model_dims"],
         latent_dim=ckpt["latent_dim"],
-        diffusion_models=set(ckpt.get(
-            "diffusion_models", g.get("diffusion_models", []))),
+        diffusion_models=set(ckpt.get("diffusion_models", g.get("diffusion_models", []))),
         model_tokens=ckpt["model_tokens"],
-        shared_latent_tokens=ckpt["shared_latent_tokens"],
-        timestep_dim=int(pick("timestep_dim", 256)),
         top_k=int(sp.get("top_k", pick("top_k", 64))),
-        topk_temperature=float(pick("topk_temperature", 0.1)),
-        use_soft_topk=bool(pick("use_soft_topk", False)),
-        interpolation_mode=str(pick("interpolation_mode", "bilinear")),
-        token_reshape_mode=str(pick("token_reshape_mode", "attention")),
-        attention_heads=int(pick("attention_heads", 8)),
-        attention_dropout=float(pick("attention_dropout", 0.0)),
+        cls_pool_mode=str(pick("cls_pool_mode", "none")),
+        use_tide=bool(pick("use_tide", False)),
+        timestep_dim=int(pick("timestep_dim", 256)),
     )
     model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
