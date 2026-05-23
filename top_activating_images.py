@@ -20,8 +20,8 @@ from tqdm import tqdm
 
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
-WEIGHTS_DIR = "/content/algoverse_github/models"    # searched automatically for the latest checkpoint
-CHECKPOINT_PATH = "/content/algoverse_github/models/universal_sae_final.pt"  
+WEIGHTS_DIR = "/content/algoverse_github/weights"    # searched automatically for the latest checkpoint
+CHECKPOINT_PATH = "/content/algoverse_github/weights/ex16_bs16_topk64_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"  
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
 DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
