@@ -20,8 +20,8 @@ from tqdm import tqdm
 
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
-WEIGHTS_DIR = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
-CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_run/usae_epoch_29.pth"  
+WEIGHTS_DIR = "/content/algoverse_github/models"    # searched automatically for the latest checkpoint
+CHECKPOINT_PATH = "/content/algoverse_github/models/universal_sae_final.pt"  
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
 DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"
@@ -34,32 +34,15 @@ MODELS_WITH_CLS = {"DinoV2", "ViT", "CLIP"}
 FeaturePoolMode = Literal["max", "max_abs"]
 
 
-def find_latest_checkpoint(weights_dir: str) -> str:
-    """Return the most recently modified valid .pth file under weights_dir.
-
-    Validates each candidate by attempting to open it as a zip archive before
-    returning it. Falls back to the next most recent file if the latest is
-    corrupted (e.g. truncated by a mid-save runtime crash).
-    """
-    import zipfile
-    candidates = glob.glob(os.path.join(weights_dir, "**", "*.pth"), recursive=True)
+def find_latest_checkpoint(models_dir: str) -> str:
+    """Return the most recently modified .pt or .pth file under models_dir."""
+    candidates = glob.glob(os.path.join(models_dir, "**", "*.pt"), recursive=True)
+    candidates += glob.glob(os.path.join(models_dir, "**", "*.pth"), recursive=True)
     if not candidates:
-        raise FileNotFoundError(f"No .pth checkpoints found under {weights_dir}")
-
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    for path in candidates:
-        size_mb = os.path.getsize(path) / 1_048_576
-        try:
-            with zipfile.ZipFile(path, "r"):
-                pass
-            print(f"[ckpt] Auto-selected (valid, {size_mb:.1f} MB): {path}")
-            return path
-        except zipfile.BadZipFile:
-            print(f"[ckpt] Skipping corrupted checkpoint ({size_mb:.1f} MB): {path}")
-
-    raise FileNotFoundError(
-        f"All .pth files under {weights_dir} are corrupted. Re-run training to produce a valid checkpoint."
-    )
+        raise FileNotFoundError(f"No .pt/.pth checkpoints found under {models_dir}")
+    latest = max(candidates, key=os.path.getmtime)
+    print(f"[ckpt] Auto-selected ({os.path.getsize(latest)/1_048_576:.1f} MB): {latest}")
+    return latest
 
 
 def save_to_drive(output_path: str, checkpoint_path: str, drive_dir: str) -> None:
