@@ -350,13 +350,14 @@ def train_universal_sae(
     use_wandb: bool = False,
     log_every: int = 50,
     cosine_weight: float = 0.0,
+    latent_align_weight: float = 1.0,  # cosine loss between z_src and z_tgt in latent space
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
-    spatial_aligner=None,  # NEW: optional SpatialAligner; pools tokens to a common grid
+    spatial_aligner=None,  # optional SpatialAligner; pools tokens to a common grid
 ):
     """
     Train a Universal SAE using only the final diffusion timestep.
@@ -373,6 +374,22 @@ def train_universal_sae(
     """
     del model_tokens
     model.train()
+
+    # Critical: can_cross_reconstruct() checks model.model_tokens to decide if
+    # cross-model reconstruction is structurally possible. With spatial alignment
+    # active, every model's tokens are pooled down to target_n_tokens before
+    # encoding, so the effective token count is the same for all models. Patch
+    # model_tokens here so can_cross_reconstruct() sees the post-alignment counts
+    # and doesn't silently skip the cross-model loss.
+    if spatial_aligner is not None:
+        target_n = spatial_aligner.target_n_tokens
+        for name in list(model.model_tokens.keys()):
+            if name in spatial_aligner.native_grid_sizes:
+                model.model_tokens[name] = target_n
+        if epoch == 0:
+            print(f"[train] spatial_aligner active: patched model_tokens -> "
+                  f"{{k: {target_n} for all aligned models}}")
+            print(f"[train] can_cross_reconstruct will now return True for all aligned pairs.")
 
     if epoch == 0:
         print("\n" + "=" * 60)
@@ -507,10 +524,57 @@ def train_universal_sae(
             reconstruction_weight_total += weight
             per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
 
+        # Latent alignment loss: for each cross-model pair, encode the target too
+        # and penalise the cosine distance between the two mean-pooled latent codes.
+        # This is a direct gradient signal forcing both encoders to fire the SAME
+        # features for the same image — cross-reconstruction alone is insufficient
+        # because a model can reconstruct the other's space using disjoint features.
+        latent_align_loss = torch.tensor(0.0, device=device)
+        n_align_pairs = 0
+        if latent_align_weight > 0 and not in_curriculum:
+            for tgt_name, x_tgt_acts in acts.items():
+                if tgt_name == source:
+                    continue
+                if not model.can_cross_reconstruct(source, tgt_name):
+                    continue
+                x_tgt_raw = x_tgt_acts.to(device)
+                if tgt_name in diffusion_models:
+                    tgt_ts_bt = _get_sigmas_bt(meta, tgt_name, batch_size, x_tgt_raw.device)
+                    x_tgt_sl, t_tgt_sl, _, _ = _extract_target_slice(
+                        x_tgt_raw, is_diffusion=True,
+                        timestep_values_bt=tgt_ts_bt,
+                        source_layer_idx=source_layer_idx,
+                        source_total_layers=source_total_layers,
+                    )
+                    if spatial_aligner is not None:
+                        x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
+                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=t_tgt_sl)
+                else:
+                    x_tgt_sl, _, _, _ = _extract_target_slice(
+                        x_tgt_raw, is_diffusion=False,
+                        timestep_values_bt=None,
+                        source_layer_idx=source_layer_idx,
+                        source_total_layers=source_total_layers,
+                    )
+                    if spatial_aligner is not None:
+                        x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
+                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=None)
+
+                # Mean-pool over tokens to get per-image latent vectors (B, K)
+                z_src_mean = z.mean(dim=1)
+                z_tgt_mean = z_tgt.mean(dim=1)
+                pair_align = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+                latent_align_loss = latent_align_loss + pair_align
+                n_align_pairs += 1
+                per_target_losses[f"latent_align_{source}_vs_{tgt_name}"] = pair_align.item()
+
         sae_loss = None
         if reconstruction_weight_total > 0:
             sae_loss = reconstruction_loss / reconstruction_weight_total
             loss = loss + sae_loss
+
+        if n_align_pairs > 0:
+            loss = loss + latent_align_weight * (latent_align_loss / n_align_pairs)
 
         loss.backward()
         optimizer.step()
@@ -543,6 +607,7 @@ def train_universal_sae(
                 "train/total_loss": loss_value,
                 "train/total_loss_ema": ema_loss,
                 "train/sae_loss": sae_loss.item() if sae_loss is not None else 0.0,
+                "train/latent_align_loss": (latent_align_loss / max(n_align_pairs, 1)).item(),
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
