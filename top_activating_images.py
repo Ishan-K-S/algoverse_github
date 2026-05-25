@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
-from spatial_aligner import SpatialAligner
+from spatial_align import SpatialAligner
 
 
 # THESE ARE WHAT TO FILL IN
