@@ -57,14 +57,13 @@ def build_spatial_aligner(cfg):
 
         native_grid_sizes[name] = side
 
-    target_n_tokens = model_cfgs[target]["num_tokens"]
+    target_grid_size = native_grid_sizes[target]
 
-    print(f"[align] enabled -> target={target}")
-    print(f"[align] target_n_tokens={target_n_tokens}")
+    print(f"[align] enabled -> target={target}, grid={target_grid_size}x{target_grid_size}")
 
     return SpatialAligner(
         native_grid_sizes=native_grid_sizes,
-        target_n_tokens=target_n_tokens,
+        target_grid_size=target_grid_size,
     )
 
 
