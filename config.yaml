@@ -24,7 +24,7 @@ global:
   # --- Universal SAE behaviour ---
   cls_pool_mode: none         # 'none' = per-token (start here, paired with spatial_align_to).
                               # 'mean' = pool to one vector per image (paper's per-sample setup).
-  use_tide: false             # diffusion timestep modulation. Off — single-timestep run makes it a no-op.
+  use_tide: true             # diffusion timestep modulation. Off — single-timestep run makes it a no-op.
 
   # --- Spatial alignment (Option B1) ---
   # When set, every model's token grid is average-pooled down to the named
