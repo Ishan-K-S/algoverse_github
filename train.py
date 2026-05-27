@@ -365,7 +365,7 @@ def train_universal_sae(
     use_wandb: bool = False,
     log_every: int = 50,
     cosine_weight: float = 0.0,
-    latent_align_weight: float = 1.0,  # cosine loss between z_src and z_tgt in latent space
+    latent_align_weight: float = 3.0,  # cosine loss between z_src and z_tgt in latent space
     latent_align_mode: str = "per_token",  # "bag" | "per_token" | "both"
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
