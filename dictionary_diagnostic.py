@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections import Counter
 from typing import Tuple
 
@@ -47,24 +48,89 @@ import torch
 import yaml
 
 
+CHECKPOINT_PATH = "/content/algoverse_github/weights/ex16_bs16_topk64_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"
+CACHE_ROOT      = "/content/combined_cache"
+CONFIG_PATH     = "/content/algoverse_github/config.yaml"
+REPO_ROOT       = "/content/algoverse_github"
+OUT_PATH        = "/content/dict_diag.npz"
+PLOT_PATH       = "/content/dict_diag.png"
+N_IMAGES        = 500
+TOP_K           = 64
+PIXART_TIMESTEP = -1
+DEVICE          = "cuda"
+DRIVE_SAVE_DIR  = "/content/drive/MyDrive/DictionaryDiagnosticResults"
+# --------------------
+
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
 def _parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="Path to usae_epoch_*.pth")
-    p.add_argument("--cache", required=True, help="Path to combined activation cache dir")
-    p.add_argument("--config", required=True, help="Path to config.yaml")
-    p.add_argument("--repo_root", default=None,
+    p.add_argument("--ckpt",            default=CHECKPOINT_PATH, help="Path to usae_epoch_*.pth")
+    p.add_argument("--cache",           default=CACHE_ROOT,      help="Path to combined activation cache dir")
+    p.add_argument("--config",          default=CONFIG_PATH,     help="Path to config.yaml")
+    p.add_argument("--repo_root",       default=REPO_ROOT,
                    help="Path to the algoverse repo (added to sys.path). Default: dirname(config).")
-    p.add_argument("--n_images", type=int, default=200, help="How many images to analyze")
-    p.add_argument("--top_k", type=int, default=64, help="K for the Jaccard scoring comparison")
-    p.add_argument("--pixart_timestep", type=int, default=-1, help="Which diffusion timestep to use")
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--out", default="dict_diag.npz", help="Where to save raw arrays")
-    p.add_argument("--plot", default="dict_diag.png", help="Where to save the diagnostic plot")
+    p.add_argument("--n_images",        type=int,   default=N_IMAGES,        help="How many images to analyze")
+    p.add_argument("--top_k",           type=int,   default=TOP_K,           help="K for the Jaccard scoring comparison")
+    p.add_argument("--pixart_timestep", type=int,   default=PIXART_TIMESTEP, help="Which diffusion timestep to use")
+    p.add_argument("--device",                      default=DEVICE)
+    p.add_argument("--out",                         default=OUT_PATH,        help="Where to save raw arrays")
+    p.add_argument("--plot",                        default=PLOT_PATH,       help="Where to save the diagnostic plot")
     return p.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Drive helpers
+# -----------------------------------------------------------------------------
+
+def _mount_drive(retries: int = 3) -> bool:
+    try:
+        from google.colab import drive as _colab_drive
+    except ImportError:
+        return False
+    for attempt in range(retries):
+        try:
+            _colab_drive.mount("/content/drive", force_remount=(attempt > 0))
+            if os.path.isdir("/content/drive/MyDrive"):
+                return True
+        except Exception as e:
+            print(f"[drive] Mount attempt {attempt + 1} failed: {e}")
+        time.sleep(5)
+    return False
+
+
+def _robust_copy(src: str, dst: str, retries: int = 3) -> None:
+    for attempt in range(retries):
+        try:
+            with open(src, "rb") as f:
+                data = f.read()
+            with open(dst, "wb") as f:
+                f.write(data)
+            return
+        except OSError as e:
+            if attempt < retries - 1:
+                print(f"[drive] OSError on {os.path.basename(src)} (errno {e.errno}), remounting...")
+                _mount_drive()
+                time.sleep(5)
+            else:
+                raise
+
+
+def save_to_drive(file_paths: list, drive_dir: str) -> None:
+    if not _mount_drive():
+        print("[drive] Not running in Colab — skipping Drive upload.")
+        return
+    os.makedirs(drive_dir, exist_ok=True)
+    for path in file_paths:
+        if not os.path.isfile(path):
+            print(f"[drive] Skipping missing file: {path}")
+            continue
+        dst = os.path.join(drive_dir, os.path.basename(path))
+        _robust_copy(path, dst)
+        print(f"[drive] Saved: {dst}")
 
 
 # -----------------------------------------------------------------------------
@@ -86,7 +152,7 @@ def main():
 
     # ----- Load checkpoint and rebuild the model -----
     print(f"[diag] loading ckpt: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     with open(args.config) as f:
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
@@ -345,6 +411,8 @@ def main():
         print(f"[diag] saved plot to: {args.plot}")
     except ImportError:
         print("[diag] matplotlib not available, skipping plot")
+
+    save_to_drive([args.out, args.plot], DRIVE_SAVE_DIR)
 
 
 if __name__ == "__main__":

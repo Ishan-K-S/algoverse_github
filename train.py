@@ -88,7 +88,7 @@ def _get_sigmas_bt(meta, model_name: str, batch_size: int, device: torch.device)
 
 def _map_timestep_idx(t_src: int, t_src_len: int, t_tgt_len: int) -> int:
     """
-    Map layer index from source layout to target layout if layer counts differ.
+    Map layer/timestep index from source layout to target layout if counts differ.
     Uses proportional mapping [0..Tsrc-1] -> [0..Ttgt-1].
     """
     if t_tgt_len <= 1:
@@ -106,14 +106,17 @@ def _pick_diffusion_slice(
     """
     Select one diffusion timestep slice for training.
 
-    By default, train only on the final diffusion timestep.
+    If timestep_idx is None, samples a random timestep per batch so the SAE
+    sees the full denoising trajectory. Returns the activation slice and
+    the corresponding sigma value at that timestep, which is forwarded to
+    the encoder as conditioning when use_tide=true.
     """
     if x.dim() != 4:
         raise ValueError(f"Expected diffusion activations shaped (B, T, N, D), got {tuple(x.shape)}")
 
     _, total_steps, _, _ = x.shape
     if timestep_idx is None:
-        timestep_idx = total_steps - 1
+        timestep_idx = random.randrange(total_steps)
     return x[:, timestep_idx], t_bt[:, timestep_idx], timestep_idx
 
 
@@ -284,13 +287,20 @@ def _extract_target_slice(
     timestep_values_bt: Optional[torch.Tensor],
     source_layer_idx: Optional[int],
     source_total_layers: Optional[int],
+    source_timestep_idx: Optional[int] = None,
+    source_total_steps: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
     """
     Normalize target activation layouts into one comparison slice.
 
-    Diffusion targets always use the final timestep. Layer alignment uses the
-    same layer index when possible, with proportional fallback if source and
-    target expose different numbers of layers.
+    Diffusion targets reuse the source's timestep so that cross-reconstruction
+    compares activations at matching noise levels. If the source was also
+    diffusion and chose timestep t, this picks t (mapped proportionally
+    if T differs between source and target). If the source was vision (no
+    timestep_idx available), the target samples a random timestep.
+
+    Layer alignment uses the same layer index when possible, with proportional
+    fallback if source and target expose different numbers of layers.
     """
     layer_idx = None
     if is_diffusion:
@@ -310,7 +320,12 @@ def _extract_target_slice(
         if timestep_values_bt is None:
             raise ValueError("Diffusion target requires timestep values.")
 
-        timestep_idx = x.shape[1] - 1
+        total_steps = x.shape[1]
+        if source_timestep_idx is None:
+            timestep_idx = random.randrange(total_steps)
+        else:
+            src_steps = source_total_steps if source_total_steps is not None else total_steps
+            timestep_idx = _map_timestep_idx(source_timestep_idx, src_steps, total_steps)
         return x[:, timestep_idx], timestep_values_bt[:, timestep_idx], layer_idx, timestep_idx
 
     if x.dim() == 4:
@@ -350,29 +365,47 @@ def train_universal_sae(
     use_wandb: bool = False,
     log_every: int = 50,
     cosine_weight: float = 0.0,
+    latent_align_weight: float = 1.0,  # cosine loss between z_src and z_tgt in latent space
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
-    spatial_aligner=None,  # NEW: optional SpatialAligner; pools tokens to a common grid
+    spatial_aligner=None,  # optional SpatialAligner; pools tokens to a common grid
 ):
     """
-    Train a Universal SAE using only the final diffusion timestep.
+    One epoch of Universal SAE training.
 
-    Compared to the pasted version:
-      - Diffusion sources and targets use the final timestep only.
-      - Temporal consistency loss is removed.
-      - Sparsity loss is removed.
-      - Decoder orthogonality loss is removed.
-      - SAE reconstruction loss and attention component loss are logged
-        separately to W&B.
-      - W&B logs include attention module heatmaps when cached and parameter
-        histograms for attention reshape modules.
+    For diffusion sources, a random timestep is sampled per batch; diffusion
+    targets reuse the source's sampled timestep (mapped proportionally if T
+    differs) so cross-reconstruction compares matching noise regimes. Sigma
+    values are passed to model.encode and model.decode; whether the encoder
+    actually conditions on them is controlled by use_tide in the model config.
+
+    Reconstruction loss is the sum of self-recon (source==target) and
+    cross-recon (source!=target) MSE, weighted by self_weight and
+    cross_weight respectively. An optional latent-alignment cosine loss
+    pulls per-image latent codes toward agreement across models.
     """
     del model_tokens
     model.train()
+
+    # Critical: can_cross_reconstruct() checks model.model_tokens to decide if
+    # cross-model reconstruction is structurally possible. With spatial alignment
+    # active, every model's tokens are pooled down to target_n_tokens before
+    # encoding, so the effective token count is the same for all models. Patch
+    # model_tokens here so can_cross_reconstruct() sees the post-alignment counts
+    # and doesn't silently skip the cross-model loss.
+    if spatial_aligner is not None:
+        target_n = spatial_aligner.target_n_tokens
+        for name in list(model.model_tokens.keys()):
+            if name in spatial_aligner.native_grid_sizes:
+                model.model_tokens[name] = target_n
+        if epoch == 0:
+            print(f"[train] spatial_aligner active: patched model_tokens -> "
+                  f"{{k: {target_n} for all aligned models}}")
+            print(f"[train] can_cross_reconstruct will now return True for all aligned pairs.")
 
     if epoch == 0:
         print("\n" + "=" * 60)
@@ -429,7 +462,7 @@ def train_universal_sae(
                     f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
                 )
 
-            x_src, t_src_values, source_layer_idx, _t_src_idx, source_total_layers, _source_total_steps = (
+            x_src, t_src_values, source_layer_idx, source_timestep_idx, source_total_layers, source_total_steps = (
                 _extract_source_slice(
                     x_src_full,
                     is_diffusion=True,
@@ -442,7 +475,7 @@ def train_universal_sae(
         else:
             x_src = acts[source].to(device)
             batch_size = x_src.shape[0]
-            x_src, _unused_t, source_layer_idx, _t_src_idx, source_total_layers, _source_total_steps = (
+            x_src, _unused_t, source_layer_idx, source_timestep_idx, source_total_layers, source_total_steps = (
                 _extract_source_slice(
                     x_src,
                     is_diffusion=False,
@@ -456,7 +489,7 @@ def train_universal_sae(
             if in_curriculum and curriculum_self_only and target != source:
                 continue
  
-            # NEW: skip cross-model targets we structurally can't reconstruct
+            # Skip cross-model targets we structurally can't reconstruct
             if not model.can_cross_reconstruct(source, target):
                 continue
  
@@ -476,6 +509,8 @@ def train_universal_sae(
                     timestep_values_bt=tgt_timesteps_bt,
                     source_layer_idx=source_layer_idx,
                     source_total_layers=source_total_layers,
+                    source_timestep_idx=source_timestep_idx,
+                    source_total_steps=source_total_steps,
                 )
                 if spatial_aligner is not None:
                     x_target_t = spatial_aligner.align(x_target_t, source=target)
@@ -492,7 +527,7 @@ def train_universal_sae(
                     x_target_t = spatial_aligner.align(x_target_t, source=target)
                 x_hat = model.decode(z, target=target, sigma=None)
  
-            # NEW: pool the target if encoder pools the source
+            # Pool the target if encoder pools the source
             x_target_t = _pool_target_for_loss(model, x_target_t)
  
             target_mse_loss = mse_flat(x_hat, x_target_t)
@@ -507,10 +542,59 @@ def train_universal_sae(
             reconstruction_weight_total += weight
             per_target_losses[f"{source}->{target}"] = target_mse_loss.item()
 
+        # Latent alignment loss: for each cross-model pair, encode the target too
+        # and penalise the cosine distance between the two mean-pooled latent codes.
+        # This is a direct gradient signal forcing both encoders to fire the SAME
+        # features for the same image — cross-reconstruction alone is insufficient
+        # because a model can reconstruct the other's space using disjoint features.
+        latent_align_loss = torch.tensor(0.0, device=device)
+        n_align_pairs = 0
+        if latent_align_weight > 0 and not in_curriculum:
+            for tgt_name, x_tgt_acts in acts.items():
+                if tgt_name == source:
+                    continue
+                if not model.can_cross_reconstruct(source, tgt_name):
+                    continue
+                x_tgt_raw = x_tgt_acts.to(device)
+                if tgt_name in diffusion_models:
+                    tgt_ts_bt = _get_sigmas_bt(meta, tgt_name, batch_size, x_tgt_raw.device)
+                    x_tgt_sl, t_tgt_sl, _, _ = _extract_target_slice(
+                        x_tgt_raw, is_diffusion=True,
+                        timestep_values_bt=tgt_ts_bt,
+                        source_layer_idx=source_layer_idx,
+                        source_total_layers=source_total_layers,
+                        source_timestep_idx=source_timestep_idx,
+                        source_total_steps=source_total_steps,
+                    )
+                    if spatial_aligner is not None:
+                        x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
+                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=t_tgt_sl)
+                else:
+                    x_tgt_sl, _, _, _ = _extract_target_slice(
+                        x_tgt_raw, is_diffusion=False,
+                        timestep_values_bt=None,
+                        source_layer_idx=source_layer_idx,
+                        source_total_layers=source_total_layers,
+                    )
+                    if spatial_aligner is not None:
+                        x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
+                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=None)
+
+                # Mean-pool over tokens to get per-image latent vectors (B, K)
+                z_src_mean = z.mean(dim=1)
+                z_tgt_mean = z_tgt.mean(dim=1)
+                pair_align = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+                latent_align_loss = latent_align_loss + pair_align
+                n_align_pairs += 1
+                per_target_losses[f"latent_align_{source}_vs_{tgt_name}"] = pair_align.item()
+
         sae_loss = None
         if reconstruction_weight_total > 0:
             sae_loss = reconstruction_loss / reconstruction_weight_total
             loss = loss + sae_loss
+
+        if n_align_pairs > 0:
+            loss = loss + latent_align_weight * (latent_align_loss / n_align_pairs)
 
         loss.backward()
         optimizer.step()
@@ -543,11 +627,14 @@ def train_universal_sae(
                 "train/total_loss": loss_value,
                 "train/total_loss_ema": ema_loss,
                 "train/sae_loss": sae_loss.item() if sae_loss is not None else 0.0,
+                "train/latent_align_loss": (latent_align_loss / max(n_align_pairs, 1)).item(),
                 "train/source_model": source,
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
                 "train/in_curriculum": float(in_curriculum),
             }
+            if source_timestep_idx is not None:
+                log_dict["train/source_timestep_idx"] = int(source_timestep_idx)
             for pair, value in per_target_losses.items():
                 safe_key = pair.replace("->", "_to_")
                 log_dict[f"train/loss_{safe_key}"] = value
