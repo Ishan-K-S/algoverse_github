@@ -366,6 +366,7 @@ def train_universal_sae(
     log_every: int = 50,
     cosine_weight: float = 0.0,
     latent_align_weight: float = 1.0,  # cosine loss between z_src and z_tgt in latent space
+    latent_align_mode: str = "per_token",  # "bag" | "per_token" | "both"
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
@@ -580,10 +581,31 @@ def train_universal_sae(
                         x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
                     _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=None)
 
-                # Mean-pool over tokens to get per-image latent vectors (B, K)
-                z_src_mean = z.mean(dim=1)
-                z_tgt_mean = z_tgt.mean(dim=1)
-                pair_align = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+                # Alignment loss: pull z_src and z_tgt toward agreement.
+                #
+                # mode='bag' (legacy): mean-pool tokens, cosine across image-level vectors.
+                #   Only constrains the per-image FEATURE-USAGE HISTOGRAM; the encoder can
+                #   satisfy this by picking different features per token while keeping the
+                #   mean similar. Diagnostic symptom: bag-of-features cosine ~1.0,
+                #   per-feature co-fire ~0.
+                #
+                # mode='per_token': cosine at each spatial position. Forces the two encoders
+                #   to agree on which features fire AT THIS PATCH. Requires spatial
+                #   alignment to be enabled so token positions correspond between models.
+                #
+                # mode='both': average of bag and per_token.
+                if latent_align_mode == "per_token":
+                    pair_align = (1.0 - F.cosine_similarity(z, z_tgt, dim=-1)).mean()
+                elif latent_align_mode == "both":
+                    z_src_mean = z.mean(dim=1)
+                    z_tgt_mean = z_tgt.mean(dim=1)
+                    bag = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+                    per_tok = (1.0 - F.cosine_similarity(z, z_tgt, dim=-1)).mean()
+                    pair_align = 0.5 * (bag + per_tok)
+                else:  # "bag" (legacy)
+                    z_src_mean = z.mean(dim=1)
+                    z_tgt_mean = z_tgt.mean(dim=1)
+                    pair_align = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
                 latent_align_loss = latent_align_loss + pair_align
                 n_align_pairs += 1
                 per_target_losses[f"latent_align_{source}_vs_{tgt_name}"] = pair_align.item()
