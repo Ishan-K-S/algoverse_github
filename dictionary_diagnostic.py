@@ -48,7 +48,7 @@ import torch
 import yaml
 
 
-CHECKPOINT_PATH = "/content/algoverse_github/weights/ex16_bs16_topk64_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"
+CHECKPOINT_PATH = "/content/algoverse_github/weights/ex16_bs16_topk512_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"
 CACHE_ROOT      = "/content/combined_cache"
 CONFIG_PATH     = "/content/algoverse_github/config.yaml"
 REPO_ROOT       = "/content/algoverse_github"
