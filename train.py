@@ -367,6 +367,11 @@ def train_universal_sae(
     cosine_weight: float = 0.0,
     latent_align_weight: float = 3.0,  # cosine loss between z_src and z_tgt in latent space
     latent_align_mode: str = "per_token",  # "bag" | "per_token" | "both"
+    pre_topk_align_weight: float = 0.5,  # weight on dense pre-activation cosine alignment.
+                                          # Adds gradient signal to non-selected feature
+                                          # positions, letting the encoder reorganize
+                                          # which indices fire (the post-TopK loss can't).
+                                          # 0.0 disables.
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
@@ -472,7 +477,7 @@ def train_universal_sae(
             )
             if spatial_aligner is not None:
                 x_src = spatial_aligner.align(x_src, source=source)
-            _z_pre, z = model.encode(x_src, source=source, sigma=t_src_values)
+            z_pre, z = model.encode(x_src, source=source, sigma=t_src_values)
         else:
             x_src = acts[source].to(device)
             batch_size = x_src.shape[0]
@@ -484,7 +489,7 @@ def train_universal_sae(
             )
             if spatial_aligner is not None:
                 x_src = spatial_aligner.align(x_src, source=source)
-            _z_pre, z = model.encode(x_src, source=source, sigma=None)
+            z_pre, z = model.encode(x_src, source=source, sigma=None)
 
         for target, x_target in acts.items():
             if in_curriculum and curriculum_self_only and target != source:
@@ -569,7 +574,7 @@ def train_universal_sae(
                     )
                     if spatial_aligner is not None:
                         x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
-                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=t_tgt_sl)
+                    z_pre_tgt, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=t_tgt_sl)
                 else:
                     x_tgt_sl, _, _, _ = _extract_target_slice(
                         x_tgt_raw, is_diffusion=False,
@@ -579,7 +584,7 @@ def train_universal_sae(
                     )
                     if spatial_aligner is not None:
                         x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)
-                    _, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=None)
+                    z_pre_tgt, z_tgt = model.encode(x_tgt_sl, source=tgt_name, sigma=None)
 
                 # Alignment loss: pull z_src and z_tgt toward agreement.
                 #
@@ -594,21 +599,37 @@ def train_universal_sae(
                 #   alignment to be enabled so token positions correspond between models.
                 #
                 # mode='both': average of bag and per_token.
+                #
+                # Pre-TopK alignment: an additional cosine term on the DENSE pre-activations
+                # (z_pre, before TopK). The post-TopK gradient is killed at the ~99.5% of
+                # positions that aren't selected, so it can only adjust magnitudes on
+                # already-overlapping indices and cannot reorganize WHICH indices fire.
+                # The pre-TopK term sees every dimension and can pull both encoders'
+                # readout directions into agreement, eventually shifting which indices
+                # cross the TopK threshold. Controlled by pre_topk_align_weight.
                 if latent_align_mode == "per_token":
-                    pair_align = (1.0 - F.cosine_similarity(z, z_tgt, dim=-1)).mean()
+                    pair_align_post = (1.0 - F.cosine_similarity(z, z_tgt, dim=-1)).mean()
                 elif latent_align_mode == "both":
                     z_src_mean = z.mean(dim=1)
                     z_tgt_mean = z_tgt.mean(dim=1)
                     bag = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
                     per_tok = (1.0 - F.cosine_similarity(z, z_tgt, dim=-1)).mean()
-                    pair_align = 0.5 * (bag + per_tok)
+                    pair_align_post = 0.5 * (bag + per_tok)
                 else:  # "bag" (legacy)
                     z_src_mean = z.mean(dim=1)
                     z_tgt_mean = z_tgt.mean(dim=1)
-                    pair_align = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+                    pair_align_post = (1.0 - F.cosine_similarity(z_src_mean, z_tgt_mean, dim=-1)).mean()
+
+                if pre_topk_align_weight > 0:
+                    pair_align_pre = (1.0 - F.cosine_similarity(z_pre, z_pre_tgt, dim=-1)).mean()
+                    pair_align = pair_align_post + pre_topk_align_weight * pair_align_pre
+                    per_target_losses[f"latent_align_pre_{source}_vs_{tgt_name}"] = pair_align_pre.item()
+                else:
+                    pair_align = pair_align_post
+
                 latent_align_loss = latent_align_loss + pair_align
                 n_align_pairs += 1
-                per_target_losses[f"latent_align_{source}_vs_{tgt_name}"] = pair_align.item()
+                per_target_losses[f"latent_align_{source}_vs_{tgt_name}"] = pair_align_post.item()
 
         sae_loss = None
         if reconstruction_weight_total > 0:

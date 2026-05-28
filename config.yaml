@@ -50,7 +50,7 @@ viz:
   sample_size: 5000
   set: val
 sae_params:
-  top_k: 64                   # K out of latent_dim=12288 -> 0.52% density per token.
+  top_k: 512                   # K out of latent_dim=12288 -> 0.52% density per token.
                               # Lower sparsity forces features to be more selective,
                               # making it harder for each model to claim its own subspace.
   latent_align_weight: 1.0    # cosine alignment loss weight between z_src and z_tgt.
