@@ -42,17 +42,24 @@ global:
   use_wandb: true
   wandb_project: "universal-sae"
   wandb_entity:                     # your wandb username or team (leave blank for default)
-  wandb_log_every: 50               # log every N training steps
+  wandb_log_every: 17               # ODD, so step%17 hits both even (DinoV2) and odd (PixArt)
+                                    # source batches under balanced_sources. With log_every=50
+                                    # every logged step was even -> PixArt-source losses hidden.
 viz:
   batch_size: 100
   sample_size: 5000
   set: val
 sae_params:
-  top_k: 64                   # K out of latent_dim=12288 -> 0.52% density per token.
+  top_k: 512                   # K out of latent_dim=12288 -> 0.52% density per token.
                               # Lower sparsity forces features to be more selective,
                               # making it harder for each model to claim its own subspace.
   latent_align_weight: 1.0    # cosine alignment loss weight between z_src and z_tgt.
                               # Set to 0 to disable; increase to 2.0+ if partition score stays >1.
+  latent_align_mode: per_token  # "per_token" (recommended) | "bag" (legacy) | "both"
+                                # per_token aligns z at each spatial position (requires
+                                # spatial_align_to). bag aligns only the mean — produces
+                                # high bag-of-features cosine but zero per-feature co-fire,
+                                # which is the failure mode the last run showed.
 model_zoo:
   # Vision encoders
   DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid

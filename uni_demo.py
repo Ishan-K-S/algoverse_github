@@ -305,6 +305,12 @@ if __name__ == "__main__":
             warmup_steps=warmup_steps,
             ema_decay=float(CONFIG.get("ema_decay", 0.98)),
             spatial_aligner=spatial_aligner,
+            latent_align_weight=float(
+                SAE_PARAMS.get("latent_align_weight", CONFIG.get("latent_align_weight", 1.0))
+            ),
+            latent_align_mode=str(
+                SAE_PARAMS.get("latent_align_mode", CONFIG.get("latent_align_mode", "per_token"))
+            ),
         )
 
         steps_seen = (epoch + 1) * len(dataloader)
