@@ -367,7 +367,7 @@ def train_universal_sae(
     cosine_weight: float = 0.0,
     latent_align_weight: float = 3.0,  # cosine loss between z_src and z_tgt in latent space
     latent_align_mode: str = "per_token",  # "bag" | "per_token" | "both"
-    pre_topk_align_weight: float = 0.5,  # weight on dense pre-activation cosine alignment.
+    pre_topk_align_weight: float = 1.0,  # weight on dense pre-activation cosine alignment.
                                           # Adds gradient signal to non-selected feature
                                           # positions, letting the encoder reorganize
                                           # which indices fire (the post-TopK loss can't).
