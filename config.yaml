@@ -32,7 +32,7 @@ global:
   # grid here, so all models will be pooled to 16x16.
   # Set to null/empty to disable (per-token DinoV2->DinoV2 self-recon only;
   # cross-model recon is then automatically skipped for mismatched grids).
-  spatial_align_to: DinoV2
+  spatial_align_to: PixArt
 
   device: cuda           # "cuda" or "cpu"
   run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_align${spatial_align_to}_${nb_epochs}ep
