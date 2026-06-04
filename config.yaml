@@ -4,7 +4,7 @@ global:
   debug: 1
   exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape
   input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
-  batch_size: 16
+  batch_size: 8
   num_workers: 8        # DataLoader worker processes
   nb_epochs: 30
   balanced_sources: true
