@@ -781,21 +781,6 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     HOOK_DEPTH_FRAC = 0.5
 
     def _get_last_block(self) -> nn.Module:
-        """
-        Return the transformer block to hook.
-
-        With HOOK_DEPTH_FRAC=0.5 this returns the MIDDLE block rather than the
-        last one. The last block's activations are shaped around predicting
-        noise (epsilon) and carry little image semantics; a middle block's
-        residual stream is dominated by self-attention + feedforward over the
-        actual image content, so it stays high-rank and image-specific. This is
-        the signal that should overlap with DinoV2 features.
-
-        NOTE: the hook attaches to the whole block (the residual-stream output),
-        NOT to .attn2. With null-prompt extraction the cross-attention output is
-        near-constant across images, so hooking the full block is the right
-        choice here.
-        """
         blocks = self.transformer.transformer_blocks
         n_blocks = len(blocks)
         idx = int(round(self.HOOK_DEPTH_FRAC * (n_blocks - 1)))
