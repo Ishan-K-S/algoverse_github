@@ -775,9 +775,34 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             model_output, _ = model_output.chunk(2, dim=1)
         return model_output
 
+    # Which transformer block to hook, as a fraction of total depth.
+    #   1.0 -> last block (original behaviour, noise-prediction-dominated)
+    #   0.5 -> middle block (Option A: richer, higher-rank semantic residual stream)
+    HOOK_DEPTH_FRAC = 0.5
+
     def _get_last_block(self) -> nn.Module:
-        """Return the last MMDiT block."""
-        return self.transformer.transformer_blocks[-1]
+        """
+        Return the transformer block to hook.
+
+        With HOOK_DEPTH_FRAC=0.5 this returns the MIDDLE block rather than the
+        last one. The last block's activations are shaped around predicting
+        noise (epsilon) and carry little image semantics; a middle block's
+        residual stream is dominated by self-attention + feedforward over the
+        actual image content, so it stays high-rank and image-specific. This is
+        the signal that should overlap with DinoV2 features.
+
+        NOTE: the hook attaches to the whole block (the residual-stream output),
+        NOT to .attn2. With null-prompt extraction the cross-attention output is
+        near-constant across images, so hooking the full block is the right
+        choice here.
+        """
+        blocks = self.transformer.transformer_blocks
+        n_blocks = len(blocks)
+        idx = int(round(self.HOOK_DEPTH_FRAC * (n_blocks - 1)))
+        idx = max(0, min(idx, n_blocks - 1))
+        print(f"[PixArt] Hooking transformer block {idx}/{n_blocks - 1} "
+              f"(depth_frac={self.HOOK_DEPTH_FRAC})")
+        return blocks[idx]
 
     def _get_ddim_sigmas(self) -> list:
         """
@@ -866,7 +891,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         if not activations_list:
             raise RuntimeError(
                 f"[PixArt] No activations captured after {self.num_inference_steps} steps. "
-                "The forward hook may not have fired — check that attn2 exists on the last transformer block."
+                "The forward hook may not have fired — check that the hooked transformer block exists and produces an output tensor."
             )
         print(f"[PixArt] Captured {len(activations_list)} activations, "
               f"each shape {tuple(activations_list[0].shape)}")
