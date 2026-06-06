@@ -4,7 +4,7 @@ global:
   debug: 1
   exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape
   input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
-  batch_size: 8
+  batch_size: 16
   num_workers: 8        # DataLoader worker processes
   nb_epochs: 30
   balanced_sources: true
@@ -32,7 +32,7 @@ global:
   # grid here, so all models will be pooled to 16x16.
   # Set to null/empty to disable (per-token DinoV2->DinoV2 self-recon only;
   # cross-model recon is then automatically skipped for mismatched grids).
-  spatial_align_to: PixArt
+  spatial_align_to: DinoV2
 
   device: cuda           # "cuda" or "cpu"
   run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_align${spatial_align_to}_${nb_epochs}ep
