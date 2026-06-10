@@ -778,7 +778,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     # Which transformer block to hook, as a fraction of total depth.
     #   1.0 -> last block (original behaviour, noise-prediction-dominated)
     #   0.5 -> middle block (Option A: richer, higher-rank semantic residual stream)
-    HOOK_DEPTH_FRAC = 0.5
+    HOOK_DEPTH_FRAC = 8 / 27
 
     def _get_last_block(self) -> nn.Module:
         blocks = self.transformer.transformer_blocks
