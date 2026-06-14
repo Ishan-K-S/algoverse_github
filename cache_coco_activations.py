@@ -64,7 +64,7 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
     
     
     
-    coco_data = CocoData(coco_root, transform=model.preprocess, max_images=500)
+    coco_data = CocoData(coco_root, transform=model.preprocess, max_images=2000)
     print(f"Found {len(coco_data)} images from Coco.")
 
     data_loader = torch.utils.data.DataLoader(

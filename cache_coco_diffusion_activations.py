@@ -73,7 +73,7 @@ def cache_diffusion_activations(
         raise RuntimeError(f"[diffusion-cache] Cache directory not found: {cache_root}\n"
                            "  Create it first: os.makedirs('/content/cache', exist_ok=True)")
 
-    ds = CocoData(coco_root, transform=extractor.preprocess, max_images=500)
+    ds = CocoData(coco_root, transform=extractor.preprocess, max_images=2000)
 
     dl = torch.utils.data.DataLoader(
         ds,
