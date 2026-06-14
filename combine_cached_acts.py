@@ -25,7 +25,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 from multiprocessing import Pool
-DRIVE_SAVE_DIR = "/content/drive/MyDrive/algoverse_results/combined_cache"
+DRIVE_SAVE_DIR = "/content/drive/MyDrive/algoverse_results/combined_cache2000"
 
 
 
