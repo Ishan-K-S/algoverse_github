@@ -37,7 +37,7 @@ def _parse_args():
     p.add_argument("--cache", required=True)
     p.add_argument("--config", required=True)
     p.add_argument("--repo_root", default=None)
-    p.add_argument("--n_images", type=int, default=500)
+    p.add_argument("--n_images", type=int, default=2000)
     p.add_argument("--pixart_timestep", type=int, default=-1)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default="input_rank.npz")
