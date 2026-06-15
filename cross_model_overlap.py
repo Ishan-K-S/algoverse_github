@@ -10,7 +10,7 @@ CKPT_SEARCH_ROOT = "/content"
 
 SOURCES             = ["DinoV2", "PixArt"]
 TOP_K               = 64
-MAX_IMAGES          = 500
+MAX_IMAGES          = 2000
 PIXART_TIMESTEP_IDX = -1
 DEVICE           = "cuda"
 OUT_DIR          = "/content/overlap_results"
