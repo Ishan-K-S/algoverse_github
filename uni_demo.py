@@ -311,6 +311,13 @@ if __name__ == "__main__":
             latent_align_mode=str(
                 SAE_PARAMS.get("latent_align_mode", CONFIG.get("latent_align_mode", "per_token"))
             ),
+            resample_dead=bool(SAE_PARAMS.get("resample_dead", CONFIG.get("resample_dead", False))),
+            resample_interval=int(SAE_PARAMS.get("resample_interval", 500)),
+            resample_dead_threshold=float(SAE_PARAMS.get("resample_dead_threshold", 1e-3)),
+            resample_enc_scale=float(SAE_PARAMS.get("resample_enc_scale", 0.2)),
+            resample_max_per_event=int(SAE_PARAMS.get("resample_max_per_event", 0)),
+            resample_start_step=int(SAE_PARAMS.get("resample_start_step", 0)),
+            resample_end_step=int(SAE_PARAMS.get("resample_end_step", 0)),
         )
 
         steps_seen = (epoch + 1) * len(dataloader)

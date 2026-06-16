@@ -60,6 +60,19 @@ sae_params:
                                 # spatial_align_to). bag aligns only the mean — produces
                                 # high bag-of-features cosine but zero per-feature co-fire,
                                 # which is the failure mode the last run showed.
+
+  # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
+  # Periodically revive features that have gone dead (usage EMA below threshold
+  # for BOTH models) by re-pointing them at the activations the SAE currently
+  # reconstructs worst and resetting their optimizer state. Set resample_dead to
+  # false to disable and reproduce the previous behaviour exactly.
+  resample_dead: false
+  resample_interval: 500          # global steps between resampling events
+  resample_dead_threshold: 1.0e-3 # usage-EMA below which a feature counts as dead
+  resample_enc_scale: 0.2         # revived encoder-row norm = this * mean alive encoder norm
+  resample_max_per_event: 4096    # cap features revived per event (0 = revive all dead at once)
+  resample_start_step: 200        # don't resample before the encoders/EMAs have settled
+  resample_end_step: 0            # stop resampling at/after this step (0 = no limit)
 model_zoo:
   # Vision encoders
   DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid
