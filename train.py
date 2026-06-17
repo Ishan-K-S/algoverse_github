@@ -354,6 +354,154 @@ def _pool_target_for_loss(model, x_target_t):
         return x_target_t[:, :1]
     raise ValueError(f"Unknown cls_pool_mode={mode!r}")
 
+
+def _reset_adam_state_slice(optimizer, param, rows=None, cols=None) -> None:
+    """
+    Zero the Adam moment estimates (exp_avg, exp_avg_sq) for specific rows/cols
+    of a parameter tensor.
+
+    This is run after re-initializing a dead feature so the optimizer doesn't
+    immediately re-freeze it with stale, near-zero momentum from when it was
+    dead. `rows` indexes dim 0, `cols` indexes dim 1 — pass whichever axis the
+    feature lives on (W_enc.weight: feature = row; W_dec.weight: feature =
+    column). The per-tensor `step` count is left alone (it can't be reset per
+    row); with exp_avg/exp_avg_sq zeroed the first revived update is a normal
+    ~lr-scaled step, not an explosion.
+    """
+    state = optimizer.state.get(param, None)
+    if not state:
+        return
+    for key in ("exp_avg", "exp_avg_sq"):
+        buf = state.get(key, None)
+        if buf is None:
+            continue
+        if rows is not None:
+            buf[rows] = 0.0
+        if cols is not None:
+            buf[:, cols] = 0.0
+
+
+@torch.no_grad()
+def resample_dead_features(
+    model: nn.Module,
+    optimizer,
+    acts: Dict[str, torch.Tensor],
+    meta,
+    diffusion_models: Set[str],
+    spatial_aligner=None,
+    dead_threshold: float = 1e-3,
+    enc_scale_factor: float = 0.2,
+    max_per_event: int = 0,
+    eps: float = 1e-8,
+) -> int:
+    """
+    Dead-feature resampling for the shared TopK dictionary, following
+    Bricken et al. 2023 ("Towards Monosemanticity", Neuron Resampling).
+
+    A feature index is "dead" when its per-model usage EMA (tracked in the
+    training loop as model._usage_ema_<name>) is below `dead_threshold` for
+    EVERY model — i.e. it sits in the "used by none" partition. Because the
+    dictionary index space is shared across models, each dead feature is revived
+    JOINTLY: for every model we re-point that same index at one of the
+    activations that model currently reconstructs worst.
+
+    Per model, for each revived feature index k:
+      - decoder column W_dec[:, k]  <- normalized (x - b_pre) of a sampled
+                                       high-loss token (a direction the current
+                                       dictionary is failing to cover)
+      - encoder row    W_enc[k, :]  <- the same direction, scaled to
+                                       enc_scale_factor * mean encoder-row norm
+                                       of the alive features (so it fires on
+                                       that token without dominating)
+      - Adam moment state for those rows/cols is zeroed.
+
+    High-loss tokens are sampled with probability proportional to squared
+    self-reconstruction error. Decoder columns are unit-normalized by the
+    training loop's normalize_decoder_dictionaries_() on the next step, which
+    is consistent with the normalized init here.
+
+    Returns the number of features resampled (0 if none were dead, or if the
+    usage EMAs haven't been populated for every model yet).
+    """
+    # --- 1. Identify features dead across ALL models from the usage EMAs ---
+    ema_attrs = {
+        name.removeprefix("_usage_ema_"): getattr(model, name)
+        for name in dir(model) if name.startswith("_usage_ema_")
+    }
+    # Need a warmed EMA for every model we have activations for, else too early.
+    if any(name not in ema_attrs for name in acts.keys()):
+        return 0
+
+    model_names = sorted(acts.keys())
+    used_stack = torch.stack([(ema_attrs[n] > dead_threshold) for n in model_names])  # (M, K)
+    dead_mask = ~used_stack.any(dim=0)   # (K,) True where dead in every model
+    alive_mask = ~dead_mask
+    dead_idx = dead_mask.nonzero(as_tuple=False).flatten()
+    if dead_idx.numel() == 0:
+        return 0
+
+    # Optionally cap revivals per event: pick a random subset so different dead
+    # features get chances across successive events (lottery-ticket spirit).
+    if max_per_event and dead_idx.numel() > max_per_event:
+        perm = torch.randperm(dead_idx.numel(), device=dead_idx.device)[:max_per_event]
+        dead_idx = dead_idx[perm]
+    n_dead = int(dead_idx.numel())
+
+    # --- 2. Revive those indices in every model, each toward its own residual ---
+    for model_name in model_names:
+        sae = model.saes[model_name]
+        device = sae.W_enc.weight.device
+
+        # Recover an aligned (B, N, D) activation slice for this model.
+        x = acts[model_name].to(device)
+        is_diff = model_name in diffusion_models
+        if is_diff:
+            ts_bt = _get_sigmas_bt(meta, model_name, x.shape[0], device)
+            x_slice, t_slice, _, _, _, _ = _extract_source_slice(
+                x, is_diffusion=True, timestep_values_bt=ts_bt,
+            )
+        else:
+            x_slice, t_slice, _, _, _, _ = _extract_source_slice(x, is_diffusion=False)
+        if spatial_aligner is not None:
+            x_slice = spatial_aligner.align(x_slice, source=model_name)
+
+        # Self-reconstruct to score per-token reconstruction error.
+        _z_pre, z = model.encode(x_slice, source=model_name, sigma=t_slice)
+        x_hat = model.decode(z, target=model_name, sigma=t_slice)
+        x_cmp = _pool_target_for_loss(model, x_slice)  # match x_hat shape if pooling
+
+        x_cmp_flat = x_cmp.reshape(-1, x_cmp.shape[-1])   # (T, D)
+        x_hat_flat = x_hat.reshape(-1, x_hat.shape[-1])   # (T, D)
+        recon_err = ((x_hat_flat - x_cmp_flat) ** 2).sum(dim=-1)  # (T,)
+
+        # Sample high-loss tokens with prob proportional to err^2.
+        probs = recon_err.double() ** 2
+        total = probs.sum()
+        if not torch.isfinite(total) or total <= 0:
+            probs = torch.ones_like(probs)
+        chosen = torch.multinomial(probs, num_samples=n_dead, replacement=True)
+        chosen_acts = x_cmp_flat[chosen]  # (n_dead, D)
+
+        # Decoder dictionary directions: point at what we currently miss.
+        directions = chosen_acts - sae.b_pre  # (n_dead, D)
+        directions = directions / directions.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+        # Encoder scale: enc_scale_factor * mean encoder-row norm of alive feats.
+        enc_norms = sae.W_enc.weight.data.norm(dim=-1)  # (K,)
+        ref_norm = enc_norms[alive_mask].mean() if alive_mask.any() else enc_norms.mean()
+        enc_scale = enc_scale_factor * ref_norm
+
+        # Write the revived weights (decoder columns, encoder rows).
+        sae.W_dec.weight.data[:, dead_idx] = directions.t().to(sae.W_dec.weight.dtype)
+        sae.W_enc.weight.data[dead_idx, :] = (directions * enc_scale).to(sae.W_enc.weight.dtype)
+
+        # Wipe optimizer momentum for just these rows/cols so they actually train.
+        _reset_adam_state_slice(optimizer, sae.W_enc.weight, rows=dead_idx)
+        _reset_adam_state_slice(optimizer, sae.W_dec.weight, cols=dead_idx)
+
+    return n_dead
+
+
 def train_universal_sae(
     model: nn.Module,
     dataloader,
@@ -379,6 +527,13 @@ def train_universal_sae(
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
     spatial_aligner=None,  # optional SpatialAligner; pools tokens to a common grid
+    resample_dead: bool = False,        # enable dead-feature resampling
+    resample_interval: int = 500,       # global steps between resampling events
+    resample_dead_threshold: float = 1e-3,  # usage-EMA threshold for "dead"
+    resample_enc_scale: float = 0.2,    # revived enc-row norm = this * mean alive norm
+    resample_max_per_event: int = 0,    # cap revivals per event (0 = all dead)
+    resample_start_step: int = 0,       # don't resample before this global step
+    resample_end_step: int = 0,         # stop resampling at/after this step (0 = no limit)
 ):
     """
     One epoch of Universal SAE training.
@@ -443,12 +598,39 @@ def train_universal_sae(
     last_loss = torch.tensor(0.0, device=device)
     ema_loss = getattr(model, "_train_loss_ema", None)
     in_curriculum = epoch < curriculum_epochs
+    resampled_since_log = 0
 
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         global_step_actual = global_step + batch_idx
         if 0 < global_step_actual + 1 <= warmup_steps:
             warmup_scale = (global_step_actual + 1) / warmup_steps
             _set_optimizer_warmup_lr(optimizer, warmup_scale)
+
+        # Dead-feature resampling (Bricken et al. 2023). Runs at intervals using
+        # the current batch's activations to score reconstruction error. Revived
+        # features participate in this batch's forward/backward immediately.
+        if (
+            resample_dead
+            and resample_interval > 0
+            and global_step_actual > 0
+            and global_step_actual % resample_interval == 0
+            and global_step_actual >= resample_start_step
+            and (resample_end_step <= 0 or global_step_actual < resample_end_step)
+        ):
+            n_resampled = resample_dead_features(
+                model,
+                optimizer,
+                acts,
+                meta,
+                diffusion_models,
+                spatial_aligner=spatial_aligner,
+                dead_threshold=resample_dead_threshold,
+                enc_scale_factor=resample_enc_scale,
+                max_per_event=resample_max_per_event,
+            )
+            if n_resampled > 0:
+                resampled_since_log += n_resampled
+                print(f"[resample] step {global_step_actual}: revived {n_resampled} dead features")
 
         source = _pick_source(acts, global_step_actual, balanced_sources)
         optimizer.zero_grad()
@@ -675,7 +857,9 @@ def train_universal_sae(
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
                 "train/in_curriculum": float(in_curriculum),
+                "train/resampled_features": resampled_since_log,
             }
+            resampled_since_log = 0
             if source_timestep_idx is not None:
                 log_dict["train/source_timestep_idx"] = int(source_timestep_idx)
             for pair, value in per_target_losses.items():
