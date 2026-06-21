@@ -53,7 +53,7 @@ sae_params:
   top_k: 512                   # K out of latent_dim=12288 -> 0.52% density per token.
                               # Lower sparsity forces features to be more selective,
                               # making it harder for each model to claim its own subspace.
-  latent_align_weight: 1.0    # cosine alignment loss weight between z_src and z_tgt.
+  latent_align_weight: 0.5    # cosine alignment loss weight between z_src and z_tgt.
                               # Set to 0 to disable; increase to 2.0+ if partition score stays >1.
   latent_align_mode: per_token  # "per_token" (recommended) | "bag" (legacy) | "both"
                                 # per_token aligns z at each spatial position (requires
