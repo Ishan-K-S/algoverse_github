@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 
 class CocoData(Dataset):
 
-    def __init__(self, path_to_data, transform, max_images=None):
+    def __init__(self, path_to_data, transform, max_images=None, seed=42):
         self.path_to_data = path_to_data
         self.transform = transform
 
@@ -28,7 +28,8 @@ class CocoData(Dataset):
             )
 
         if max_images is not None:
-            self.images = random.sample(self.images, min(max_images, len(self.images)))
+            rng = random.Random(seed)
+            self.images = rng.sample(self.images, min(max_images, len(self.images)))
             self.images.sort()
         else:
             self.images.sort()
