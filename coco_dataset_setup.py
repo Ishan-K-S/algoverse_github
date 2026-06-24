@@ -1,5 +1,6 @@
 import sys
 import os
+import random
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -26,9 +27,11 @@ class CocoData(Dataset):
                 f"[CocoData] No images (.jpg/.png/.jpeg) found in: {path_to_data}"
             )
 
-        self.images.sort()
         if max_images is not None:
-            self.images = self.images[:max_images]
+            self.images = random.sample(self.images, min(max_images, len(self.images)))
+            self.images.sort()
+        else:
+            self.images.sort()
 
         print(f"[CocoData] Found {len(self.images)} images in {path_to_data}"
               + (f" (capped at {max_images})" if max_images is not None else ""))
