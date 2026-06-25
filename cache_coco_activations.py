@@ -17,7 +17,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 import gzip
-from coco_dataset_setup import CocoData
+from coco_dataset_setup import CocoData, select_images
 
 # Save a tensor with gzip compression
 def save_tensor_compressed(tensors, path):
@@ -42,10 +42,10 @@ def load_tensor_npz(path):
     return activation, filename
 
 
-def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_size=512):
+def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_size=512, image_list=None):
     """
     Cache activations for a single model.
-    
+
     Parameters
     ----------
     model : BaseModel
@@ -58,13 +58,13 @@ def cache_model_activations(model, model_name, coco_root, path_to_cache, batch_s
         Output directory for cached activations.
     batch_size : int
         Batch size for processing.
+    image_list : list[str] or None
+        Pre-selected image filenames. If None, all images in coco_root are used.
     """
     print(f"Caching model activations: {model_name}")
     print("Loading Coco dataset...")
-    
-    
-    
-    coco_data = CocoData(coco_root, transform=model.preprocess, max_images=2000)
+
+    coco_data = CocoData(coco_root, transform=model.preprocess, image_list=image_list)
     print(f"Found {len(coco_data)} images from Coco.")
 
     data_loader = torch.utils.data.DataLoader(
@@ -164,7 +164,11 @@ if __name__ == '__main__':
     if not os.path.isdir(colab_path_to_cache):
         raise RuntimeError(f"[cache] Cache directory not found: {colab_path_to_cache}\n"
                            "  Create it first: os.makedirs('/content/cache', exist_ok=True)")
-    
+
+    # Select (or reload) the shared image list — written once, reused by all caching scripts.
+    selection_file = os.path.join(colab_path_to_cache, "selected_images.txt")
+    image_list = select_images(colab_coco_root, 2000, selection_file)
+
     # Select which model to cache (uncomment one)
     
     # Option 1: ViT - Output shape: Bx197x768
@@ -190,5 +194,6 @@ if __name__ == '__main__':
         model_name=model_name,
         coco_root=colab_coco_root,
         path_to_cache=colab_path_to_cache,
-        batch_size=512
+        batch_size=512,
+        image_list=image_list,
     )

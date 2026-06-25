@@ -14,7 +14,7 @@ import os
 import numpy as np
 import torch
 from tqdm import tqdm
-from coco_dataset_setup import CocoData
+from coco_dataset_setup import CocoData, select_images
 
 
 from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor, PixArtActivationExtractor
@@ -50,16 +50,18 @@ def cache_diffusion_activations(
     source_name: str,
     coco_root: str,
     cache_root: str,
-    #split: str = "train",
     batch_size: int = 4,
     num_workers: int = 2,
+    image_list=None,
 ):
     """
     extractor: SD3ActivationExtractor or FLUXActivationExtractor.
       Must expose `.preprocess` compatible with torchvision transforms, and
       `.extract_activations(image_batch)` that returns ActivationOutput with
       activations (list of (B,N,D)), sigmas(list[float]), timesteps(list[tensor]).
-      (This matches your DiffusionActivationExtractor.py.) :contentReference[oaicite:4]{index=4}
+    image_list : list[str] or None
+        Pre-selected image filenames (from select_images()). If None, all images
+        in coco_root are used.
     """
     print(f"[diffusion-cache] ---- Starting diffusion caching ----")
     print(f"[diffusion-cache] source     : {source_name}")
@@ -73,7 +75,7 @@ def cache_diffusion_activations(
         raise RuntimeError(f"[diffusion-cache] Cache directory not found: {cache_root}\n"
                            "  Create it first: os.makedirs('/content/cache', exist_ok=True)")
 
-    ds = CocoData(coco_root, transform=extractor.preprocess, max_images=2000)
+    ds = CocoData(coco_root, transform=extractor.preprocess, image_list=image_list)
 
     dl = torch.utils.data.DataLoader(
         ds,
@@ -161,12 +163,17 @@ if __name__ == "__main__":
     #extractor = FLUXActivationExtractor(device=device, num_inference_steps=4)
     #source_name = "FLUX"
 
+    # Load the same selection file written by cache_coco_activations.py.
+    # If it doesn't exist yet (running diffusion first), it will be created here.
+    selection_file = os.path.join(colab_path_to_cache, "selected_images.txt")
+    image_list = select_images(colab_coco_root, 2000, selection_file)
+
     cache_diffusion_activations(
         extractor=extractor,
         source_name=source_name,
         coco_root=colab_coco_root,
         cache_root=colab_path_to_cache,
-        #split="train",
         batch_size=2,
         num_workers=2,
+        image_list=image_list,
     )
