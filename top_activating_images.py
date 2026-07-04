@@ -22,7 +22,7 @@ from spatial_align import SpatialAligner
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
 WEIGHTS_DIR = "/content/algoverse_github/weights"
-CHECKPOINT_PATH = "/content/usae_epoch_29 (1).pth"
+CHECKPOINT_PATH = None  # auto-discovered from WEIGHTS_DIR at runtime
 SOURCE = "DinoV2"
 OUTPUT_PATH = "/content/top_activations.json"
 DRIVE_SAVE_DIR = "/content/drive/My Drive/algoverse_results"

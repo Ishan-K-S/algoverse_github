@@ -20,8 +20,10 @@ from top_activating_images import (
     COCO_ANNOTATIONS_DIR,
     COCO_SPLIT,
     CONFIG_PATH,
+    WEIGHTS_DIR,
     FeaturePoolMode,
     coco_annotation_path,
+    find_latest_checkpoint,
     load_activation_for_image,
     load_universal_sae,
     pool_feature_scores,
@@ -316,6 +318,8 @@ def parse_args():
     parser.add_argument("--cache_root", default=CACHE_ROOT)
     parser.add_argument("--config", default=CONFIG_PATH)
     parser.add_argument("--checkpoint", default=CHECKPOINT_PATH)
+    parser.add_argument("--weights_dir", default=WEIGHTS_DIR,
+                        help="Searched for the latest .pth when --checkpoint is not given.")
     parser.add_argument("--source", required=True)
     parser.add_argument("--stem", required=True, help="Cache stem without '_combined.npz'.")
     parser.add_argument("--output", default=None)
@@ -345,7 +349,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model, cfg = load_universal_sae(args.checkpoint, args.config, args.device)
+
+    checkpoint = args.checkpoint
+    if checkpoint is None or not os.path.isfile(checkpoint):
+        checkpoint = find_latest_checkpoint(args.weights_dir)
+
+    model, cfg = load_universal_sae(checkpoint, args.config, args.device)
     diffusion_models = set(cfg.get("global", {}).get("diffusion_models", []))
     is_diffusion = args.source in diffusion_models
 
