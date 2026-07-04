@@ -23,6 +23,7 @@ from top_activating_images import (
     WEIGHTS_DIR,
     FeaturePoolMode,
     coco_annotation_path,
+    discover_stems,
     find_latest_checkpoint,
     load_activation_for_image,
     load_universal_sae,
@@ -321,7 +322,11 @@ def parse_args():
     parser.add_argument("--weights_dir", default=WEIGHTS_DIR,
                         help="Searched for the latest .pth when --checkpoint is not given.")
     parser.add_argument("--source", required=True)
-    parser.add_argument("--stem", required=True, help="Cache stem without '_combined.npz'.")
+    parser.add_argument("--stem", default=None,
+                        help="Cache stem without '_combined.npz' (e.g. '000000001000'). "
+                             "Omit to use the first available stem. Run --list_stems to see all.")
+    parser.add_argument("--list_stems", action="store_true",
+                        help="Print all available stems in --cache_root and exit.")
     parser.add_argument("--output", default=None)
     parser.add_argument("--timestep_idx", type=int, default=-1)
     parser.add_argument("--use_cls", action="store_true")
@@ -350,6 +355,28 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Resolve stem — list or auto-pick if not provided.
+    stems = discover_stems(args.cache_root)
+    if args.list_stems:
+        print(f"[mask-probe] {len(stems)} stems in {args.cache_root}:")
+        for s in stems:
+            print(f"  {s}")
+        return
+
+    stem = args.stem
+    if stem is None:
+        stem = stems[0]
+        print(f"[mask-probe] No --stem given, using first available: {stem}")
+    else:
+        expected = os.path.join(args.cache_root, f"{stem}_combined.npz")
+        if not os.path.isfile(expected):
+            raise FileNotFoundError(
+                f"File not found: {expected}\n"
+                f"  --stem must be a bare image stem, not a directory path.\n"
+                f"  Example: --stem {stems[0]}\n"
+                f"  Run with --list_stems to see all available stems."
+            )
+
     checkpoint = args.checkpoint
     if checkpoint is None or not os.path.isfile(checkpoint):
         checkpoint = find_latest_checkpoint(args.weights_dir)
@@ -360,14 +387,14 @@ def main():
 
     act, sigma = load_activation_for_image(
         args.cache_root,
-        args.stem,
+        stem,
         args.source,
         is_diffusion,
         args.timestep_idx,
         args.use_cls,
     )
     grid_size = infer_grid_size(act.shape[0])
-    patch_indices, mask_sources = build_mask_indices(args, args.stem, grid_size)
+    patch_indices, mask_sources = build_mask_indices(args, stem, grid_size)
     if not patch_indices:
         raise ValueError("No patches selected. Pass --patches, --box, or --coco_category.")
 
@@ -388,8 +415,8 @@ def main():
     result = {
         "metadata": {
             "source": args.source,
-            "stem": args.stem,
-            "checkpoint": args.checkpoint,
+            "stem": stem,
+            "checkpoint": checkpoint,
             "is_diffusion": is_diffusion,
             "timestep_idx": args.timestep_idx if is_diffusion else None,
             "sigma": float(sigma.item()) if sigma is not None and sigma.numel() == 1 else None,
@@ -412,7 +439,7 @@ def main():
 
     output = args.output
     if output is None:
-        safe_stem = os.path.basename(args.stem)
+        safe_stem = os.path.basename(stem)
         output = f"patch_mask_probe_{safe_stem}_{args.source}.json"
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "w") as f:
