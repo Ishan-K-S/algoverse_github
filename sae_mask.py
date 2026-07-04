@@ -22,9 +22,11 @@ from top_activating_images import (
     CONFIG_PATH,
     WEIGHTS_DIR,
     FeaturePoolMode,
+    build_coco_label_lookup,
     coco_annotation_path,
     discover_stems,
     find_latest_checkpoint,
+    labels_for_stem,
     load_activation_for_image,
     load_universal_sae,
     pool_feature_scores,
@@ -348,6 +350,8 @@ def parse_args():
     parser.add_argument("--coco_category", default=None)
     parser.add_argument("--coco_annotations_dir", default=COCO_ANNOTATIONS_DIR)
     parser.add_argument("--coco_split", default=COCO_SPLIT, choices=("train2017", "val2017"))
+    parser.add_argument("--skip_coco_labels", action="store_true",
+                        help="Skip loading COCO category labels for the image.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -376,6 +380,13 @@ def main():
                 f"  Example: --stem {stems[0]}\n"
                 f"  Run with --list_stems to see all available stems."
             )
+
+    # Load COCO labels for this image.
+    image_labels: List[str] = []
+    if not args.skip_coco_labels:
+        annotations_path = coco_annotation_path(args.coco_annotations_dir, args.coco_split)
+        coco_lookup = build_coco_label_lookup(annotations_path)
+        image_labels = labels_for_stem(stem, coco_lookup)
 
     checkpoint = args.checkpoint
     if checkpoint is None or not os.path.isfile(checkpoint):
@@ -427,6 +438,7 @@ def main():
             "n_patches_masked": len(patch_indices),
             "masked_fraction": len(patch_indices) / (grid_size * grid_size),
             "mask_sources": mask_sources,
+            "coco_labels": image_labels,
         },
         "masked_patches": patch_coords(patch_indices, grid_size),
         "feature_results": top_drops(
@@ -446,6 +458,7 @@ def main():
         json.dump(result, f, indent=2)
 
     print(f"[mask-probe] masked {len(patch_indices)}/{grid_size * grid_size} patches")
+    print(f"[mask-probe] coco labels : {', '.join(image_labels) if image_labels else '(none found)'}")
     print(f"[mask-probe] saved -> {output}")
     for row in result["feature_results"][: min(10, len(result["feature_results"]))]:
         rel = row["relative_drop"]
