@@ -20,8 +20,10 @@ from top_activating_images import (
     COCO_ANNOTATIONS_DIR,
     COCO_SPLIT,
     CONFIG_PATH,
+    WEIGHTS_DIR,
     FeaturePoolMode,
     coco_annotation_path,
+    find_latest_checkpoint,
     load_activation_for_image,
     load_universal_sae,
     pool_feature_scores,
@@ -612,7 +614,12 @@ def main():
     if args.mask_labels and args.mask_rgb:
         raise ValueError("Use either --mask_labels or --mask_rgb, not both.")
 
-    model, cfg = load_universal_sae(args.checkpoint, args.config, args.device)
+    checkpoint = args.checkpoint
+    if not checkpoint or not os.path.isfile(checkpoint):
+        checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
+    args.checkpoint = checkpoint
+
+    model, cfg = load_universal_sae(checkpoint, args.config, args.device)
     diffusion_models = set(cfg.get("global", {}).get("diffusion_models", []))
     is_diffusion = args.source in diffusion_models
 
