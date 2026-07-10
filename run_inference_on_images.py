@@ -33,15 +33,13 @@ from data import CocoActivationDataset
 from top_activating_images import (
     build_coco_label_lookup,
     coco_annotation_path,
+    find_latest_checkpoint,
     labels_for_stem,
     COCO_ANNOTATIONS_DIR,
     COCO_SPLIT,
+    WEIGHTS_DIR,
 )
 
-DEFAULT_CKPT = (
-    "/content/algoverse_github/weights/"
-    "ex16_bs16_topk512_LR0.0005_alignDinoV2_30ep/usae_epoch_29.pth"
-)
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
 DEFAULT_CACHE = "/content/combined_cache"
 
@@ -60,7 +58,11 @@ def parse_args():
     p.add_argument("--top_k", type=int, default=10, help="Top features to report per image.")
     p.add_argument("--top_images", type=int, default=5,
                    help="Top-activating images to show per feature (0 = skip the cache scan).")
-    p.add_argument("--ckpt", default=DEFAULT_CKPT)
+    p.add_argument("--ckpt", default=None,
+                   help="Checkpoint path. If omitted or not a file, the newest "
+                        ".pt/.pth under --weights_dir is auto-selected.")
+    p.add_argument("--weights_dir", default=WEIGHTS_DIR,
+                   help="Searched for the latest checkpoint when --ckpt is not given.")
     p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--cache_root", default=DEFAULT_CACHE)
     p.add_argument("--coco_annotations_dir", default=COCO_ANNOTATIONS_DIR)
@@ -132,7 +134,10 @@ def main():
         raise SystemExit(f"--source {args.source!r} must be one of --sources {args.sources}")
 
     # ---- Load model ----
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    ckpt_path = args.ckpt
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        ckpt_path = find_latest_checkpoint(args.weights_dir)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     g = cfg["global"]
