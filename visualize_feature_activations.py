@@ -30,7 +30,7 @@ from data import CocoActivationDataset
 
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
 DEFAULT_CACHE = "/content/combined_cache"
-DEFAULT_WEIGHTS_DIR = "/content/weights"
+DEFAULT_WEIGHTS_DIR = "/content/algoverse_github/weights"
 
 
 def find_latest_checkpoint(weights_dir: str) -> str:
