@@ -254,7 +254,9 @@ def build_grid_image(thumbnails: List[Tuple[str, Image.Image]], cols: int = 4, p
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stem", required=True, help="Cache stem or image path/filename, e.g. '000000562818'.")
+    p.add_argument("--stem", nargs="+", required=True,
+                   help="One or more cache stems or image paths, e.g. "
+                        "'000000562818 000000001000'. Each produces its own heatmap grid.")
     p.add_argument("--source", default="DinoV2")
     p.add_argument("--sources", nargs="+", default=["DinoV2", "PixArt"])
     p.add_argument("--top_k", type=int, default=8)
@@ -268,48 +270,18 @@ def parse_args():
     p.add_argument("--semantic_mask_dir", default=None,
                    help="Directory of *_labelmap.png / *_legend.json from semantic_mask.py.")
     p.add_argument("--output_dir", default="feature_visualizations")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress per-feature text output; only print saved file paths.")
     p.add_argument("--cols", type=int, default=4)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    ckpt_path = args.ckpt
-    if not ckpt_path or not os.path.isfile(ckpt_path):
-        ckpt_path = find_latest_checkpoint(args.weights_dir)
-    print(f"[viz] checkpoint : {ckpt_path}")
-
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-    g = cfg["global"]
-
-    model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
-    model.eval().to(args.device)
-
-    if model.cls_pool_mode != "none":
-        raise ValueError(
-            f"cls_pool_mode={model.cls_pool_mode!r} pools all tokens into one vector "
-            "per image; per-patch visualization requires cls_pool_mode='none'."
-        )
-
-    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
-    if aligner is not None:
-        print(f"[viz] spatial alignment ON -> target grid "
-              f"{aligner.target_grid_size}x{aligner.target_grid_size}")
-
-    ds = CocoActivationDataset(
-        cache_root=args.cache_root,
-        sources=args.sources,
-        combined_npz=True,
-        standardize=bool(g.get("standardize", True)),
-        return_metadata=True,
-        diffusion_models=[s for s in args.sources if s in model.diffusion_models],
-        use_class_tokens=False,
-    )
-    stem = resolve_stem(args.stem, ds.stems)
-    print(f"[viz] resolved stem : {stem}")
+def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
+    """Encode one image, render its top-feature heatmaps, and save grid + report."""
+    stem = resolve_stem(stem_query, ds.stems)
+    if not args.quiet:
+        print(f"\n{'=' * 60}\n[viz] resolved stem : {stem}")
 
     idx = ds.stems.index(stem)
     (acts, meta), _ = ds[idx]
@@ -322,12 +294,13 @@ def main():
         for i, s in zip(top_idx.tolist(), top_scores.tolist())
     ]
 
-    print(f"\n[viz] top {k} features for {stem} (source={args.source}, grid={grid_size}x{grid_size}):")
-    print_top_features(top_features)
+    if not args.quiet:
+        print(f"[viz] top {k} features for {stem} (source={args.source}, grid={grid_size}x{grid_size}):")
+        print_top_features(top_features)
 
     raw_image_path = find_raw_image(stem, args.raw_image_dir)
     base_image = Image.open(raw_image_path).convert("RGB") if raw_image_path else None
-    if base_image is None:
+    if base_image is None and not args.quiet:
         print("[viz] no raw image found -- rendering heatmaps only.")
 
     label_map = None
@@ -338,8 +311,9 @@ def main():
         with open(legend_path) as f:
             legend = json.load(f)
         id_to_name = {int(k_): v for k_, v in legend.get("id_to_name", {}).items()}
-        print(f"[viz] semantic mask found -> {labelmap_path}")
-    elif args.semantic_mask_dir:
+        if not args.quiet:
+            print(f"[viz] semantic mask found -> {labelmap_path}")
+    elif args.semantic_mask_dir and not args.quiet:
         print(f"[viz] no semantic mask found for stem={stem!r} in {args.semantic_mask_dir}. "
               f"Run semantic_mask.py on this image first.")
 
@@ -378,11 +352,11 @@ def main():
             indent=2,
         )
 
-    print(f"\n[viz] saved image grid -> {grid_path}")
+    print(f"[viz] saved image grid -> {grid_path}")
     print(f"[viz] saved report     -> {json_path}")
 
-    if label_map is not None:
-        print("\n[viz] top semantic class per feature:")
+    if label_map is not None and not args.quiet:
+        print("[viz] top semantic class per feature:")
         for entry in feature_report:
             classes = entry.get("semantic_classes", [])
             if classes:
@@ -390,6 +364,55 @@ def main():
                 print(f"  feature {entry['feature_idx']:>5}: "
                       f"{top_cls['class_name']:<20} "
                       f"({top_cls['fraction_of_hot_patches']*100:.0f}% of hot patches)")
+
+
+def main():
+    args = parse_args()
+
+    ckpt_path = args.ckpt
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        ckpt_path = find_latest_checkpoint(args.weights_dir)
+    print(f"[viz] checkpoint : {ckpt_path}")
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    g = cfg["global"]
+
+    model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
+    model.eval().to(args.device)
+
+    if model.cls_pool_mode != "none":
+        raise ValueError(
+            f"cls_pool_mode={model.cls_pool_mode!r} pools all tokens into one vector "
+            "per image; per-patch visualization requires cls_pool_mode='none'."
+        )
+
+    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
+    if aligner is not None:
+        print(f"[viz] spatial alignment ON -> target grid "
+              f"{aligner.target_grid_size}x{aligner.target_grid_size}")
+
+    ds = CocoActivationDataset(
+        cache_root=args.cache_root,
+        sources=args.sources,
+        combined_npz=True,
+        standardize=bool(g.get("standardize", True)),
+        return_metadata=True,
+        diffusion_models=[s for s in args.sources if s in model.diffusion_models],
+        use_class_tokens=False,
+    )
+    failures = []
+    for stem_query in args.stem:
+        try:
+            visualize_stem(args, model, aligner, ds, ckpt_path, stem_query)
+        except Exception as e:
+            print(f"[viz] SKIPPED {stem_query!r}: {e}")
+            failures.append(stem_query)
+
+    done = len(args.stem) - len(failures)
+    print(f"\n[viz] finished {done}/{len(args.stem)} stems -> {args.output_dir}")
+    if failures:
+        print(f"[viz] skipped: {', '.join(map(str, failures))}")
 
 
 if __name__ == "__main__":
