@@ -12,6 +12,7 @@ and **one diffusion model**, that **extrapolates to further models** (SigLIP, St
 Diffusion, etc.). "Shared language" means the same dictionary features fire on the
 same *content* across models — not merely that features co-fire in aggregate usage.
 
+
 **Scope decisions:** PixArt is **not** required — it can be swapped for a lighter
 diffusion model. We need exactly one diffusion + one non-diffusion to start, then
 add models to demonstrate extrapolation.

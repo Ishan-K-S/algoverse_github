@@ -1,7 +1,7 @@
 from typing import Callable, Dict, List, Optional, Tuple, Union
-
 import torch
 import torch.nn as nn
+
 
 
 def _ensure_bt(values: torch.Tensor, batch_size: int) -> torch.Tensor:

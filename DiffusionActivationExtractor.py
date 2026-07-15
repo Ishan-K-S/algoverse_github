@@ -13,7 +13,6 @@ import torch
 from torch import nn
 from torchvision import transforms
 
-
 @dataclass
 class ActivationOutput:
     """Container for extracted activations across timesteps."""
@@ -80,6 +79,13 @@ class BaseActivationExtractor(ABC, nn.Module):
     def _get_last_block(self) -> nn.Module:
         """Return the last transformer block to hook."""
         pass
+
+    # Which attention submodule of the hooked block to capture the output of.
+    # "attn2" = cross-attention onto encoder_hidden_states (the text prompt).
+    # "attn1" = self-attention among the image/latent tokens themselves.
+    # Subclasses override this when attn2 doesn't carry spatial signal (e.g.
+    # when extraction always uses a null/empty prompt, see PixArtActivationExtractor).
+    HOOK_ATTN_NAME = "attn2"
     
     def _encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """Encode image to latent space using VAE."""
@@ -182,7 +188,7 @@ class BaseActivationExtractor(ABC, nn.Module):
             activations_list.append(activation.clone())
         
         # Register hook on the last transformer block
-        last_block = self._get_last_block().attn2
+        last_block = getattr(self._get_last_block(), self.HOOK_ATTN_NAME)
         hook_handle = last_block.register_forward_hook(hook_fn)
         
         # Step 6: Denoise step by step, capturing activations at each step
@@ -779,6 +785,13 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     #   1.0 -> last block (original behaviour, noise-prediction-dominated)
     #   0.5 -> middle block (Option A: richer, higher-rank semantic residual stream)
     HOOK_DEPTH_FRAC = 8 / 27
+
+    # Extraction always runs with a null/empty prompt (_encode_null_prompt), so
+    # attn2's cross-attention context is the same content-free sequence for every
+    # image and every patch -- its output collapses to near-uniform per-patch
+    # values. attn1 (self-attention among image patch tokens) is where per-patch
+    # spatial identity actually lives, analogous to DinoV2's self-attention.
+    HOOK_ATTN_NAME = "attn1"
 
     def _get_last_block(self) -> nn.Module:
         blocks = self.transformer.transformer_blocks
