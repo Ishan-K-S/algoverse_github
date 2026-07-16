@@ -41,6 +41,37 @@ from visualize_feature_activations import (
 )
 from pixart_timestep_autopsy import encode_slice, localization, peakiness_of_topk, save_grid
 
+EPS = 1e-8
+
+
+def raw_token_stats(x: torch.Tensor) -> dict:
+    """Localization stats computed directly on raw (pre-SAE) activations.
+
+    x: (N, D) single-image activation, any source.
+    Unlike `localization()` in pixart_timestep_autopsy.py, this does NOT rank
+    features by their own score before reporting -- it averages over every
+    channel, so there's no selection bias inflating the number.
+
+    Returns:
+      mean_pairwise_cos : average cosine similarity between distinct tokens.
+                           ~1.0 means every patch is (almost) the same vector,
+                           i.e. no spatial information reached this point.
+      channel_peakiness : mean over channels of max_token(|v|)/mean_token(|v|).
+                           ~1.0 means every channel is flat across tokens.
+    """
+    v = x.float()
+    vn = torch.nn.functional.normalize(v, dim=-1)
+    sim = vn @ vn.T
+    n = sim.shape[0]
+    off_diag = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+    mean_pairwise_cos = sim[off_diag].mean().item()
+
+    absv = v.abs()
+    mean_c = absv.mean(dim=0)
+    max_c = absv.max(dim=0).values
+    channel_peakiness = (max_c / (mean_c + EPS)).mean().item()
+    return {"mean_pairwise_cos": mean_pairwise_cos, "channel_peakiness": channel_peakiness}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -104,6 +135,11 @@ def main():
               os.path.join(args.output_dir, f"{stem}_{args.ref_source}_reference.png"), args.top_k)
     print(f"\n[sanity] REFERENCE {args.ref_source}: top-k peakiness = {ref_peak:.2f}\n")
 
+    ref_raw = raw_token_stats(acts[args.ref_source])
+    print(f"[sanity] REFERENCE {args.ref_source} RAW (pre-SAE): "
+          f"mean_pairwise_cos={ref_raw['mean_pairwise_cos']:.3f}  "
+          f"channel_peakiness={ref_raw['channel_peakiness']:.2f}\n")
+
     # ---- PixArt: extract fresh, with the attn1 hook ----
     print("[sanity] loading PixArt pipeline (this takes a while)...")
     extractor = PixArtActivationExtractor(device=args.device, num_inference_steps=args.num_inference_steps)
@@ -120,7 +156,8 @@ def main():
     T = a.shape[0]
     print(f"[sanity] PixArt(attn1) activations shape = {tuple(a.shape)}  (T={T} timesteps)\n")
 
-    header = f"{'t':>3} {'sigma':>10} {'n_active':>9} {'peak(mean-rank)':>16} {'peak(localized)':>16}"
+    header = (f"{'t':>3} {'sigma':>10} {'n_active':>9} {'peak(mean-rank)':>16} {'peak(localized)':>16} "
+              f"{'raw_cos':>9} {'raw_chan_peak':>13}")
     print(header)
     print("-" * len(header))
 
@@ -134,8 +171,10 @@ def main():
         peak_mean, mean_ids = peakiness_of_topk(stats, args.top_k, by="mean")
         peak_loc, loc_ids = peakiness_of_topk(stats, args.top_k, by="localized")
         n_active = int(stats["active"].sum().item())
+        raw = raw_token_stats(a[t])
 
-        print(f"{t:>3} {sigmas[t]:>10.3f} {n_active:>9} {peak_mean:>16.2f} {peak_loc:>16.2f}")
+        print(f"{t:>3} {sigmas[t]:>10.3f} {n_active:>9} {peak_mean:>16.2f} {peak_loc:>16.2f} "
+              f"{raw['mean_pairwise_cos']:>9.3f} {raw['channel_peakiness']:>13.2f}")
         save_grid(base_image, z_t, loc_ids, grid,
                   os.path.join(args.output_dir, f"{stem}_PixArt_attn1_t{t}_localized.png"), args.top_k)
 
@@ -143,11 +182,12 @@ def main():
             "timestep": t, "sigma": sigmas[t], "n_active": n_active,
             "peakiness_mean_ranked": peak_mean, "peakiness_localized": peak_loc,
             "top_mean_features": mean_ids, "top_localized_features": loc_ids,
+            "raw_mean_pairwise_cos": raw["mean_pairwise_cos"], "raw_channel_peakiness": raw["channel_peakiness"],
         })
         if peak_loc > best["peak_localized"]:
             best = {"peak_localized": peak_loc, "peak_mean": peak_mean, "t": t,
                     "sigma": sigmas[t], "loc_ids": loc_ids, "mean_ids": mean_ids,
-                    "z": z_t, "grid": grid}
+                    "z": z_t, "grid": grid, "raw": raw}
 
     bt = best["t"]
     save_grid(base_image, best["z"], best["mean_ids"], best["grid"],
@@ -160,29 +200,51 @@ def main():
     # floor and make its middle branch unreachable).
     ref_thresh = 1.0 + 0.5 * (ref_peak - 1.0)
     best_mean = best["peak_mean"]
+    best_raw = best["raw"]
     print("\n" + "=" * 60)
-    print(f"[verdict] reference ({args.ref_source}) peakiness : {ref_peak:.2f}")
-    print(f"[verdict] best PixArt(attn1) timestep            : t={bt} (sigma={best['sigma']:.3f})")
-    print(f"[verdict]   peakiness, localized-ranked           : {best['peak_localized']:.2f}")
-    print(f"[verdict]   peakiness, mean-ranked                : {best_mean:.2f}")
+    print(f"[verdict] reference ({args.ref_source}) peakiness         : {ref_peak:.2f}")
+    print(f"[verdict] reference ({args.ref_source}) raw mean_pairwise_cos : {ref_raw['mean_pairwise_cos']:.3f}")
+    print(f"[verdict] best PixArt(attn1) timestep                    : t={bt} (sigma={best['sigma']:.3f})")
+    print(f"[verdict]   peakiness, localized-ranked                  : {best['peak_localized']:.2f}")
+    print(f"[verdict]   peakiness, mean-ranked                       : {best_mean:.2f}")
+    print(f"[verdict]   raw mean_pairwise_cos                        : {best_raw['mean_pairwise_cos']:.3f}")
+    print(f"[verdict]   raw channel_peakiness                        : {best_raw['channel_peakiness']:.2f}")
 
-    if best_mean >= ref_thresh:
+    sae_localizes = best_mean >= ref_thresh
+    # Raw signal counts as "carrying spatial structure" if its token-to-token
+    # variation is in the same ballpark as DinoV2's -- i.e. tokens are not
+    # near-duplicates of each other. Pure cosine similarity has no natural
+    # zero-floor issue (unlike peakiness), so compare directly to the reference.
+    raw_carries_signal = best_raw["mean_pairwise_cos"] <= ref_raw["mean_pairwise_cos"] + 0.15
+
+    if sae_localizes:
         verdict = ("IMPROVED: mean-ranked (real usage) features now localize close to the "
                    "DinoV2 baseline -- the attn2->attn1 hook change looks like the fix. "
                    "Proceed to re-cache PixArt with this hook and re-run cross-recon.")
+    elif raw_carries_signal:
+        verdict = ("SAE/ALIGNMENT ISSUE: the raw attn1 activation is NOT token-invariant "
+                   f"(mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f} vs DinoV2's "
+                   f"{ref_raw['mean_pairwise_cos']:.3f}) -- real per-patch structure exists "
+                   "upstream. The SAE encoder / spatial_align path for PixArt is what's "
+                   "collapsing it. Look at spatial_align.py's handling of diffusion sources "
+                   "and the SAE's PixArt-specific training weight, not the extractor.")
     else:
-        verdict = ("STILL FLAT: mean-ranked features remain near-uniform even with attn1. "
-                   "The null-prompt cross-attention wasn't the (only) cause -- look at "
-                   "HOOK_DEPTH_FRAC, the spatial aligner, or treat this as a genuine "
-                   "PixArt/DiT limitation and consider swapping to SD-Turbo/SD1.5.")
+        verdict = ("REAL UPSTREAM FAILURE: even the raw, pre-SAE activation is nearly "
+                   f"token-invariant (mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f}, "
+                   f"channel_peakiness={best_raw['channel_peakiness']:.2f}, both close to the "
+                   "no-signal floor). Neither attn1 nor attn2 carries per-patch identity at "
+                   f"block depth_frac={PixArtActivationExtractor.HOOK_DEPTH_FRAC:.3f}. Try a "
+                   "shallower/later block depth, or treat this as a genuine PixArt/DiT "
+                   "limitation and swap to SD-Turbo/SD1.5.")
     print(f"\n[verdict] {verdict}")
     print("=" * 60)
 
     with open(os.path.join(args.output_dir, f"sanity_{stem}.json"), "w") as f:
         json.dump({
             "stem": stem, "hook": "attn1", "checkpoint": ckpt_path,
-            "reference_peakiness": ref_peak, "best_timestep": bt,
-            "best_sigma": best["sigma"], "verdict": verdict, "per_timestep": rows,
+            "reference_peakiness": ref_peak, "reference_raw": ref_raw,
+            "best_timestep": bt, "best_sigma": best["sigma"], "best_raw": best_raw,
+            "verdict": verdict, "per_timestep": rows,
         }, f, indent=2)
     print(f"\n[sanity] saved -> {args.output_dir}/  (grids + sanity_{stem}.json)")
 
