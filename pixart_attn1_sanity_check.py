@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -211,6 +212,40 @@ def main():
     save_grid(base_image, best["z"], best["mean_ids"], best["grid"],
               os.path.join(args.output_dir, f"{stem}_PixArt_attn1_t{bt}_meanranked.png"), args.top_k)
 
+    # ---- Is TIDE's learned "pre" modulation swamping the signal? ----
+    # TIDE computes one (scale, shift) pair per image from sigma alone and
+    # broadcasts it identically across every token (universal_sae.py
+    # TIDETemporalModulation.forward). If the learned shift is large relative
+    # to a typical standardized token vector, it pushes every token toward the
+    # same constant -- independent of attn1/attn2 or extraction entirely.
+    tide_pre = model.pre["PixArt"] if "PixArt" in model.pre else None
+    tide_active = tide_pre is not None and not isinstance(tide_pre, torch.nn.Identity)
+    print("\n" + "-" * 60)
+    if not tide_active:
+        print("[tide-check] use_tide is off (or PixArt has no TIDE adapter) -- not a factor here.")
+    else:
+        typical_norm = math.sqrt(a.shape[-1])  # standardized per-channel std=1 -> per-token norm ~= sqrt(D)
+        print(f"[tide-check] typical standardized per-token vector norm ~= sqrt(D) = {typical_norm:.2f}")
+        print(f"{'t':>3} {'sigma':>10} {'scale_norm':>11} {'shift_norm':>11} {'shift/typical':>14}")
+        best_ratio = None
+        with torch.no_grad():
+            for t in range(T):
+                sigma_t = torch.tensor([sigmas[t]], device=args.device)
+                scale, shift = tide_pre.mlp(tide_pre.t_embed(sigma_t)).chunk(2, dim=-1)
+                scale_norm = scale.norm().item()
+                shift_norm = shift.norm().item()
+                ratio = shift_norm / typical_norm
+                print(f"{t:>3} {sigmas[t]:>10.3f} {scale_norm:>11.3f} {shift_norm:>11.3f} {ratio:>14.3f}")
+                if t == bt:
+                    best_ratio = ratio
+        if best_ratio is not None:
+            if best_ratio > 0.5:
+                print(f"[tide-check] shift/typical={best_ratio:.2f} at the best timestep is large enough to be "
+                      "a real suspect -- try use_tide=false and re-run this same check.")
+            else:
+                print(f"[tide-check] shift/typical={best_ratio:.2f} at the best timestep is small -- TIDE is "
+                      "unlikely to be the dominant cause; look at W_enc/b_pre training instead.")
+
     # ---- Verdict ----
     # peakiness has a mathematical floor of 1.0 (max_token/mean_token >= 1), so
     # compare excess-over-uniform rather than the raw value -- see the bug in
@@ -240,12 +275,18 @@ def main():
                    "DinoV2 baseline -- the attn2->attn1 hook change looks like the fix. "
                    "Proceed to re-cache PixArt with this hook and re-run cross-recon.")
     elif raw_carries_signal:
-        verdict = ("SAE/ALIGNMENT ISSUE: the raw attn1 activation is NOT token-invariant "
+        # Note: spatial_align.py is a no-op for PixArt specifically (it's the
+        # alignment target -- SpatialAligner.align() returns x unchanged when
+        # g_src == g_tgt), so it's already ruled out. See the tide-check block
+        # above for whether TIDE is the mechanism; if not, suspect the SAE's
+        # W_enc/b_pre training for PixArt (e.g. latent_align_weight too low).
+        verdict = ("SAE ISSUE: the raw attn1 activation is NOT token-invariant "
                    f"(mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f} vs DinoV2's "
                    f"{ref_raw['mean_pairwise_cos']:.3f}) -- real per-patch structure exists "
-                   "upstream. The SAE encoder / spatial_align path for PixArt is what's "
-                   "collapsing it. Look at spatial_align.py's handling of diffusion sources "
-                   "and the SAE's PixArt-specific training weight, not the extractor.")
+                   "upstream, but the trained SAE encoder for PixArt collapses it. "
+                   "spatial_align.py is ruled out (no-op for the alignment target). "
+                   "Check the tide-check numbers above; if TIDE isn't dominant, this points "
+                   "at the SAE's PixArt encoder training (e.g. latent_align_weight).")
     else:
         verdict = ("REAL UPSTREAM FAILURE: even the raw, pre-SAE activation is nearly "
                    f"token-invariant (mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f}, "
