@@ -73,6 +73,20 @@ def raw_token_stats(x: torch.Tensor) -> dict:
     return {"mean_pairwise_cos": mean_pairwise_cos, "channel_peakiness": channel_peakiness}
 
 
+def standardize_tokens(x: torch.Tensor) -> torch.Tensor:
+    """Per-channel z-score across the token dimension of a single (N, D) activation.
+
+    Approximates CocoActivationDataset's standardize=True step (data.py), which the
+    SAE was actually trained on. Fresh activations from the extractor are raw-scale;
+    feeding them into model.encode() unstandardized can produce meaningless output
+    regardless of whether real spatial signal exists, independent of any attn1/attn2
+    or TIDE question.
+    """
+    mean = x.mean(dim=0, keepdim=True)
+    std = x.std(dim=0, keepdim=True)
+    return (x - mean) / (std + EPS)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stem", required=True, help="COCO stem, e.g. '000000562818'.")
@@ -154,7 +168,10 @@ def main():
     a = a[:, 0]  # (T, N, D)
     sigmas = out.sigmas
     T = a.shape[0]
-    print(f"[sanity] PixArt(attn1) activations shape = {tuple(a.shape)}  (T={T} timesteps)\n")
+    print(f"[sanity] PixArt(attn1) activations shape = {tuple(a.shape)}  (T={T} timesteps)")
+    print(f"[sanity] PixArt raw scale (t=0, pre-standardize): mean={a[0].mean().item():.3f} "
+          f"std={a[0].std().item():.3f}  (reference {args.ref_source} is already standardize=True, "
+          f"i.e. ~0/~1)\n")
 
     header = (f"{'t':>3} {'sigma':>10} {'n_active':>9} {'peak(mean-rank)':>16} {'peak(localized)':>16} "
               f"{'raw_cos':>9} {'raw_chan_peak':>13}")
@@ -165,7 +182,8 @@ def main():
     best = {"peak_localized": -1.0, "t": None}
     for t in range(T):
         sigma_t = torch.tensor([sigmas[t]], device=args.device)
-        z_t = encode_slice(model, a[t].unsqueeze(0), "PixArt", sigma_t, aligner, args.device)
+        a_t_std = standardize_tokens(a[t])
+        z_t = encode_slice(model, a_t_std.unsqueeze(0), "PixArt", sigma_t, aligner, args.device)
         grid = infer_grid_size(z_t.shape[1])
         stats = localization(z_t)
         peak_mean, mean_ids = peakiness_of_topk(stats, args.top_k, by="mean")
