@@ -8,7 +8,11 @@ global:
   num_workers: 8        # DataLoader worker processes
   nb_epochs: 30
   balanced_sources: true
-  curriculum_epochs: 0  # 0 disables curriculum; cross-recon active from step 1
+  curriculum_epochs: 5  # self-recon only for the first N epochs before cross-recon +
+                        # latent-alignment losses turn on. Was 0 (cross/align live from
+                        # step 1), which let the alignment loss reward both encoders for
+                        # collapsing onto the same near-constant feature clique before
+                        # either had learned real per-model structure to align.
   save_every: 5         # save a checkpoint every N epochs
   standardize: true     # standardise activations (mean=0, std=1)
   divide_norm: false    # normalise by L2 norm instead of standardising
