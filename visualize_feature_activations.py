@@ -144,7 +144,7 @@ def encode_image_tokens(
         x = aligner.align(x, source=source)
 
     _z_pre, z = model.encode(x, source=source, sigma=sigma)  # (1, N, K)
-    scores = z.abs().mean(dim=(0, 1))
+    scores = z.abs().amax(dim=(0, 1))
     grid_size = infer_grid_size(z.shape[1])
     return scores.cpu(), z.cpu(), grid_size
 
