@@ -255,8 +255,8 @@ def main():
             cofire += (fired_d & fired_p).long()
 
             # Top-K scoring metric (matches cross_model_overlap.py)
-            scores_d = z_d.abs().mean(dim=(0, 1))
-            scores_p = z_p.abs().mean(dim=(0, 1))
+            scores_d = z_d.abs().amax(dim=(0, 1))
+            scores_p = z_p.abs().amax(dim=(0, 1))
             _, top_d_idx = torch.topk(scores_d, k=min(args.top_k, K))
             _, top_p_idx = torch.topk(scores_p, k=min(args.top_k, K))
             sa, sb = set(top_d_idx.cpu().tolist()), set(top_p_idx.cpu().tolist())
