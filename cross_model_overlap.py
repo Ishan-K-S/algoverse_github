@@ -148,7 +148,7 @@ def top_feature_set(model, x, source, sigma, top_k, device, aligner=None):
     if sigma is not None:
         sigma = sigma.to(device).float().view(1)
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
-    scores = z.abs().mean(dim=(0, 1))
+    scores = z.abs().amax(dim=(0, 1))
     _, idx = torch.topk(scores, k=min(top_k, scores.numel()))
     return idx.cpu().numpy()
 
