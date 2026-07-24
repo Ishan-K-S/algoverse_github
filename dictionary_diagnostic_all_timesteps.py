@@ -144,7 +144,8 @@ def main():
             fires_dino += fired_d.long()
 
             # Mean magnitude scoring for DinoV2 (image-level)
-            scores_d = z_d.abs().mean(dim=(0, 1))
+            scores_d = z_d.abs().mean(dim=(0, 1))       # for bag of features cosine
+            scores_d_max = z_d.abs().amax(dim=(0, 1))   # for top-k rankig
 
             # Process every PixArt timestep
             z_p_sum = torch.zeros(1, model_tokens_eff["PixArt"], K, device=device)
@@ -167,9 +168,12 @@ def main():
             cofire += (fired_d & fired_p_any).long()
 
             # Image-level top-K Jaccard using averaged |z|
-            scores_p_mean = (z_p_sum / T).mean(dim=(0, 1))
-            _, top_d_idx = torch.topk(scores_d, k=min(args.top_k, K))
-            _, top_p_idx = torch.topk(scores_p_mean, k=min(args.top_k, K))
+            z_p_avg = z_p_sum / T
+            scores_p_mean = z_p_avg.mean(dim=(0, 1))
+            scores_d_max = z_d.abs().amax(dim=(0, 1))
+            scores_p_max = z_p_avg.amax(dim=(0, 1))
+            _, top_d_idx = torch.topk(scores_d_max, k=min(args.top_k, K))
+            _, top_p_idx = torch.topk(scores_p_max, k=min(args.top_k, K))
             sa, sb = set(top_d_idx.cpu().tolist()), set(top_p_idx.cpu().tolist())
             u = sa | sb
             jaccard_scores.append(len(sa & sb) / len(u) if u else 0.0)
