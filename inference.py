@@ -108,7 +108,7 @@ def _score_latents(z: torch.Tensor) -> torch.Tensor:
 
     if z.dim() == 3:
         # Average over batch and token dimensions
-        return z.abs().mean(dim=(0, 1))
+        return z.abs().amax(dim=(0, 1))
 
     raise ValueError(
         f"Unsupported latent shape {tuple(z.shape)}. Expected (B, K) or (B, N, K)."
