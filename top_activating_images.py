@@ -312,6 +312,7 @@ def load_universal_sae(
     )
 
     model.eval()
+    model._standardization_stats = ckpt.get("standardization_stats")
 
     return model.to(device), cfg
 
@@ -412,6 +413,7 @@ def compute_top_activations(
     coco_labels: Optional[Dict[str, List[str]]] = None,
     feature_pool: FeaturePoolMode = "max",
     spatial_aligner=None,
+    standardization_stats=None,
 ):
     is_diffusion = source in diffusion_models
 
@@ -455,6 +457,18 @@ def compute_top_activations(
                 use_cls=use_cls,
                 spatial_aligner=spatial_aligner,
             )
+
+            if standardization_stats is None or source not in standardization_stats:
+                raise ValueError(
+                    "This tool requires standardization statistics saved in the checkpoint. "
+                    "Use a newly trained checkpoint; old checkpoints cannot be evaluated reliably."
+                )
+            stats = standardization_stats[source]
+            mean = torch.as_tensor(stats["mean"], dtype=act.dtype)
+            std = torch.as_tensor(stats["std"], dtype=act.dtype)
+            if act.shape[-1] != mean.numel() or mean.shape != std.shape:
+                raise ValueError(f"Invalid standardization stats for source {source!r}.")
+            act = (act - mean) / (std + 1e-5)
 
             acts_list.append(act)
 
@@ -669,6 +683,7 @@ def main():
         coco_labels=coco_labels,
         feature_pool=args.feature_pool,
         spatial_aligner=spatial_aligner,   # NEW
+        standardization_stats=getattr(model, "_standardization_stats", None),
     )
 
     save_to_drive(

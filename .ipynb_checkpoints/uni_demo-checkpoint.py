@@ -28,7 +28,6 @@ from train import train_universal_sae
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = "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"  # Set your key here or via WANDB_API_KEY env variable
 
 try:
     import wandb
@@ -43,9 +42,8 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     Initialize a wandb run. Returns True if successful.
 
     The API key is read from (in priority order):
-      1. WANDB_API_KEY constant at the top of this file
-      2. WANDB_API_KEY environment variable (set externally)
-      3. wandb's own stored credentials (~/.netrc / wandb login)
+      1. WANDB_API_KEY environment variable (set externally)
+      2. wandb's own stored credentials (~/.netrc / wandb login)
     """
     if not WANDB_AVAILABLE:
         return False
@@ -54,9 +52,6 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     if not bool(global_cfg.get("use_wandb", True)):
         print("[wandb] Disabled via config (use_wandb: false).")
         return False
-
-    if WANDB_API_KEY:
-        os.environ["WANDB_API_KEY"] = WANDB_API_KEY
 
     wandb_project = global_cfg.get("wandb_project", "universal-sae")
     wandb_entity  = global_cfg.get("wandb_entity", None)

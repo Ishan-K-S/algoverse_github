@@ -15,6 +15,7 @@ global:
                         # either had learned real per-model structure to align.
   save_every: 5         # save a checkpoint every N epochs
   standardize: true     # standardise activations (mean=0, std=1)
+  stats_seed: 0         # deterministic fallback only; checkpoints persist the exact training stats
   divide_norm: false    # normalise by L2 norm instead of standardising
   use_class_tokens: false
   num_tokens: 196
@@ -28,7 +29,7 @@ global:
   # --- Universal SAE behaviour ---
   cls_pool_mode: none         # 'none' = per-token (start here, paired with spatial_align_to).
                               # 'mean' = pool to one vector per image (paper's per-sample setup).
-  use_tide: true             # diffusion timestep modulation. Off — single-timestep run makes it a no-op.
+  use_tide: false            # Keep off until a single PixArt timestep has been selected and validated.
 
   # --- Spatial alignment (Option B1) ---
   # When set, every model's token grid is average-pooled down to the named
@@ -54,16 +55,18 @@ viz:
   sample_size: 5000
   set: val
 sae_params:
-  top_k: 512                   # K out of latent_dim=12288 -> 0.52% density per token.
-                              # Lower sparsity forces features to be more selective,
-                              # making it harder for each model to claim its own subspace.
-  latent_align_weight: 0.5    # cosine alignment loss weight between z_src and z_tgt.
+  top_k: 128                  # K out of latent_dim=12288 -> 1.04% density per token.
+                              # Start sparse; tune only after checking usage/localization diagnostics.
+  self_weight: 1.0            # self reconstruction must remain at least as important as cross reconstruction.
+  cross_weight: 0.0           # Keep off until one validated PixArt timestep is cached; otherwise DINO targets random noise levels.
+  latent_align_weight: 0.0    # Enable only after both models have healthy localized self-reconstruction.
                               # Set to 0 to disable; increase to 2.0+ if partition score stays >1.
   latent_align_mode: per_token  # "per_token" (recommended) | "bag" (legacy) | "both"
                                 # per_token aligns z at each spatial position (requires
                                 # spatial_align_to). bag aligns only the mean — produces
                                 # high bag-of-features cosine but zero per-feature co-fire,
                                 # which is the failure mode the last run showed.
+  pre_topk_align_weight: 0.0  # Disabled initially; make this an explicit experimental choice.
 
   # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
   # Periodically revive features that have gone dead (usage EMA below threshold

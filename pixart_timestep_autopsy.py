@@ -136,16 +136,19 @@ def main():
 
     model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
     model.eval().to(args.device)
-    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
+    eval_g = getattr(model, "_training_global", g)
+    aligner = build_spatial_aligner_from_config(eval_g, model_tokens_native)
 
     ds = CocoActivationDataset(
         cache_root=args.cache_root,
         sources=args.sources,
         combined_npz=True,
-        standardize=bool(g.get("standardize", True)),
+        standardize=bool(eval_g.get("standardize", True)),
         return_metadata=True,
         diffusion_models=[s for s in args.sources if s in model.diffusion_models],
         use_class_tokens=False,
+        standardization_stats=getattr(model, "_standardization_stats", None),
+        stats_seed=eval_g.get("stats_seed", 0),
     )
     stem = resolve_stem(args.stem, ds.stems)
     (acts, meta), _ = ds[ds.stems.index(stem)]
@@ -218,7 +221,9 @@ def main():
               os.path.join(args.output_dir, f"{stem}_{src}_t{bt}_meanranked.png"), args.top_k)
 
     # ---- Verdict ----
-    ref_thresh = 0.5 * ref_peak  # "localized" = at least half the reference peakiness
+    # Peakiness has a floor of 1.0, so compare excess-over-uniform rather
+    # than multiplying the raw score (which can create an unreachable branch).
+    ref_thresh = 1.0 + 0.5 * (ref_peak - 1.0)
     best_loc = best["peak_localized"]
     best_mean = best["peak_mean"]
     print("\n" + "=" * 60)

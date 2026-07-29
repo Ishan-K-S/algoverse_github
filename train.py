@@ -523,6 +523,8 @@ def train_universal_sae(
     curriculum_epochs: int = 5,
     curriculum_self_only: bool = True,
     balanced_sources: bool = False,
+    self_weight: float = 1.0,
+    cross_weight: float = 1.0,
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
@@ -591,8 +593,22 @@ def train_universal_sae(
             break
 
     diffusion_models = set(diffusion_models)
-    cross_weight = 2.0
-    self_weight = 1.0
+    if self_weight < 0 or cross_weight < 0:
+        raise ValueError("self_weight and cross_weight must be non-negative.")
+    if cross_weight > 0:
+        for (preview_acts, _preview_meta), _preview_y in dataloader:
+            multi_timestep = [
+                name for name, values in preview_acts.items()
+                if name in diffusion_models and values.dim() >= 4 and values.shape[1] > 1
+            ]
+            if multi_timestep:
+                print(
+                    "[train] WARNING: cross reconstruction is enabled while "
+                    f"{multi_timestep} has multiple cached timesteps. A fixed source code is "
+                    "otherwise trained against incompatible noise levels; collapse is likely. "
+                    "Collapse the cache to one validated timestep before enabling cross_weight."
+                )
+            break
 
     global_step = epoch * len(dataloader)
     last_loss = torch.tensor(0.0, device=device)

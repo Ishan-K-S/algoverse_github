@@ -29,7 +29,6 @@ from spatial_align import build_spatial_aligner_from_config
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = "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" 
 
 try:
     import wandb
@@ -43,10 +42,8 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     """
     Initialize a wandb run. Returns True if successful.
 
-    The API key is read from (in priority order):
-      1. WANDB_API_KEY constant at the top of this file
-      2. WANDB_API_KEY environment variable (set externally)
-      3. wandb's own stored credentials (~/.netrc / wandb login)
+    Authentication is delegated to WANDB_API_KEY in the environment, a Colab
+    secret, or wandb's own stored credentials. Never commit API keys here.
     """
     if not WANDB_AVAILABLE:
         return False
@@ -55,9 +52,6 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     if not bool(global_cfg.get("use_wandb", True)):
         print("[wandb] Disabled via config (use_wandb: false).")
         return False
-
-    if WANDB_API_KEY:
-        os.environ["WANDB_API_KEY"] = WANDB_API_KEY
 
     wandb_project = global_cfg.get("wandb_project", "universal-sae")
     wandb_entity = global_cfg.get("wandb_entity", None)
@@ -184,6 +178,7 @@ if __name__ == "__main__":
         use_class_tokens=bool(CONFIG.get("use_class_tokens", True)),
         return_metadata=combined_npz,
         diffusion_models=list(diffusion_models),
+        stats_seed=CONFIG.get("stats_seed"),
     )
 
     # Optionally recompute standardisation stats with a configured sample size
@@ -311,6 +306,9 @@ if __name__ == "__main__":
             latent_align_mode=str(
                 SAE_PARAMS.get("latent_align_mode", CONFIG.get("latent_align_mode", "per_token"))
             ),
+            self_weight=float(SAE_PARAMS.get("self_weight", CONFIG.get("self_weight", 1.0))),
+            cross_weight=float(SAE_PARAMS.get("cross_weight", CONFIG.get("cross_weight", 1.0))),
+            pre_topk_align_weight=float(SAE_PARAMS.get("pre_topk_align_weight", CONFIG.get("pre_topk_align_weight", 0.0))),
             resample_dead=bool(SAE_PARAMS.get("resample_dead", CONFIG.get("resample_dead", False))),
             resample_interval=int(SAE_PARAMS.get("resample_interval", 500)),
             resample_dead_threshold=float(SAE_PARAMS.get("resample_dead_threshold", 1e-3)),
@@ -348,6 +346,13 @@ if __name__ == "__main__":
                     "model_tokens_native": model_tokens,       # pre-alignment
                     "spatial_align_to": CONFIG.get("spatial_align_to", None),
                     "latent_dim": latent_dim,
+                    "standardization_stats": {
+                        source: {
+                            "mean": values["mean"].detach().cpu(),
+                            "std": values["std"].detach().cpu(),
+                        }
+                        for source, values in getattr(dataset, "standardization_stats", {}).items()
+                    },
                 },
                 ckpt_path,
             )

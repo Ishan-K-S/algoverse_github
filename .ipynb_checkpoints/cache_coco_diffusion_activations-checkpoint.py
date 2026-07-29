@@ -20,7 +20,10 @@ from coco_dataset_setup import CocoData
 from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor
 
 from huggingface_hub import login
-login(token="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")
+
+token = os.environ.get("HF_TOKEN")
+if token:
+    login(token=token, add_to_git_credential=False)
 
 
 def save_diffusion_npz(path_no_ext: str, activation_tnd: torch.Tensor, sigmas, timesteps, filename: str):
