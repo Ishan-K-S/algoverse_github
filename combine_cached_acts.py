@@ -33,7 +33,18 @@ DIFF_META_FIELDS = ("sigmas", "timesteps")
 
 
 def _mount_drive(retries: int = 3) -> bool:
-    """Mount Google Drive, returning True on success."""
+    """Mount Google Drive, returning True on success.
+
+    If Drive is already mounted, return immediately without calling
+    drive.mount(). This matters when the script runs as a SUBPROCESS (e.g.
+    driven from another script rather than typed into a notebook cell):
+    google.colab.drive.mount() needs the notebook kernel's message channel and
+    fails there with "'NoneType' object has no attribute 'kernel'". Previously
+    that made every Drive upload silently no-op even though /content/drive was
+    mounted and perfectly writable.
+    """
+    if os.path.isdir("/content/drive/MyDrive"):
+        return True
     try:
         from google.colab import drive as _colab_drive
     except ImportError:

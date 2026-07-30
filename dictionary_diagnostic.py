@@ -87,6 +87,12 @@ def _parse_args():
 # -----------------------------------------------------------------------------
 
 def _mount_drive(retries: int = 3) -> bool:
+    # If Drive is already mounted, return immediately without calling
+    # drive.mount(). That call needs the notebook kernel's message channel and
+    # fails in a subprocess with "'NoneType' object has no attribute 'kernel'",
+    # which silently turned every Drive upload into a no-op.
+    if os.path.isdir("/content/drive/MyDrive"):
+        return True
     try:
         from google.colab import drive as _colab_drive
     except ImportError:
