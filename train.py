@@ -228,10 +228,25 @@ def _pick_source(acts: Dict[str, torch.Tensor], step: int, balanced_sources: boo
     return random.choice(source_names)
 
 
+def _resolve_fixed_timestep(fixed_timestep_idx: Optional[int], total_steps: int) -> Optional[int]:
+    """Turn a configured timestep index into a real one for this cache.
+
+    None means keep the old random sampling. Negative values count from the end
+    (-1 is the last, least-noisy timestep). Out of range gets clamped.
+    """
+    if fixed_timestep_idx is None:
+        return None
+    idx = int(fixed_timestep_idx)
+    if idx < 0:
+        idx = total_steps + idx
+    return max(0, min(idx, total_steps - 1))
+
+
 def _extract_source_slice(
     x: torch.Tensor,
     is_diffusion: bool,
     timestep_values_bt: Optional[torch.Tensor] = None,
+    fixed_timestep_idx: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Normalize source activation layouts into a single slice the SAE can encode.
@@ -263,7 +278,10 @@ def _extract_source_slice(
 
         if timestep_values_bt is None:
             raise ValueError("Diffusion source requires timestep values.")
-        x_slice, timestep_slice, timestep_idx = _pick_diffusion_slice(x, timestep_values_bt)
+        pinned = _resolve_fixed_timestep(fixed_timestep_idx, x.shape[1])
+        x_slice, timestep_slice, timestep_idx = _pick_diffusion_slice(
+            x, timestep_values_bt, timestep_idx=pinned
+        )
         return x_slice, timestep_slice, layer_idx, timestep_idx, total_layers, x.shape[1]
 
     if x.dim() == 4:
@@ -289,6 +307,7 @@ def _extract_target_slice(
     source_total_layers: Optional[int],
     source_timestep_idx: Optional[int] = None,
     source_total_steps: Optional[int] = None,
+    fixed_timestep_idx: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[int], Optional[int]]:
     """
     Normalize target activation layouts into one comparison slice.
@@ -296,8 +315,13 @@ def _extract_target_slice(
     Diffusion targets reuse the source's timestep so that cross-reconstruction
     compares activations at matching noise levels. If the source was also
     diffusion and chose timestep t, this picks t (mapped proportionally
-    if T differs between source and target). If the source was vision (no
-    timestep_idx available), the target samples a random timestep.
+    if T differs between source and target).
+
+    If the source was vision there's no source timestep to reuse, and this used
+    to just pick a random one. That means a fixed DinoV2 code gets matched
+    against a different PixArt noise level every step, which isn't learnable -
+    the best the model can do is output the average. Set fixed_timestep_idx to
+    pin the target instead.
 
     Layer alignment uses the same layer index when possible, with proportional
     fallback if source and target expose different numbers of layers.
@@ -321,8 +345,9 @@ def _extract_target_slice(
             raise ValueError("Diffusion target requires timestep values.")
 
         total_steps = x.shape[1]
+        pinned = _resolve_fixed_timestep(fixed_timestep_idx, total_steps)
         if source_timestep_idx is None:
-            timestep_idx = random.randrange(total_steps)
+            timestep_idx = pinned if pinned is not None else random.randrange(total_steps)
         else:
             src_steps = source_total_steps if source_total_steps is not None else total_steps
             timestep_idx = _map_timestep_idx(source_timestep_idx, src_steps, total_steps)
@@ -525,6 +550,7 @@ def train_universal_sae(
     balanced_sources: bool = False,
     self_weight: float = 1.0,
     cross_weight: float = 1.0,
+    fixed_timestep_idx: Optional[int] = None,  # pin the PixArt timestep, -1 = last. None = old random behaviour
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
@@ -601,13 +627,14 @@ def train_universal_sae(
                 name for name, values in preview_acts.items()
                 if name in diffusion_models and values.dim() >= 4 and values.shape[1] > 1
             ]
-            if multi_timestep:
+            if multi_timestep and fixed_timestep_idx is None:
                 print(
-                    "[train] WARNING: cross reconstruction is enabled while "
-                    f"{multi_timestep} has multiple cached timesteps. A fixed source code is "
-                    "otherwise trained against incompatible noise levels; collapse is likely. "
-                    "Collapse the cache to one validated timestep before enabling cross_weight."
+                    f"[train] WARNING: cross_weight > 0 and {multi_timestep} has multiple cached "
+                    "timesteps, but fixed_timestep_idx isn't set. The cross target will move every "
+                    "step and probably collapse. Set fixed_timestep_idx (-1 is fine)."
                 )
+            elif multi_timestep:
+                print(f"[train] cross recon on, PixArt timestep pinned to {fixed_timestep_idx}")
             break
 
     global_step = epoch * len(dataloader)
@@ -671,6 +698,7 @@ def train_universal_sae(
                     x_src_full,
                     is_diffusion=True,
                     timestep_values_bt=src_timesteps_bt,
+                    fixed_timestep_idx=fixed_timestep_idx,
                 )
             )
             if spatial_aligner is not None:
@@ -715,6 +743,7 @@ def train_universal_sae(
                     source_total_layers=source_total_layers,
                     source_timestep_idx=source_timestep_idx,
                     source_total_steps=source_total_steps,
+                    fixed_timestep_idx=fixed_timestep_idx,
                 )
                 if spatial_aligner is not None:
                     x_target_t = spatial_aligner.align(x_target_t, source=target)
@@ -769,6 +798,7 @@ def train_universal_sae(
                         source_total_layers=source_total_layers,
                         source_timestep_idx=source_timestep_idx,
                         source_total_steps=source_total_steps,
+                        fixed_timestep_idx=fixed_timestep_idx,
                     )
                     if spatial_aligner is not None:
                         x_tgt_sl = spatial_aligner.align(x_tgt_sl, source=tgt_name)

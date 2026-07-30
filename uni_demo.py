@@ -158,9 +158,17 @@ if __name__ == "__main__":
     print(f"[config] Diffusion models : {diffusion_models}")
 
     # ----- Run name -----
+    # run_name comes straight from the config values, so if two of us run the same config
+    # we get the same name. The runs stay separate in wandb but the checkpoint artifacts
+    # are named f"{run_name}_epoch_{n}", so they all stack up as versions of one collection
+    # and you can't tell whose weights are whose. run_tag keeps them apart.
     run_name_template = CONFIG.get("run_name", "usae_run")
     run_name = _expand_run_name(run_name_template, sources, CONFIG, SAE_PARAMS)
+    run_tag = str(CONFIG.get("run_tag", "") or "").strip()
+    if run_tag:
+        run_name = f"{run_name}_{run_tag}"
     CONFIG["run_name"] = run_name
+    print(f"[config] Run name         : {run_name}")
 
     # ----- wandb -----
     use_wandb = _init_wandb(cfg, run_name)
@@ -308,6 +316,10 @@ if __name__ == "__main__":
             ),
             self_weight=float(SAE_PARAMS.get("self_weight", CONFIG.get("self_weight", 1.0))),
             cross_weight=float(SAE_PARAMS.get("cross_weight", CONFIG.get("cross_weight", 1.0))),
+            fixed_timestep_idx=(
+                None if CONFIG.get("fixed_timestep_idx", None) is None
+                else int(CONFIG["fixed_timestep_idx"])
+            ),
             pre_topk_align_weight=float(SAE_PARAMS.get("pre_topk_align_weight", CONFIG.get("pre_topk_align_weight", 0.0))),
             resample_dead=bool(SAE_PARAMS.get("resample_dead", CONFIG.get("resample_dead", False))),
             resample_interval=int(SAE_PARAMS.get("resample_interval", 500)),

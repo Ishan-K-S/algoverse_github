@@ -31,6 +31,16 @@ global:
                               # 'mean' = pool to one vector per image (paper's per-sample setup).
   use_tide: false            # Keep off until a single PixArt timestep has been selected and validated.
 
+  # PixArt has 15 timesteps cached and training was picking one at random each step, so a
+  # DinoV2 code was being matched against a different noise level every time. You can't
+  # learn that, the best you can do is predict the average, which is probably why
+  # PixArt->DinoV2 has been stuck at ~0.95. Pinning it fixes cross-recon without recaching.
+  # null = old random behaviour, -1 = last timestep (least noisy).
+  # Checked -1 on our cache: per-patch cos ~0.40 / peakiness ~3.85, DinoV2 is ~0.29 / ~3.22.
+  fixed_timestep_idx: -1
+
+  run_tag: kaveh             # keeps wandb runs and checkpoints separate when more than one of us runs
+
   # --- Spatial alignment (Option B1) ---
   # When set, every model's token grid is average-pooled down to the named
   # model's native grid before encoding. DinoV2 (16x16=256) is the smallest
@@ -57,16 +67,17 @@ viz:
 sae_params:
   top_k: 128                  # K out of latent_dim=12288 -> 1.04% density per token.
                               # Start sparse; tune only after checking usage/localization diagnostics.
-  self_weight: 1.0            # self reconstruction must remain at least as important as cross reconstruction.
-  cross_weight: 0.0           # Keep off until one validated PixArt timestep is cached; otherwise DINO targets random noise levels.
-  latent_align_weight: 0.0    # Enable only after both models have healthy localized self-reconstruction.
-                              # Set to 0 to disable; increase to 2.0+ if partition score stays >1.
+  self_weight: 1.0
+  cross_weight: 2.0           # back to the old 2:1 cross/self ratio. cross-recon is the whole point of a
+                              # universal SAE, so it can't stay at 0.
+  latent_align_weight: 0.5    # same as the last run (pnv4rmcp). curriculum_epochs=5 keeps it off for the
+                              # first 5 epochs anyway.
   latent_align_mode: per_token  # "per_token" (recommended) | "bag" (legacy) | "both"
                                 # per_token aligns z at each spatial position (requires
                                 # spatial_align_to). bag aligns only the mean — produces
                                 # high bag-of-features cosine but zero per-feature co-fire,
                                 # which is the failure mode the last run showed.
-  pre_topk_align_weight: 0.0  # Disabled initially; make this an explicit experimental choice.
+  pre_topk_align_weight: 1.0  # what it was silently defaulting to before this got made explicit
 
   # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
   # Periodically revive features that have gone dead (usage EMA below threshold
