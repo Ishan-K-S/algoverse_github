@@ -12,6 +12,7 @@ Combined npz keys:  <MODEL> (N,D or T,N,D),  <MODEL>__sigmas (T,),  <MODEL>__tim
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import yaml
 import shutil
@@ -97,6 +98,30 @@ def _require_nonempty(cfg: Dict[str, Any], key: str) -> str:
     if v is None or (isinstance(v, str) and len(v.strip()) == 0):
         raise ValueError(f"CONFIG.global.{key} is empty. Please set it in config.yaml.")
     return str(v)
+
+
+def _code_version() -> str:
+    """Short git hash of the code that produced a run, '-dirty' if uncommitted.
+
+    We had no way to tell which commit a checkpoint came from, so a run that
+    looked wrong could not be traced back to the code that made it.
+    """
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo, capture_output=True, text=True, timeout=5,
+        )
+        if head.returncode != 0:
+            return "unknown"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo, capture_output=True, text=True, timeout=5,
+        )
+        suffix = "-dirty" if dirty.stdout.strip() else ""
+        return head.stdout.strip() + suffix
+    except Exception:
+        return "unknown"
 
 
 def _parse_int_field(x: Any, name: str) -> int:
@@ -358,6 +383,14 @@ if __name__ == "__main__":
                     "model_tokens_native": model_tokens,       # pre-alignment
                     "spatial_align_to": CONFIG.get("spatial_align_to", None),
                     "latent_dim": latent_dim,
+                    # Enough to identify what produced this checkpoint. The full
+                    # config is above; this is the part config.yaml can't tell you.
+                    "manifest": {
+                        "code_version": _code_version(),
+                        "cache_root": CONFIG.get("path_to_cache"),
+                        "n_images": len(dataset),
+                        "fixed_timestep_idx": CONFIG.get("fixed_timestep_idx"),
+                    },
                     "standardization_stats": {
                         source: {
                             "mean": values["mean"].detach().cpu(),
