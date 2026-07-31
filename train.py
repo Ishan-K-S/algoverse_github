@@ -550,7 +550,7 @@ def train_universal_sae(
     balanced_sources: bool = False,
     self_weight: float = 1.0,
     cross_weight: float = 1.0,
-    fixed_timestep_idx: Optional[int] = None,  # pin the PixArt timestep, -1 = last. None = old random behaviour
+    fixed_timestep_idx: Optional[int] = None,  # pin the PixArt timestep, negatives count from the end. None = old random behaviour
     warmup_steps: int = 1000,
     ema_decay: float = 0.98,
     save_model_path: str = SAVE_MODEL_PATH,
@@ -631,7 +631,8 @@ def train_universal_sae(
                 print(
                     f"[train] WARNING: cross_weight > 0 and {multi_timestep} has multiple cached "
                     "timesteps, but fixed_timestep_idx isn't set. The cross target will move every "
-                    "step and probably collapse. Set fixed_timestep_idx (-1 is fine)."
+                    "step and probably collapse. Set fixed_timestep_idx. Don't guess at the "
+                    "value, run pixart_timestep_autopsy.py and pin whichever timestep it picks."
                 )
             elif multi_timestep:
                 print(f"[train] cross recon on, PixArt timestep pinned to {fixed_timestep_idx}")

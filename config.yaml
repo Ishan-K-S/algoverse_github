@@ -35,9 +35,13 @@ global:
   # DinoV2 code was being matched against a different noise level every time. You can't
   # learn that, the best you can do is predict the average, which is probably why
   # PixArt->DinoV2 has been stuck at ~0.95. Pinning it fixes cross-recon without recaching.
-  # null = old random behaviour, -1 = last timestep (least noisy).
-  # Checked -1 on our cache: per-patch cos ~0.40 / peakiness ~3.85, DinoV2 is ~0.29 / ~3.22.
-  fixed_timestep_idx: -1
+  # null = old random behaviour, otherwise an index (negatives count from the end).
+  #
+  # Was -1 (the last timestep). pixart_timestep_autopsy.py on the epoch-29 checkpoint says
+  # that was the wrong pick: at t=14 only 288 features are active and peakiness is 1.22,
+  # basically flat, so there was nothing there to reconstruct from. t=10 has 3617 active
+  # and peakiness 6.09 against a DinoV2 reference of ~1.4. t=10 won on all 6 images tested.
+  fixed_timestep_idx: 10
 
   run_tag: kaveh             # keeps wandb runs and checkpoints separate when more than one of us runs
 

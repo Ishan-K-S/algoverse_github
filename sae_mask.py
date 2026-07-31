@@ -330,7 +330,8 @@ def parse_args():
     parser.add_argument("--list_stems", action="store_true",
                         help="Print all available stems in --cache_root and exit.")
     parser.add_argument("--output", default=None)
-    parser.add_argument("--timestep_idx", type=int, default=-1)
+    parser.add_argument("--timestep_idx", type=int, default=None,
+                        help="Override the diffusion timestep. Defaults to whatever the checkpoint trained on.")
     parser.add_argument("--use_cls", action="store_true")
     parser.add_argument("--feature_ids", default=None, help="Comma/range list like '12,44,80-90'.")
     parser.add_argument("--top_k_drops", type=int, default=25)
@@ -403,6 +404,7 @@ def main():
         is_diffusion,
         args.timestep_idx,
         args.use_cls,
+        training_global=getattr(model, "_training_global", None),
     )
     grid_size = infer_grid_size(act.shape[0])
     patch_indices, mask_sources = build_mask_indices(args, stem, grid_size)

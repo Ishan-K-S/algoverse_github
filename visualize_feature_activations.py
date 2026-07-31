@@ -26,6 +26,7 @@ from inference import print_top_features
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config, infer_grid_size
 from data import CocoActivationDataset
+from pixart_timestep import resolve_pixart_timestep
 
 
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
@@ -153,7 +154,11 @@ def encode_image_tokens(
         sig = meta["sigmas_by_model"].get(source, meta.get("sigmas"))
         if sig is None:
             raise ValueError(f"Diffusion source {source!r} has no sigmas in metadata.")
-        t_idx = x.shape[1] - 1  # final timestep, matches convention elsewhere in repo
+        # Heatmaps have to come from the timestep the encoder was trained on,
+        # otherwise you are visualising features the model never saw fire.
+        t_idx = resolve_pixart_timestep(
+            x.shape[1], config_global=getattr(model, "_training_global", None)
+        )
         sigma = sig.to(device).view(-1)[t_idx].view(1)
         x = x[:, t_idx]
 

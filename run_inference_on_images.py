@@ -30,6 +30,7 @@ from inference import print_top_features
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config
 from data import CocoActivationDataset
+from pixart_timestep import resolve_pixart_timestep
 from top_activating_images import (
     build_coco_label_lookup,
     coco_annotation_path,
@@ -93,7 +94,8 @@ def feature_scores(model, acts, meta, source, diffusion_models, aligner, device)
     """Encode one image's activations -> (per-feature score vector, raw latents).
 
     Score = mean |latent| over batch and tokens, matching inference._score_latents.
-    Handles diffusion sources by selecting the final timestep and passing its sigma.
+    Diffusion sources are sliced to the timestep the checkpoint trained on and
+    scored with that timestep's sigma.
     """
     if source not in acts:
         raise KeyError(f"Source '{source}' not in loaded activations {list(acts)}. "
@@ -106,7 +108,9 @@ def feature_scores(model, acts, meta, source, diffusion_models, aligner, device)
             sig = meta.get("sigmas")
         if sig is None:
             raise ValueError(f"Diffusion source '{source}' has no sigmas in metadata.")
-        t_idx = x.shape[1] - 1  # final timestep, matches timestep_idx=-1 elsewhere
+        t_idx = resolve_pixart_timestep(
+            x.shape[1], config_global=getattr(model, "_training_global", None)
+        )
         sigma = sig.to(device).view(-1)[t_idx].view(1)
         x = x[:, t_idx]  # -> (1,N,D)
     if aligner is not None:
@@ -165,6 +169,9 @@ def main():
     model.eval().to(args.device)
 
     eval_g = {**g, **saved_global}
+    # Ride along on the model so feature_scores can pick the training timestep
+    # without threading the config through every call.
+    model._training_global = eval_g
     aligner = build_spatial_aligner_from_config(eval_g, ckpt.get("model_tokens_native", ckpt["model_tokens"]))
 
     # ---- Load dataset ----

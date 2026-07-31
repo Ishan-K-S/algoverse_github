@@ -15,6 +15,7 @@ import torch
 import yaml
 from tqdm import tqdm
 from spatial_align import SpatialAligner
+from pixart_timestep import resolve_pixart_timestep
 
 
 # THESE ARE WHAT TO FILL IN
@@ -313,6 +314,9 @@ def load_universal_sae(
 
     model.eval()
     model._standardization_stats = ckpt.get("standardization_stats")
+    # Carry the training config so callers can pick the same PixArt timestep
+    # this checkpoint was trained on. Checkpoint values win over config.yaml.
+    model._training_global = {**g, **gc}
 
     return model.to(device), cfg
 
@@ -322,9 +326,10 @@ def load_activation_for_image(
     stem: str,
     source: str,
     is_diffusion: bool,
-    timestep_idx: int,
+    timestep_idx: Optional[int],
     use_cls: bool,
     spatial_aligner=None,
+    training_global=None,
 ):
     path = os.path.join(cache_root, f"{stem}_combined.npz")
 
@@ -349,8 +354,9 @@ def load_activation_for_image(
 
         T = act.shape[0]
 
-        idx = timestep_idx if timestep_idx >= 0 else T + timestep_idx
-        idx = max(0, min(idx, T - 1))
+        idx = resolve_pixart_timestep(
+            T, config_global=training_global, override=timestep_idx
+        )
 
         sigma_key = f"{source}__sigmas"
 
@@ -405,7 +411,7 @@ def compute_top_activations(
     diffusion_models: set,
     output_path: str,
     top_pct: float = 0.1,
-    timestep_idx: int = -1,
+    timestep_idx: Optional[int] = None,
     use_cls: bool = False,
     batch_size: int = 32,
     device: str = "cuda",
@@ -414,6 +420,7 @@ def compute_top_activations(
     feature_pool: FeaturePoolMode = "max",
     spatial_aligner=None,
     standardization_stats=None,
+    training_global=None,
 ):
     is_diffusion = source in diffusion_models
 
@@ -456,6 +463,7 @@ def compute_top_activations(
                 timestep_idx=timestep_idx,
                 use_cls=use_cls,
                 spatial_aligner=spatial_aligner,
+                training_global=training_global,
             )
 
             if standardization_stats is None or source not in standardization_stats:
@@ -599,7 +607,8 @@ def parse_args():
     p.add_argument("--output", default=OUTPUT_PATH)
 
     p.add_argument("--top_pct", type=float, default=0.1)
-    p.add_argument("--timestep_idx", type=int, default=-1)
+    p.add_argument("--timestep_idx", type=int, default=None,
+                   help="Override the diffusion timestep. Defaults to whatever the checkpoint trained on.")
 
     p.add_argument("--use_cls", action="store_true")
 
@@ -684,6 +693,7 @@ def main():
         feature_pool=args.feature_pool,
         spatial_aligner=spatial_aligner,   # NEW
         standardization_stats=getattr(model, "_standardization_stats", None),
+        training_global=getattr(model, "_training_global", None),
     )
 
     save_to_drive(

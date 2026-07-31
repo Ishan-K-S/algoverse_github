@@ -38,7 +38,8 @@ def _parse_args():
     p.add_argument("--config", required=True)
     p.add_argument("--repo_root", default=None)
     p.add_argument("--n_images", type=int, default=2000)
-    p.add_argument("--pixart_timestep", type=int, default=-1)
+    p.add_argument("--pixart_timestep", type=int, default=None,
+                   help="Override the diffusion timestep. Defaults to whatever the checkpoint trained on.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default="input_rank.npz")
     return p.parse_args()
@@ -71,6 +72,7 @@ def main():
 
     from data import CocoActivationDataset
     from spatial_align import build_spatial_aligner_from_config
+    from pixart_timestep import resolve_pixart_timestep
 
     print(f"[rank] loading ckpt: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location="cpu")
@@ -106,7 +108,9 @@ def main():
         x_dino = acts["DinoV2"].float()
         x_pix_full = acts["PixArt"].float()
         T = x_pix_full.shape[0]
-        t_idx = args.pixart_timestep if args.pixart_timestep >= 0 else T + args.pixart_timestep
+        t_idx = resolve_pixart_timestep(
+            T, ckpt=ckpt, config_global=g_file, override=args.pixart_timestep
+        )
         x_pix = x_pix_full[t_idx]
 
         if aligner is not None:
