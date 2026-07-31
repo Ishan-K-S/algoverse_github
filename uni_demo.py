@@ -198,7 +198,7 @@ if __name__ == "__main__":
         dataset,
         batch_size=_parse_int_field(CONFIG.get("batch_size", 32), "CONFIG.global.batch_size"),
         shuffle=True,
-        # num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
+        num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
         pin_memory=True,
     )
     print(f"[uni_demo] Dataset size  : {len(dataset)} images")
