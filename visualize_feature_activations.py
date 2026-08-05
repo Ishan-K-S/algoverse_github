@@ -26,6 +26,7 @@ from inference import print_top_features
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config, infer_grid_size
 from data import CocoActivationDataset
+from pixart_timestep import resolve_pixart_timestep
 
 
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
@@ -51,30 +52,40 @@ def native_tokens_from_zoo(cfg: dict, model_names: List[str]) -> Dict[str, int]:
     return {name: int(zoo[name]["num_tokens"]) for name in model_names if name in zoo}
 
 
-def load_checkpoint(ckpt_path: str, cfg: dict) -> Tuple[UniversalSAE, Dict[str, int]]:
+def load_checkpoint(ckpt_path: str, cfg: dict) -> Tuple[UniversalSAE, Dict[str, int], Optional[dict]]:
+    """Returns (model, model_tokens_native, raw_ckpt_dict). raw_ckpt_dict is None
+    for the legacy whole-object pickle format, which carries no config/stats."""
     g = cfg["global"]
     raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     if isinstance(raw, UniversalSAE):
         model = raw
         model_tokens_native = native_tokens_from_zoo(cfg, model.model_names)
+        return model, model_tokens_native, None
     elif isinstance(raw, dict) and "state_dict" in raw:
         diffusion_models = set(raw.get("diffusion_models", g.get("diffusion_models", [])))
+        ckpt_cfg = raw.get("config")
+        ckpt_sae_params = ckpt_cfg.get("sae_params", {}) if isinstance(ckpt_cfg, dict) else {}
         model = UniversalSAE(
             model_dims=raw["model_dims"],
             latent_dim=raw["latent_dim"],
             diffusion_models=diffusion_models,
             model_tokens=raw["model_tokens"],
-            top_k=int(cfg["sae_params"].get("top_k", 64)),
+            top_k=int(ckpt_sae_params.get("top_k", cfg["sae_params"].get("top_k", 64))),
             cls_pool_mode=str(g.get("cls_pool_mode", "none")),
             use_tide=bool(g.get("use_tide", False)),
         )
-        model.load_state_dict(raw["state_dict"], strict=False)
+        missing, unexpected = model.load_state_dict(raw["state_dict"], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint {ckpt_path} state_dict does not match the model built from its "
+                f"own config -- refusing to silently run on a partially-random encoder. "
+                f"missing={missing} unexpected={unexpected}"
+            )
         model_tokens_native = raw.get("model_tokens_native") or native_tokens_from_zoo(cfg, model.model_names)
+        return model, model_tokens_native, raw
     else:
         raise TypeError(f"Unrecognized checkpoint at {ckpt_path}: {type(raw)}")
-
-    return model, model_tokens_native
 
 
 def discover_stems(cache_root: str) -> List[str]:
@@ -122,6 +133,9 @@ def encode_image_tokens(
     source: str,
     aligner,
     device: str,
+    ckpt_raw: Optional[dict] = None,
+    config_global: Optional[dict] = None,
+    pixart_timestep_override: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Returns (per-feature score (K,), raw per-token latents (1,N,K), grid_size)."""
     if source not in acts:
@@ -133,7 +147,9 @@ def encode_image_tokens(
         sig = meta["sigmas_by_model"].get(source, meta.get("sigmas"))
         if sig is None:
             raise ValueError(f"Diffusion source {source!r} has no sigmas in metadata.")
-        t_idx = x.shape[1] - 1  # final timestep, matches convention elsewhere in repo
+        t_idx = resolve_pixart_timestep(
+            x.shape[1], ckpt=ckpt_raw, config_global=config_global, override=pixart_timestep_override
+        )
         sigma = sig.to(device).view(-1)[t_idx].view(1)
         x = x[:, t_idx]
 
@@ -301,6 +317,9 @@ def parse_args():
     p.add_argument("--source", default="DinoV2")
     p.add_argument("--sources", nargs="+", default=["DinoV2", "PixArt"])
     p.add_argument("--top_k", type=int, default=8)
+    p.add_argument("--pixart_timestep", type=int, default=None,
+                   help="Override the diffusion timestep index. Defaults to whatever "
+                        "the checkpoint (or config.yaml as a last resort) trained on.")
     p.add_argument("--ckpt", default=None)
     p.add_argument("--weights_dir", default=DEFAULT_WEIGHTS_DIR)
     p.add_argument("--config", default=DEFAULT_CONFIG)
@@ -322,7 +341,7 @@ def parse_args():
     return p.parse_args()
 
 
-def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
+def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query, ckpt_raw, config_global):
     """Encode one image, render its top-feature heatmaps, and save grid + report."""
     stem = resolve_stem(stem_query, ds.stems)
     if not args.quiet:
@@ -331,7 +350,10 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
     idx = ds.stems.index(stem)
     (acts, meta), _ = ds[idx]
 
-    _amax_scores, z, grid_size = encode_image_tokens(model, acts, meta, args.source, aligner, args.device)
+    _amax_scores, z, grid_size = encode_image_tokens(
+        model, acts, meta, args.source, aligner, args.device,
+        ckpt_raw=ckpt_raw, config_global=config_global, pixart_timestep_override=args.pixart_timestep,
+    )
 
     raw_image_path = find_raw_image(stem, args.raw_image_dir)
     base_image = Image.open(raw_image_path).convert("RGB") if raw_image_path else None
@@ -446,7 +468,7 @@ def main():
         cfg = yaml.safe_load(f)
     g = cfg["global"]
 
-    model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
+    model, model_tokens_native, ckpt_raw = load_checkpoint(ckpt_path, cfg)
     model.eval().to(args.device)
 
     if model.cls_pool_mode != "none":
@@ -455,11 +477,18 @@ def main():
             "per image; per-patch visualization requires cls_pool_mode='none'."
         )
 
-    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
+    # Prefer the checkpoint's own training-time config over live config.yaml, which may
+    # have moved on since the run that produced this checkpoint (V12).
+    ckpt_global = (ckpt_raw.get("config") or {}).get("global", {}) if isinstance(ckpt_raw, dict) else {}
+    align_to = ckpt_raw.get("spatial_align_to") if isinstance(ckpt_raw, dict) else None
+    if align_to is None:
+        align_to = ckpt_global.get("spatial_align_to", g.get("spatial_align_to"))
+    aligner = build_spatial_aligner_from_config({"spatial_align_to": align_to}, model_tokens_native)
     if aligner is not None:
         print(f"[viz] spatial alignment ON -> target grid "
               f"{aligner.target_grid_size}x{aligner.target_grid_size}")
 
+    standardization_stats = ckpt_raw.get("standardization_stats") if isinstance(ckpt_raw, dict) else None
     ds = CocoActivationDataset(
         cache_root=args.cache_root,
         sources=args.sources,
@@ -468,11 +497,13 @@ def main():
         return_metadata=True,
         diffusion_models=[s for s in args.sources if s in model.diffusion_models],
         use_class_tokens=False,
+        standardization_stats=standardization_stats or None,
+        stats_seed=0,
     )
     failures = []
     for stem_query in args.stem:
         try:
-            visualize_stem(args, model, aligner, ds, ckpt_path, stem_query)
+            visualize_stem(args, model, aligner, ds, ckpt_path, stem_query, ckpt_raw, g)
         except Exception as e:
             print(f"[viz] SKIPPED {stem_query!r}: {e}")
             failures.append(stem_query)
