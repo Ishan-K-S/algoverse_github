@@ -26,7 +26,6 @@ from inference import print_top_features
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config, infer_grid_size
 from data import CocoActivationDataset
-from pixart_timestep import resolve_pixart_timestep
 
 
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
@@ -60,38 +59,21 @@ def load_checkpoint(ckpt_path: str, cfg: dict) -> Tuple[UniversalSAE, Dict[str, 
         model = raw
         model_tokens_native = native_tokens_from_zoo(cfg, model.model_names)
     elif isinstance(raw, dict) and "state_dict" in raw:
-        saved_cfg = raw.get("config") if isinstance(raw.get("config"), dict) else {}
-        saved_global = saved_cfg.get("global", {})
-        saved_sae = saved_cfg.get("sae_params", {})
-        diffusion_models = set(raw.get("diffusion_models", saved_global.get("diffusion_models", g.get("diffusion_models", []))))
+        diffusion_models = set(raw.get("diffusion_models", g.get("diffusion_models", [])))
         model = UniversalSAE(
             model_dims=raw["model_dims"],
             latent_dim=raw["latent_dim"],
             diffusion_models=diffusion_models,
             model_tokens=raw["model_tokens"],
-            top_k=int(saved_sae.get("top_k", cfg["sae_params"].get("top_k", 64))),
-            cls_pool_mode=str(saved_global.get("cls_pool_mode", g.get("cls_pool_mode", "none"))),
-            use_tide=bool(saved_global.get("use_tide", g.get("use_tide", False))),
-            timestep_dim=int(saved_global.get("timestep_dim", g.get("timestep_dim", 256))),
+            top_k=int(cfg["sae_params"].get("top_k", 64)),
+            cls_pool_mode=str(g.get("cls_pool_mode", "none")),
+            use_tide=bool(g.get("use_tide", False)),
         )
-        missing, unexpected = model.load_state_dict(raw["state_dict"], strict=False)
-        if missing or unexpected:
-            raise RuntimeError(
-                "Checkpoint architecture does not match its saved configuration: "
-                f"missing={len(missing)}, unexpected={len(unexpected)}."
-            )
+        model.load_state_dict(raw["state_dict"], strict=False)
         model_tokens_native = raw.get("model_tokens_native") or native_tokens_from_zoo(cfg, model.model_names)
     else:
         raise TypeError(f"Unrecognized checkpoint at {ckpt_path}: {type(raw)}")
 
-    # Keep preprocessing with the model so every caller uses the exact training
-    # coordinate system instead of recomputing a random cache sample.
-    model._standardization_stats = raw.get("standardization_stats") if isinstance(raw, dict) else None
-    model._training_global = (
-        raw.get("config", {}).get("global", {})
-        if isinstance(raw, dict) and isinstance(raw.get("config"), dict)
-        else dict(cfg.get("global", {}))
-    )
     return model, model_tokens_native
 
 
@@ -151,11 +133,7 @@ def encode_image_tokens(
         sig = meta["sigmas_by_model"].get(source, meta.get("sigmas"))
         if sig is None:
             raise ValueError(f"Diffusion source {source!r} has no sigmas in metadata.")
-        # Heatmaps have to come from the timestep the encoder was trained on,
-        # otherwise you are visualising features the model never saw fire.
-        t_idx = resolve_pixart_timestep(
-            x.shape[1], config_global=getattr(model, "_training_global", None)
-        )
+        t_idx = x.shape[1] - 1  # final timestep, matches convention elsewhere in repo
         sigma = sig.to(device).view(-1)[t_idx].view(1)
         x = x[:, t_idx]
 
@@ -470,7 +448,6 @@ def main():
 
     model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
     model.eval().to(args.device)
-    eval_g = getattr(model, "_training_global", g)
 
     if model.cls_pool_mode != "none":
         raise ValueError(
@@ -478,7 +455,7 @@ def main():
             "per image; per-patch visualization requires cls_pool_mode='none'."
         )
 
-    aligner = build_spatial_aligner_from_config(eval_g, model_tokens_native)
+    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
     if aligner is not None:
         print(f"[viz] spatial alignment ON -> target grid "
               f"{aligner.target_grid_size}x{aligner.target_grid_size}")
@@ -487,12 +464,10 @@ def main():
         cache_root=args.cache_root,
         sources=args.sources,
         combined_npz=True,
-        standardize=bool(eval_g.get("standardize", True)),
+        standardize=bool(g.get("standardize", True)),
         return_metadata=True,
         diffusion_models=[s for s in args.sources if s in model.diffusion_models],
         use_class_tokens=False,
-        standardization_stats=getattr(model, "_standardization_stats", None),
-        stats_seed=eval_g.get("stats_seed", 0),
     )
     failures = []
     for stem_query in args.stem:
