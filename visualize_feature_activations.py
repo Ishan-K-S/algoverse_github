@@ -45,11 +45,8 @@ def find_latest_checkpoint(weights_dir: str) -> str:
 
 
 def native_tokens_from_zoo(cfg: dict, model_names: List[str]) -> Dict[str, int]:
-    """Pre-alignment token counts per model, from config.yaml's model_zoo.
-
-    model.model_tokens is mutated in place to post-alignment counts during
-    training (see train.py), so it can't be used to recover native grid sizes.
-    """
+    # model.model_tokens gets overwritten with post-alignment counts during
+    # training, so pull native counts straight from config instead.
     zoo = cfg.get("model_zoo", {})
     return {name: int(zoo[name]["num_tokens"]) for name in model_names if name in zoo}
 
@@ -155,8 +152,8 @@ def feature_heatmap(z: torch.Tensor, feature_idx: int, grid_size: int) -> np.nda
 
 
 def upsample_heatmap(heat: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
-    """out_size is (height, width). Nearest-neighbor so each patch fills the
-    exact image region it covers, rather than blending across patch borders."""
+    # Nearest-neighbor so each patch fills the exact region it covers,
+    # instead of blending across patch borders.
     h_img = Image.fromarray((heat * 255.0 / max(heat.max(), 1e-12)).astype(np.uint8))
     h_img = h_img.resize((out_size[1], out_size[0]), resample=Image.NEAREST)
     return np.asarray(h_img).astype(np.float32) / 255.0
@@ -180,33 +177,77 @@ def overlay_heatmap_on_image(image: Image.Image, heat_grid: np.ndarray, alpha: f
     return Image.fromarray(blended.clip(0, 255).astype(np.uint8))
 
 
-def semantic_labels_for_heatmap(
-    heat_grid: np.ndarray,
+def concept_selectivity_scores(
+    z: torch.Tensor,
+    grid_size: int,
     label_map: np.ndarray,
     id_to_name: Dict[int, str],
-    top_fraction: float = 0.2,
-) -> List[dict]:
-    """Class breakdown among the hottest top_fraction of pixels for one feature."""
+    min_percentile: float = 50.0,
+) -> Tuple[np.ndarray, List[dict]]:
+    """Score each feature by top-concept-mean minus second-concept-mean.
+
+    Gated features (dead on this image, or below the image-wide magnitude
+    floor) keep their entry but get margin=-inf so they drop out of ranking
+    without losing the record of why.
+    """
     h, w = label_map.shape
-    heat_px = upsample_heatmap(heat_grid, (h, w))
-    flat_heat = heat_px.flatten()
-    flat_labels = label_map.flatten()
+    label_small = np.asarray(
+        Image.fromarray(label_map).resize((grid_size, grid_size), resample=Image.NEAREST)
+    )
+    labels_flat = label_small.reshape(-1)
+    vals = z[0].abs().numpy()  # (N, K)
+    K = vals.shape[1]
 
-    n_top = max(1, int(len(flat_heat) * top_fraction))
-    top_idx = np.argpartition(flat_heat, -n_top)[-n_top:]
-    top_labels = flat_labels[top_idx]
+    unique_ids = np.unique(labels_flat)
+    if len(unique_ids) < 2:
+        return np.full(K, -np.inf), [
+            {"gated": True, "gate_reason": "fewer than 2 concepts present in this image"}
+            for _ in range(K)
+        ]
 
-    ids, counts = np.unique(top_labels, return_counts=True)
-    order = np.argsort(-counts)
-    rows = []
-    for i in order:
-        cls_id = int(ids[i])
-        rows.append({
-            "class_id": cls_id,
-            "class_name": id_to_name.get(cls_id, f"class_{cls_id}"),
-            "fraction_of_hot_patches": float(counts[i]) / n_top,
-        })
-    return rows
+    # Mean |activation| per concept per feature: (num_concepts, K)
+    concept_means = np.stack([vals[labels_flat == cid].mean(axis=0) for cid in unique_ids])
+    order = np.argsort(-concept_means, axis=0)
+    feat_idx = np.arange(K)
+    top1_row, top2_row = order[0], order[1]
+    top1_val = concept_means[top1_row, feat_idx]
+    top2_val = concept_means[top2_row, feat_idx]
+    raw_margins = top1_val - top2_val
+
+    # Threshold is pooled across all features' nonzero per-token activations,
+    # not per-feature -- a per-feature percentile is a no-op since a
+    # feature's top-concept mean is always one of its own higher values.
+    nonzero_pool = vals[vals > 0]
+    if nonzero_pool.size >= 2:
+        magnitude_threshold = float(np.percentile(nonzero_pool, min_percentile))
+    else:
+        magnitude_threshold = float("inf")
+
+    has_signal = (vals > 0).any(axis=0)
+    eligible = has_signal & (top1_val >= magnitude_threshold)
+    margins = np.where(eligible, raw_margins, -np.inf)
+
+    concept_info = []
+    for k in range(K):
+        entry = {
+            "top_concept": id_to_name.get(int(unique_ids[top1_row[k]]), f"class_{unique_ids[top1_row[k]]}"),
+            "top_concept_mean": float(top1_val[k]),
+            "second_concept": id_to_name.get(int(unique_ids[top2_row[k]]), f"class_{unique_ids[top2_row[k]]}"),
+            "second_concept_mean": float(top2_val[k]),
+            "margin": float(raw_margins[k]),
+            "magnitude_threshold": magnitude_threshold,
+            "gated": not bool(eligible[k]),
+        }
+        if not has_signal[k]:
+            entry["gate_reason"] = "feature never fires on this image"
+        elif not eligible[k]:
+            entry["gate_reason"] = (
+                f"top-concept mean {top1_val[k]:.4g} below image-wide p{min_percentile:.0f} "
+                f"activation threshold {magnitude_threshold:.4g}"
+            )
+        concept_info.append(entry)
+
+    return margins, concept_info
 
 
 def make_feature_thumbnail(
@@ -269,6 +310,10 @@ def parse_args():
                         "heatmaps render without the underlying photo.")
     p.add_argument("--semantic_mask_dir", default=None,
                    help="Directory of *_labelmap.png / *_legend.json from semantic_mask.py.")
+    p.add_argument("--min_percentile", type=float, default=50.0,
+                   help="Magnitude gate for concept-margin ranking: a feature's top-concept "
+                        "mean must clear this percentile of the image's pooled nonzero "
+                        "activations to be eligible. Only used when --semantic_mask_dir is set.")
     p.add_argument("--output_dir", default="feature_visualizations")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-feature text output; only print saved file paths.")
@@ -286,17 +331,7 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
     idx = ds.stems.index(stem)
     (acts, meta), _ = ds[idx]
 
-    scores, z, grid_size = encode_image_tokens(model, acts, meta, args.source, aligner, args.device)
-    k = min(args.top_k, scores.numel())
-    top_scores, top_idx = torch.topk(scores, k=k)
-    top_features = [
-        {"feature_idx": int(i), "score": float(s)}
-        for i, s in zip(top_idx.tolist(), top_scores.tolist())
-    ]
-
-    if not args.quiet:
-        print(f"[viz] top {k} features for {stem} (source={args.source}, grid={grid_size}x{grid_size}):")
-        print_top_features(top_features)
+    _amax_scores, z, grid_size = encode_image_tokens(model, acts, meta, args.source, aligner, args.device)
 
     raw_image_path = find_raw_image(stem, args.raw_image_dir)
     base_image = Image.open(raw_image_path).convert("RGB") if raw_image_path else None
@@ -317,6 +352,40 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
         print(f"[viz] no semantic mask found for stem={stem!r} in {args.semantic_mask_dir}. "
               f"Run semantic_mask.py on this image first.")
 
+    # With a semantic mask, rank by concept-margin (magnitude-gated).
+    # Without one there's no concept to be selective for, so fall back
+    # to raw per-token max activation.
+    concept_info: Optional[List[dict]] = None
+    if label_map is not None:
+        margins, concept_info = concept_selectivity_scores(
+            z, grid_size, label_map, id_to_name, min_percentile=args.min_percentile
+        )
+        scores, score_label = torch.from_numpy(margins), "concept margin"
+        n_eligible = int(np.isfinite(margins).sum())
+        n_gated = scores.numel() - n_eligible
+        if not args.quiet and n_gated:
+            print(f"[viz] {n_gated}/{scores.numel()} features gated out (dead-on-this-image or "
+                  f"below their own p{args.min_percentile:.0f} magnitude threshold) -- excluded from ranking.")
+        k = min(args.top_k, n_eligible)
+    else:
+        scores, score_label = _amax_scores, "max activation"
+        k = min(args.top_k, scores.numel())
+
+    if k == 0:
+        print(f"[viz] SKIPPED {stem!r}: no eligible features (all gated) for source={args.source}.")
+        return
+
+    top_scores, top_idx = torch.topk(scores, k=k)
+    top_features = [
+        {"feature_idx": int(i), "score": float(s)}
+        for i, s in zip(top_idx.tolist(), top_scores.tolist())
+    ]
+
+    if not args.quiet:
+        print(f"[viz] top {k} features for {stem} (source={args.source}, grid={grid_size}x{grid_size}, "
+              f"ranked by {score_label}):")
+        print_top_features(top_features)
+
     os.makedirs(args.output_dir, exist_ok=True)
     thumbnails: List[Tuple[str, Image.Image]] = []
     feature_report = []
@@ -326,10 +395,9 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
         thumb = make_feature_thumbnail(base_image, z, fi, grid_size)
         thumbnails.append((f"#{rank} feat {fi} ({feat['score']:.3f})", thumb))
 
-        entry = {"rank": rank, "feature_idx": fi, "score": feat["score"]}
-        if label_map is not None:
-            heat = feature_heatmap(z, fi, grid_size)
-            entry["semantic_classes"] = semantic_labels_for_heatmap(heat, label_map, id_to_name)
+        entry = {"rank": rank, "feature_idx": fi, "score": feat["score"], "score_type": score_label}
+        if concept_info is not None:
+            entry["concept_selectivity"] = concept_info[fi]
         feature_report.append(entry)
 
     grid_img = build_grid_image(thumbnails, cols=args.cols)
@@ -356,14 +424,14 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query):
     print(f"[viz] saved report     -> {json_path}")
 
     if label_map is not None and not args.quiet:
-        print("[viz] top semantic class per feature:")
+        print("[viz] top concept per feature (margin = top concept mean - 2nd concept mean):")
         for entry in feature_report:
-            classes = entry.get("semantic_classes", [])
-            if classes:
-                top_cls = classes[0]
+            sel = entry.get("concept_selectivity")
+            if sel:
                 print(f"  feature {entry['feature_idx']:>5}: "
-                      f"{top_cls['class_name']:<20} "
-                      f"({top_cls['fraction_of_hot_patches']*100:.0f}% of hot patches)")
+                      f"{sel['top_concept']:<20} "
+                      f"(top_mean={sel['top_concept_mean']:.3f}, margin={sel['margin']:.3f}, "
+                      f"2nd={sel['second_concept']})")
 
 
 def main():
