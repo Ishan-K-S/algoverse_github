@@ -895,12 +895,23 @@ def train_universal_sae(
                 getattr(model, attr).mul_(0.95).add_(0.05 * usage_now)
 
         if use_wandb and WANDB_AVAILABLE and (batch_idx % log_every == 0):
+            latent_align_loss_unweighted = (latent_align_loss / max(n_align_pairs, 1)).item()
             log_dict = {
                 "train/total_loss": loss_value,
                 "train/total_loss_ema": ema_loss,
                 "train/sae_loss": sae_loss.item() if sae_loss is not None else 0.0,
-                "train/latent_align_loss": (latent_align_loss / max(n_align_pairs, 1)).item(),
-                "train/source_model": source,
+                # Unweighted per-pair average (what was previously logged as
+                # "train/latent_align_loss") and its actual contribution to the
+                # objective (multiplied by latent_align_weight) -- these differ by
+                # exactly latent_align_weight and were previously conflated under
+                # one unweighted name.
+                "train/latent_align_loss_unweighted": latent_align_loss_unweighted,
+                "train/latent_align_loss_weighted": latent_align_weight * latent_align_loss_unweighted,
+                # model.model_names has a fixed order set at construction, so this
+                # index is stable across the run. Replaces the previous string-valued
+                # "train/source_model", which wandb stores as non-numeric and cannot
+                # render on a line chart.
+                "train/source_model_idx": model.model_names.index(source),
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
                 "train/in_curriculum": float(in_curriculum),
@@ -914,7 +925,10 @@ def train_universal_sae(
                 log_dict[f"train/loss_{safe_key}"] = value
 
             with torch.no_grad():
-                log_dict["train/latent_sparsity"] = (z == 0).float().mean().item()
+                # train/latent_sparsity used to be logged here. TopK guarantees exactly
+                # top_k nonzeros per token always, so (z == 0).float().mean() is the
+                # constant (latent_dim - top_k) / latent_dim for the entire run --
+                # zero information. Removed rather than fixed, per REPAIR_PLAN.md V11.
                 attn_loss = attention_component_loss(model)
                 if attn_loss is not None:
                     log_dict["train/attention_component_loss"] = attn_loss.item()
@@ -928,9 +942,11 @@ def train_universal_sae(
                     for name in dir(model) if name.startswith("_usage_ema_")
                 }
                 if len(ema_attrs) >= 2:
-                    # Threshold: feature is "used" if EMA firing rate > 1e-3
-                    # (i.e. fires on at least 0.1% of tokens averaged over recent batches).
-                    used_per_model = {n: (e > 1e-3) for n, e in ema_attrs.items()}
+                    # Threshold: feature is "used" if EMA firing rate exceeds the same
+                    # threshold the dead-feature resampler uses, so this diagnostic and
+                    # the resampler agree on what "dead" means (previously hardcoded to
+                    # 1e-3 here, decoupled from resample_dead_threshold).
+                    used_per_model = {n: (e > resample_dead_threshold) for n, e in ema_attrs.items()}
                     model_names = sorted(used_per_model.keys())
                     used_stack = torch.stack([used_per_model[n] for n in model_names])  # (M, K)
 
@@ -949,14 +965,27 @@ def train_universal_sae(
 
                     # Partition score: max exclusive count / shared count.
                     # >1.0 means more features are exclusive to some model than shared.
+                    # used_by_all == 0 (total partitioning -- the exact failure this
+                    # metric exists to detect) used to silently fall back to dividing by
+                    # 1, jumping the metric's units from a ratio to a raw count instead
+                    # of reporting the undefined value it actually is.
                     max_excl = max(
                         log_dict[f"partition/used_by_{n}_only"] for n in model_names
                     )
-                    log_dict["partition/score"] = max_excl / max(used_by_all, 1)
+                    if used_by_all > 0:
+                        log_dict["partition/score"] = max_excl / used_by_all
+                    elif max_excl > 0:
+                        log_dict["partition/score"] = float("inf")
+                    else:
+                        log_dict["partition/score"] = float("nan")
 
                     # Per-feature firing-rate cosine across models — continuous
                     # version of frac_shared. 1 = identical usage profile,
-                    # 0 = orthogonal (disjoint feature sets).
+                    # 0 = orthogonal (disjoint feature sets). Bounded in [0,1] since
+                    # both inputs are non-negative firing rates, so it saturates high
+                    # whenever a handful of near-always-on features are shared even if
+                    # the rest of the dictionary is poorly shared -- see the
+                    # mean-centered version below for a metric that can go negative.
                     if len(model_names) == 2:
                         e0 = ema_attrs[model_names[0]]
                         e1 = ema_attrs[model_names[1]]
@@ -964,6 +993,30 @@ def train_universal_sae(
                             e0.unsqueeze(0), e1.unsqueeze(0)
                         ).item()
                         log_dict[f"partition/usage_cosine_{model_names[0]}_vs_{model_names[1]}"] = cos
+
+                        # Mean-centered cosine: subtracts each model's own mean usage
+                        # rate first, so features that are merely "on for everything"
+                        # in both models no longer inflate the score. Can be negative
+                        # (anti-correlated usage), unlike the raw cosine above.
+                        e0c = e0 - e0.mean()
+                        e1c = e1 - e1.mean()
+                        cos_centered = torch.nn.functional.cosine_similarity(
+                            e0c.unsqueeze(0), e1c.unsqueeze(0)
+                        ).item()
+                        log_dict[
+                            f"partition/usage_cosine_centered_{model_names[0]}_vs_{model_names[1]}"
+                        ] = cos_centered
+
+                        # Jaccard of the thresholded used-sets: fraction of the union
+                        # of "used by either model" that's also "used by both" --
+                        # unlike the cosine above, this only credits features that
+                        # actually cross the same used/unused threshold in both models.
+                        u0, u1 = used_per_model[model_names[0]], used_per_model[model_names[1]]
+                        union = (u0 | u1).sum().item()
+                        jaccard = (u0 & u1).sum().item() / union if union > 0 else float("nan")
+                        log_dict[
+                            f"partition/usage_jaccard_{model_names[0]}_vs_{model_names[1]}"
+                        ] = jaccard
 
             wandb.log(log_dict, step=global_step_actual)
 
