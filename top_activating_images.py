@@ -654,7 +654,7 @@ def main():
 
     checkpoint = args.checkpoint
 
-    if not os.path.isfile(checkpoint):
+    if checkpoint is None or not os.path.isfile(checkpoint):
         checkpoint = find_latest_checkpoint(WEIGHTS_DIR)
 
     coco_labels = None

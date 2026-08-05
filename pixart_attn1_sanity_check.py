@@ -2,12 +2,26 @@
 attn2 (cross-attention to the null prompt) fix PixArt's flat/uniform
 per-patch activations?
 
-The existing cache was built with the old attn2 hook, so this runs
-PixArtActivationExtractor fresh on a single raw image (bypassing the cache
-entirely) and feeds the resulting (T, N, D) activations through the same
-localization diagnostic as pixart_timestep_autopsy.py. DinoV2's reference
-activation is reused from the existing combined cache since its extraction
-is unaffected by this change.
+CORRECTION (REPAIR_PLAN.md V8): this script's original premise was that the
+existing cache was built with an attn2-only hook and this script tests
+switching to attn1. That premise is false -- `PixArtActivationExtractor
+.extract_activations` has always hooked the *entire last block*
+(`self._get_last_block()`, full post-attn1 + post-attn2 + post-FF residual
+stream) for every commit in this repo's history. `HOOK_ATTN_NAME` is set on
+the extractor and asserted below, but it is dead code for PixArt: the
+PixArt-specific override never reads it. So the "fresh extraction" this
+script performs is NOT an attn1-only ablation -- it hooks the same full
+block the existing cache already hooks. The only thing this script actually
+tests is whether a single fresh raw-image extraction (bypassing the cache)
+differs from what's in the cache, e.g. due to preprocessing differences. Any
+verdict below phrased in terms of "attn1 vs attn2" should not be trusted;
+treat this script as informative only about fresh-vs-cached extraction
+consistency until PixArtActivationExtractor is changed to actually respect
+HOOK_ATTN_NAME (out of scope for this correction -- it touches the
+extraction pipeline that produced every existing cache).
+
+DinoV2's reference activation is reused from the existing combined cache
+since its extraction is unaffected by any of this.
 
 Example:
     python pixart_attn1_sanity_check.py --stem 000000562818 \
@@ -159,12 +173,16 @@ def main():
           f"mean_pairwise_cos={ref_raw['mean_pairwise_cos']:.3f}  "
           f"channel_peakiness={ref_raw['channel_peakiness']:.2f}\n")
 
-    # ---- PixArt: extract fresh, with the attn1 hook ----
+    # ---- PixArt: extract fresh (NOT an attn1-only ablation -- see module docstring, V8) ----
     print("[sanity] loading PixArt pipeline (this takes a while)...")
     extractor = PixArtActivationExtractor(device=args.device, num_inference_steps=args.num_inference_steps)
+    # NOTE (V8): HOOK_ATTN_NAME is dead code for PixArt -- extract_activations always hooks
+    # the full last block regardless of this value. This assert checks the attribute exists
+    # and equals "attn1", NOT that extraction is actually attn1-only. Kept only so a future
+    # change to HOOK_ATTN_NAME's default doesn't silently change this script's (already
+    # limited) meaning further.
     assert extractor.HOOK_ATTN_NAME == "attn1", (
-        f"Expected PixArtActivationExtractor.HOOK_ATTN_NAME == 'attn1', got {extractor.HOOK_ATTN_NAME!r}. "
-        "Did the patch land?"
+        f"Expected PixArtActivationExtractor.HOOK_ATTN_NAME == 'attn1', got {extractor.HOOK_ATTN_NAME!r}."
     )
 
     x = extractor.preprocess(base_image).unsqueeze(0)
@@ -252,9 +270,7 @@ def main():
 
     # ---- Verdict ----
     # peakiness has a mathematical floor of 1.0 (max_token/mean_token >= 1), so
-    # compare excess-over-uniform rather than the raw value -- see the bug in
-    # pixart_timestep_autopsy.py's ref_thresh (0.5 * ref_peak can fall below the
-    # floor and make its middle branch unreachable).
+    # compare excess-over-uniform rather than the raw value.
     ref_thresh = 1.0 + 0.5 * (ref_peak - 1.0)
     best_mean = best["peak_mean"]
     best_raw = best["raw"]
@@ -276,15 +292,18 @@ def main():
 
     if sae_localizes:
         verdict = ("IMPROVED: mean-ranked (real usage) features now localize close to the "
-                   "DinoV2 baseline -- the attn2->attn1 hook change looks like the fix. "
-                   "Proceed to re-cache PixArt with this hook and re-run cross-recon.")
+                   "DinoV2 baseline. NOTE: this is NOT evidence that attn1 differs from attn2 "
+                   "(see module docstring, V8) -- it means this fresh single-image extraction "
+                   "differs from what's in the existing cache for some other reason (e.g. "
+                   "preprocessing). Investigate that difference before drawing conclusions.")
     elif raw_carries_signal:
         # Note: spatial_align.py is a no-op for PixArt specifically (it's the
         # alignment target -- SpatialAligner.align() returns x unchanged when
         # g_src == g_tgt), so it's already ruled out. See the tide-check block
         # above for whether TIDE is the mechanism; if not, suspect the SAE's
         # W_enc/b_pre training for PixArt (e.g. latent_align_weight too low).
-        verdict = ("SAE ISSUE: the raw attn1 activation is NOT token-invariant "
+        verdict = ("SAE ISSUE: the raw activation (full block, not attn1-only -- see module "
+                   "docstring, V8) is NOT token-invariant "
                    f"(mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f} vs DinoV2's "
                    f"{ref_raw['mean_pairwise_cos']:.3f}) -- real per-patch structure exists "
                    "upstream, but the trained SAE encoder for PixArt collapses it. "
@@ -295,8 +314,9 @@ def main():
         verdict = ("REAL UPSTREAM FAILURE: even the raw, pre-SAE activation is nearly "
                    f"token-invariant (mean_pairwise_cos={best_raw['mean_pairwise_cos']:.3f}, "
                    f"channel_peakiness={best_raw['channel_peakiness']:.2f}, both close to the "
-                   "no-signal floor). Neither attn1 nor attn2 carries per-patch identity at "
-                   f"block depth_frac={PixArtActivationExtractor.HOOK_DEPTH_FRAC:.3f}. Try a "
+                   "no-signal floor). The full block's residual stream (attn1+attn2+FF, this "
+                   "extractor's actual hook point -- see module docstring, V8) carries no "
+                   f"per-patch identity at block depth_frac={PixArtActivationExtractor.HOOK_DEPTH_FRAC:.3f}. Try a "
                    "shallower/later block depth, or treat this as a genuine PixArt/DiT "
                    "limitation and swap to SD-Turbo/SD1.5.")
     print(f"\n[verdict] {verdict}")

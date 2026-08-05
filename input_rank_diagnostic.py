@@ -75,7 +75,7 @@ def main():
     from pixart_timestep import resolve_pixart_timestep
 
     print(f"[rank] loading ckpt: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     with open(args.config) as f:
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
@@ -164,18 +164,22 @@ def main():
     pr_d = results["DinoV2"]["participation_ratio"]
     pr_p = results["PixArt"]["participation_ratio"]
     if pr_p < 0.3 * pr_d:
-        print(f"  PixArt input is ~{pr_d/pr_p:.1f}x lower-rank than DinoV2's.")
+        # pr_p can be exactly 0.0 on total collapse (effective_rank's empty-singular-value
+        # case) -- this is the exact condition this branch exists to detect, so guard the
+        # division instead of crashing on it.
+        ratio_str = f"~{pr_d / pr_p:.1f}x" if pr_p > 0 else "fully collapsed (participation_ratio=0)"
+        print(f"  PixArt input is {ratio_str} lower-rank than DinoV2's.")
         print("  The encoder collapse is UPSTREAM of the SAE — PixArt activations")
-        print("  themselves are low-rank, probably due to single-timestep training")
-        print("  or standardization stats computed across mismatched timesteps.")
+        print("  themselves are low-rank, probably due to standardization stats computed")
+        print("  across mismatched timesteps, or DinoV2/PixArt not seeing the same pixels")
+        print("  (different resize/crop preprocessing).")
         print()
         print("  Fixes (in priority order):")
-        print("    1. Train on RANDOM timesteps, not just the last. Set t_idx=random in")
-        print("       _pick_diffusion_slice instead of total_steps-1.")
-        print("    2. Recompute standardization stats USING ONLY the timestep you train on.")
+        print("    1. Recompute standardization stats USING ONLY the timestep you train on.")
+        print("    2. Unify DinoV2/PixArt preprocessing so both see the same pixels.")
         print("    3. Set use_tide=true so sigma conditioning at least varies the encoder")
-        print("       (only helps if you also vary timestep).")
-    elif results["PixArt"]["X_per_feature_std" if False else "rank_90"] > 0.5 * results["PixArt"]["D"]:
+        print("       (only helps if fixed_timestep_idx is later swept, not with a single t).")
+    elif results["PixArt"]["rank_90"] > 0.5 * results["PixArt"]["D"]:
         print("  PixArt input has comparable rank to DinoV2 — the collapse is in the")
         print("  encoder/optimization, not the data. Fix at the encoder side:")
         print("    1. Tied/shared decoder architecture.")

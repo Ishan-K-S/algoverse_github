@@ -23,6 +23,7 @@ from top_activating_images import (
     WEIGHTS_DIR,
     FeaturePoolMode,
     build_coco_label_lookup,
+    build_spatial_aligner,
     coco_annotation_path,
     discover_stems,
     find_latest_checkpoint,
@@ -397,6 +398,14 @@ def main():
     diffusion_models = set(cfg.get("global", {}).get("diffusion_models", []))
     is_diffusion = args.source in diffusion_models
 
+    # Checkpoint's own spatial_align_to wins over live config.yaml (V12), matching
+    # top_activating_images.py's main(). Without this, act stays at its native grid
+    # (e.g. PixArt's 32x32) instead of the pooled grid the SAE was trained on
+    # (e.g. 16x16), and infer_grid_size below silently reports the wrong coordinate
+    # system for every masked-patch index.
+    eval_g = getattr(model, "_training_global", cfg.get("global", {}))
+    spatial_aligner = build_spatial_aligner({"global": eval_g, "model_zoo": cfg.get("model_zoo", {})})
+
     act, sigma = load_activation_for_image(
         args.cache_root,
         stem,
@@ -404,8 +413,26 @@ def main():
         is_diffusion,
         args.timestep_idx,
         args.use_cls,
-        training_global=getattr(model, "_training_global", None),
+        spatial_aligner=spatial_aligner,
+        training_global=eval_g,
     )
+
+    # Standardize, matching top_activating_images.compute_top_activations. The SAE
+    # was trained on standardized inputs; feeding it raw activations puts every
+    # token far outside the distribution b_pre/W_enc were fit to.
+    standardization_stats = getattr(model, "_standardization_stats", None)
+    if standardization_stats is None or args.source not in standardization_stats:
+        raise ValueError(
+            "This tool requires standardization statistics saved in the checkpoint. "
+            "Use a newly trained checkpoint; old checkpoints cannot be evaluated reliably."
+        )
+    stats = standardization_stats[args.source]
+    mean = torch.as_tensor(stats["mean"], dtype=act.dtype)
+    std = torch.as_tensor(stats["std"], dtype=act.dtype)
+    if act.shape[-1] != mean.numel() or mean.shape != std.shape:
+        raise ValueError(f"Invalid standardization stats for source {args.source!r}.")
+    act = (act - mean) / (std + 1e-5)
+
     grid_size = infer_grid_size(act.shape[0])
     patch_indices, mask_sources = build_mask_indices(args, stem, grid_size)
     if not patch_indices:
