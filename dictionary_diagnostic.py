@@ -56,7 +56,7 @@ OUT_PATH        = "/content/dict_diag.npz"
 PLOT_PATH       = "/content/dict_diag.png"
 N_IMAGES        = 2000
 TOP_K           = 64
-PIXART_TIMESTEP = -1
+PIXART_TIMESTEP = None   # None = take it from the checkpoint, see pixart_timestep.py
 DEVICE          = "cuda"
 DRIVE_SAVE_DIR  = "/content/drive/MyDrive/DictionaryDiagnosticResults"
 # --------------------
@@ -75,7 +75,8 @@ def _parse_args():
                    help="Path to the algoverse repo (added to sys.path). Default: dirname(config).")
     p.add_argument("--n_images",        type=int,   default=N_IMAGES,        help="How many images to analyze")
     p.add_argument("--top_k",           type=int,   default=TOP_K,           help="K for the Jaccard scoring comparison")
-    p.add_argument("--pixart_timestep", type=int,   default=PIXART_TIMESTEP, help="Which diffusion timestep to use")
+    p.add_argument("--pixart_timestep", type=int,   default=PIXART_TIMESTEP,
+                   help="Override the diffusion timestep. Defaults to whatever the checkpoint trained on.")
     p.add_argument("--device",                      default=DEVICE)
     p.add_argument("--out",                         default=OUT_PATH,        help="Where to save raw arrays")
     p.add_argument("--plot",                        default=PLOT_PATH,       help="Where to save the diagnostic plot")
@@ -87,6 +88,12 @@ def _parse_args():
 # -----------------------------------------------------------------------------
 
 def _mount_drive(retries: int = 3) -> bool:
+    # If Drive is already mounted, return immediately without calling
+    # drive.mount(). That call needs the notebook kernel's message channel and
+    # fails in a subprocess with "'NoneType' object has no attribute 'kernel'",
+    # which silently turned every Drive upload into a no-op.
+    if os.path.isdir("/content/drive/MyDrive"):
+        return True
     try:
         from google.colab import drive as _colab_drive
     except ImportError:
@@ -147,6 +154,7 @@ def main():
     from data import CocoActivationDataset
     from universal_sae import UniversalSAE
     from spatial_align import build_spatial_aligner_from_config
+    from pixart_timestep import resolve_pixart_timestep
 
     device = args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
 
@@ -200,6 +208,11 @@ def main():
         use_class_tokens=bool(g_file.get("use_class_tokens", False)),
         return_metadata=True,
         diffusion_models=list(model.diffusion_models),
+        # Reuse the exact stats the model was trained with. Recomputing them here
+        # means reading 1000 npz files before the diagnostic even starts, which on
+        # a Drive-mounted cache is hours. It's also more correct: standardising
+        # eval data with different stats than training used shifts every code.
+        standardization_stats=ckpt.get("standardization_stats"),
     )
     n_use = min(args.n_images, len(ds))
     print(f"[diag] analyzing {n_use}/{len(ds)} images")
@@ -228,9 +241,13 @@ def main():
             x_dino = acts["DinoV2"].to(device).unsqueeze(0).float()
             x_pix_full = acts["PixArt"].to(device).float()
 
-            # Pick the same timestep as eval
+            # Score at the timestep the model was actually trained on
             T = x_pix_full.shape[0]
-            t_idx = args.pixart_timestep if args.pixart_timestep >= 0 else T + args.pixart_timestep
+            t_idx = resolve_pixart_timestep(
+                T, ckpt=ckpt, config_global=g_file, override=args.pixart_timestep
+            )
+            if i == 0:
+                print(f"[diag] PixArt timestep {t_idx} of {T}")
             x_pix = x_pix_full[t_idx].unsqueeze(0)
 
             sig_map = meta.get("sigmas_by_model", {})

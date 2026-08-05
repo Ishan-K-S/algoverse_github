@@ -12,6 +12,7 @@ Combined npz keys:  <MODEL> (N,D or T,N,D),  <MODEL>__sigmas (T,),  <MODEL>__tim
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import yaml
 import shutil
@@ -29,7 +30,6 @@ from spatial_align import build_spatial_aligner_from_config
 # ---------------------------------------------------------------------------
 # wandb setup
 # ---------------------------------------------------------------------------
-WANDB_API_KEY = "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" 
 
 try:
     import wandb
@@ -43,10 +43,8 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     """
     Initialize a wandb run. Returns True if successful.
 
-    The API key is read from (in priority order):
-      1. WANDB_API_KEY constant at the top of this file
-      2. WANDB_API_KEY environment variable (set externally)
-      3. wandb's own stored credentials (~/.netrc / wandb login)
+    Authentication is delegated to WANDB_API_KEY in the environment, a Colab
+    secret, or wandb's own stored credentials. Never commit API keys here.
     """
     if not WANDB_AVAILABLE:
         return False
@@ -55,9 +53,6 @@ def _init_wandb(cfg: Dict[str, Any], run_name: str) -> bool:
     if not bool(global_cfg.get("use_wandb", True)):
         print("[wandb] Disabled via config (use_wandb: false).")
         return False
-
-    if WANDB_API_KEY:
-        os.environ["WANDB_API_KEY"] = WANDB_API_KEY
 
     wandb_project = global_cfg.get("wandb_project", "universal-sae")
     wandb_entity = global_cfg.get("wandb_entity", None)
@@ -103,6 +98,30 @@ def _require_nonempty(cfg: Dict[str, Any], key: str) -> str:
     if v is None or (isinstance(v, str) and len(v.strip()) == 0):
         raise ValueError(f"CONFIG.global.{key} is empty. Please set it in config.yaml.")
     return str(v)
+
+
+def _code_version() -> str:
+    """Short git hash of the code that produced a run, '-dirty' if uncommitted.
+
+    We had no way to tell which commit a checkpoint came from, so a run that
+    looked wrong could not be traced back to the code that made it.
+    """
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo, capture_output=True, text=True, timeout=5,
+        )
+        if head.returncode != 0:
+            return "unknown"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo, capture_output=True, text=True, timeout=5,
+        )
+        suffix = "-dirty" if dirty.stdout.strip() else ""
+        return head.stdout.strip() + suffix
+    except Exception:
+        return "unknown"
 
 
 def _parse_int_field(x: Any, name: str) -> int:
@@ -164,9 +183,17 @@ if __name__ == "__main__":
     print(f"[config] Diffusion models : {diffusion_models}")
 
     # ----- Run name -----
+    # run_name comes straight from the config values, so if two of us run the same config
+    # we get the same name. The runs stay separate in wandb but the checkpoint artifacts
+    # are named f"{run_name}_epoch_{n}", so they all stack up as versions of one collection
+    # and you can't tell whose weights are whose. run_tag keeps them apart.
     run_name_template = CONFIG.get("run_name", "usae_run")
     run_name = _expand_run_name(run_name_template, sources, CONFIG, SAE_PARAMS)
+    run_tag = str(CONFIG.get("run_tag", "") or "").strip()
+    if run_tag:
+        run_name = f"{run_name}_{run_tag}"
     CONFIG["run_name"] = run_name
+    print(f"[config] Run name         : {run_name}")
 
     # ----- wandb -----
     use_wandb = _init_wandb(cfg, run_name)
@@ -184,6 +211,7 @@ if __name__ == "__main__":
         use_class_tokens=bool(CONFIG.get("use_class_tokens", True)),
         return_metadata=combined_npz,
         diffusion_models=list(diffusion_models),
+        stats_seed=CONFIG.get("stats_seed"),
     )
 
     # Optionally recompute standardisation stats with a configured sample size
@@ -195,7 +223,7 @@ if __name__ == "__main__":
         dataset,
         batch_size=_parse_int_field(CONFIG.get("batch_size", 32), "CONFIG.global.batch_size"),
         shuffle=True,
-        # num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
+        num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
         pin_memory=True,
     )
     print(f"[uni_demo] Dataset size  : {len(dataset)} images")
@@ -311,6 +339,13 @@ if __name__ == "__main__":
             latent_align_mode=str(
                 SAE_PARAMS.get("latent_align_mode", CONFIG.get("latent_align_mode", "per_token"))
             ),
+            self_weight=float(SAE_PARAMS.get("self_weight", CONFIG.get("self_weight", 1.0))),
+            cross_weight=float(SAE_PARAMS.get("cross_weight", CONFIG.get("cross_weight", 1.0))),
+            fixed_timestep_idx=(
+                None if CONFIG.get("fixed_timestep_idx", None) is None
+                else int(CONFIG["fixed_timestep_idx"])
+            ),
+            pre_topk_align_weight=float(SAE_PARAMS.get("pre_topk_align_weight", CONFIG.get("pre_topk_align_weight", 0.0))),
             resample_dead=bool(SAE_PARAMS.get("resample_dead", CONFIG.get("resample_dead", False))),
             resample_interval=int(SAE_PARAMS.get("resample_interval", 500)),
             resample_dead_threshold=float(SAE_PARAMS.get("resample_dead_threshold", 1e-3)),
@@ -348,6 +383,21 @@ if __name__ == "__main__":
                     "model_tokens_native": model_tokens,       # pre-alignment
                     "spatial_align_to": CONFIG.get("spatial_align_to", None),
                     "latent_dim": latent_dim,
+                    # Enough to identify what produced this checkpoint. The full
+                    # config is above; this is the part config.yaml can't tell you.
+                    "manifest": {
+                        "code_version": _code_version(),
+                        "cache_root": CONFIG.get("path_to_cache"),
+                        "n_images": len(dataset),
+                        "fixed_timestep_idx": CONFIG.get("fixed_timestep_idx"),
+                    },
+                    "standardization_stats": {
+                        source: {
+                            "mean": values["mean"].detach().cpu(),
+                            "std": values["std"].detach().cpu(),
+                        }
+                        for source, values in getattr(dataset, "standardization_stats", {}).items()
+                    },
                 },
                 ckpt_path,
             )

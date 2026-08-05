@@ -1,2 +1,5 @@
 .claude/worktrees/funny-hofstadter-276acc/
 CLAUDE.md
+__pycache__/
+.ipynb_checkpoints/
+*.pyc

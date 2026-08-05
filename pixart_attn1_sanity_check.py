@@ -74,18 +74,13 @@ def raw_token_stats(x: torch.Tensor) -> dict:
     return {"mean_pairwise_cos": mean_pairwise_cos, "channel_peakiness": channel_peakiness}
 
 
-def standardize_tokens(x: torch.Tensor) -> torch.Tensor:
-    """Per-channel z-score across the token dimension of a single (N, D) activation.
-
-    Approximates CocoActivationDataset's standardize=True step (data.py), which the
-    SAE was actually trained on. Fresh activations from the extractor are raw-scale;
-    feeding them into model.encode() unstandardized can produce meaningless output
-    regardless of whether real spatial signal exists, independent of any attn1/attn2
-    or TIDE question.
-    """
-    mean = x.mean(dim=0, keepdim=True)
-    std = x.std(dim=0, keepdim=True)
-    return (x - mean) / (std + EPS)
+def standardize_tokens(x: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Apply the exact PixArt standardization statistics used for training."""
+    mean = torch.as_tensor(stats["mean"], dtype=x.dtype, device=x.device)
+    std = torch.as_tensor(stats["std"], dtype=x.dtype, device=x.device)
+    if mean.ndim != 1 or mean.shape != std.shape or mean.numel() != x.shape[-1]:
+        raise ValueError("Checkpoint PixArt standardization stats do not match fresh activations.")
+    return (x - mean) / (std + 1e-5)
 
 
 def parse_args():
@@ -122,17 +117,26 @@ def main():
 
     model, model_tokens_native = load_checkpoint(ckpt_path, cfg)
     model.eval().to(args.device)
-    aligner = build_spatial_aligner_from_config(g, model_tokens_native)
+    eval_g = getattr(model, "_training_global", g)
+    pixart_stats = getattr(model, "_standardization_stats", None)
+    if pixart_stats is None or "PixArt" not in pixart_stats:
+        raise ValueError(
+            "This sanity check requires a checkpoint with persisted PixArt "
+            "standardization statistics. Retrain or migrate the checkpoint first."
+        )
+    aligner = build_spatial_aligner_from_config(eval_g, model_tokens_native)
 
     # ---- DinoV2 reference: reused from the existing cache (unaffected by this change) ----
     ds = CocoActivationDataset(
         cache_root=args.cache_root,
         sources=[args.ref_source],
         combined_npz=True,
-        standardize=bool(g.get("standardize", True)),
+        standardize=bool(eval_g.get("standardize", True)),
         return_metadata=True,
         diffusion_models=[],
         use_class_tokens=False,
+        standardization_stats=getattr(model, "_standardization_stats", None),
+        stats_seed=eval_g.get("stats_seed", 0),
     )
     stem = resolve_stem(args.stem, ds.stems)
     (acts, _meta), _ = ds[ds.stems.index(stem)]
@@ -183,7 +187,7 @@ def main():
     best = {"peak_localized": -1.0, "t": None}
     for t in range(T):
         sigma_t = torch.tensor([sigmas[t]], device=args.device)
-        a_t_std = standardize_tokens(a[t])
+        a_t_std = standardize_tokens(a[t], pixart_stats["PixArt"])
         z_t = encode_slice(model, a_t_std.unsqueeze(0), "PixArt", sigma_t, aligner, args.device)
         grid = infer_grid_size(z_t.shape[1])
         stats = localization(z_t)

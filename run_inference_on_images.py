@@ -30,6 +30,7 @@ from inference import print_top_features
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config
 from data import CocoActivationDataset
+from pixart_timestep import resolve_pixart_timestep
 from top_activating_images import (
     build_coco_label_lookup,
     coco_annotation_path,
@@ -93,7 +94,8 @@ def feature_scores(model, acts, meta, source, diffusion_models, aligner, device)
     """Encode one image's activations -> (per-feature score vector, raw latents).
 
     Score = mean |latent| over batch and tokens, matching inference._score_latents.
-    Handles diffusion sources by selecting the final timestep and passing its sigma.
+    Diffusion sources are sliced to the timestep the checkpoint trained on and
+    scored with that timestep's sigma.
     """
     if source not in acts:
         raise KeyError(f"Source '{source}' not in loaded activations {list(acts)}. "
@@ -106,7 +108,9 @@ def feature_scores(model, acts, meta, source, diffusion_models, aligner, device)
             sig = meta.get("sigmas")
         if sig is None:
             raise ValueError(f"Diffusion source '{source}' has no sigmas in metadata.")
-        t_idx = x.shape[1] - 1  # final timestep, matches timestep_idx=-1 elsewhere
+        t_idx = resolve_pixart_timestep(
+            x.shape[1], config_global=getattr(model, "_training_global", None)
+        )
         sigma = sig.to(device).view(-1)[t_idx].view(1)
         x = x[:, t_idx]  # -> (1,N,D)
     if aligner is not None:
@@ -141,31 +145,46 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     g = cfg["global"]
-    diffusion_models = set(ckpt.get("diffusion_models", g.get("diffusion_models", [])))
+    saved_cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+    saved_global = saved_cfg.get("global", {})
+    saved_sae = saved_cfg.get("sae_params", {})
+    diffusion_models = set(ckpt.get("diffusion_models", saved_global.get("diffusion_models", g.get("diffusion_models", []))))
 
     model = UniversalSAE(
         model_dims=ckpt["model_dims"],
         latent_dim=ckpt["latent_dim"],
         diffusion_models=diffusion_models,
         model_tokens=ckpt["model_tokens"],
-        top_k=int(cfg["sae_params"].get("top_k", 64)),
-        cls_pool_mode=str(g.get("cls_pool_mode", "none")),
-        use_tide=bool(g.get("use_tide", False)),
+        top_k=int(saved_sae.get("top_k", cfg["sae_params"].get("top_k", 64))),
+        cls_pool_mode=str(saved_global.get("cls_pool_mode", g.get("cls_pool_mode", "none"))),
+        use_tide=bool(saved_global.get("use_tide", g.get("use_tide", False))),
+        timestep_dim=int(saved_global.get("timestep_dim", g.get("timestep_dim", 256))),
     )
-    model.load_state_dict(ckpt["state_dict"], strict=False)
+    missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint architecture does not match its saved configuration: "
+            f"missing={len(missing)}, unexpected={len(unexpected)}."
+        )
     model.eval().to(args.device)
 
-    aligner = build_spatial_aligner_from_config(g, ckpt["model_tokens_native"])
+    eval_g = {**g, **saved_global}
+    # Ride along on the model so feature_scores can pick the training timestep
+    # without threading the config through every call.
+    model._training_global = eval_g
+    aligner = build_spatial_aligner_from_config(eval_g, ckpt.get("model_tokens_native", ckpt["model_tokens"]))
 
     # ---- Load dataset ----
     ds = CocoActivationDataset(
         cache_root=args.cache_root,
         sources=args.sources,
         combined_npz=True,
-        standardize=bool(g.get("standardize", True)),
+        standardize=bool(eval_g.get("standardize", True)),
         return_metadata=True,
         diffusion_models=[s for s in args.sources if s in diffusion_models],
         use_class_tokens=False,
+        standardization_stats=ckpt.get("standardization_stats"),
+        stats_seed=eval_g.get("stats_seed", 0),
     )
     stem_to_idx = {stem: i for i, stem in enumerate(ds.stems)}
 

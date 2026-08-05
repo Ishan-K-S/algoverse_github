@@ -111,6 +111,8 @@ class CocoActivationDataset(Dataset):
         use_class_tokens: bool = True,
         return_metadata: bool = False,
         diffusion_models: Optional[List[str]] = None,
+        standardization_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+        stats_seed: Optional[int] = None,
     ):
         super().__init__()
 
@@ -122,6 +124,7 @@ class CocoActivationDataset(Dataset):
         self.use_class_tokens = use_class_tokens
         self.return_metadata = return_metadata
         self.diffusion_models = set(diffusion_models or [])
+        self.stats_seed = stats_seed
 
         # ------------------------------------------------------------------ #
         # Discover image stems from existing cache files.
@@ -165,7 +168,12 @@ class CocoActivationDataset(Dataset):
         # Standardisation stats
         # ------------------------------------------------------------------ #
         if standardize:
-            self._compute_standardization_stats()
+            if standardization_stats is None:
+                self._compute_standardization_stats()
+            else:
+                self.standardization_stats = self._validate_standardization_stats(
+                    standardization_stats
+                )
 
     # ---------------------------------------------------------------------- #
     # Standardisation helpers
@@ -184,7 +192,8 @@ class CocoActivationDataset(Dataset):
         self.standardization_stats: Dict[str, Dict[str, torch.Tensor]] = {}
 
         sample_size = min(sample_size, len(self.stems))
-        sample_indices = np.random.choice(len(self.stems), sample_size, replace=False)
+        rng = np.random.default_rng(self.stats_seed)
+        sample_indices = rng.choice(len(self.stems), sample_size, replace=False)
 
         for source in self.sources:
             print(f"[stats] Computing standardisation stats for {source} …")
@@ -234,6 +243,38 @@ class CocoActivationDataset(Dataset):
 
             self.standardization_stats[source] = {"mean": mean, "std": std}
             print(f"  [{source}] mean.shape={tuple(mean.shape)}  std.shape={tuple(std.shape)}")
+
+    def _validate_standardization_stats(
+        self,
+        stats: Dict[str, Dict[str, torch.Tensor]],
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Validate and normalize persisted training statistics.
+
+        Evaluation must use the exact mean/std used during training.  Recomputing
+        a random cache sample at inference changes the SAE's input coordinate
+        system and can make a few global features dominate every image.
+        """
+        normalized: Dict[str, Dict[str, torch.Tensor]] = {}
+        for source in self.sources:
+            if source not in stats:
+                raise KeyError(
+                    f"Persisted standardization stats are missing source {source!r}."
+                )
+            source_stats = stats[source]
+            if "mean" not in source_stats or "std" not in source_stats:
+                raise KeyError(
+                    f"Persisted standardization stats for {source!r} require 'mean' and 'std'."
+                )
+            mean = torch.as_tensor(source_stats["mean"], dtype=torch.float32).cpu()
+            std = torch.as_tensor(source_stats["std"], dtype=torch.float32).cpu()
+            if mean.ndim != 1 or std.ndim != 1 or mean.shape != std.shape:
+                raise ValueError(
+                    f"Invalid persisted standardization stats for {source!r}: "
+                    f"mean={tuple(mean.shape)}, std={tuple(std.shape)}"
+                )
+            normalized[source] = {"mean": mean, "std": std.clamp_min(1e-5)}
+        print("[stats] Using standardization statistics persisted in the checkpoint.")
+        return normalized
 
     # ---------------------------------------------------------------------- #
     # Low-level loaders

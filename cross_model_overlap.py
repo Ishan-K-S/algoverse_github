@@ -11,7 +11,7 @@ CKPT_SEARCH_ROOT = "/content"
 SOURCES             = ["DinoV2", "PixArt"]
 TOP_K               = 64
 MAX_IMAGES          = 2000
-PIXART_TIMESTEP_IDX = -1
+PIXART_TIMESTEP_IDX = None  # None = take it from the checkpoint, see pixart_timestep.py
 DEVICE           = "cuda"
 OUT_DIR          = "/content/overlap_results"
 DRIVE_SAVE_DIR   = "/content/drive/My Drive/algoverse_inference_results"
@@ -28,6 +28,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from data import CocoActivationDataset
+from pixart_timestep import resolve_pixart_timestep
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config
 
@@ -187,6 +188,12 @@ def run():
     model, cfg, aligner = load_universal_sae(checkpoint, CONFIG_PATH, device)
     g = cfg.get("global", {})
 
+    # Reuse the training stats rather than recomputing them off 1000 npz files,
+    # which is hours when the cache is on a Drive mount (and gives you slightly
+    # different stats than the model was trained with).
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    ckpt_stats = ckpt.get("standardization_stats")
+
     # combined npz so we can pull pixart sigmas from metadata
     ds = CocoActivationDataset(
         cache_root=CACHE_ROOT,
@@ -197,6 +204,7 @@ def run():
         use_class_tokens=bool(g.get("use_class_tokens", False)),
         return_metadata=True,
         diffusion_models=list(model.diffusion_models),
+        standardization_stats=ckpt_stats,
     )
 
     n_use = len(ds) if MAX_IMAGES is None else min(MAX_IMAGES, len(ds))
@@ -211,9 +219,13 @@ def run():
         x_dino   = acts["DinoV2"]
         x_pixart = acts["PixArt"]
 
-        # pick one diffusion timestep slice
+        # pick one diffusion timestep slice, the same one the model trained on
         T = x_pixart.shape[0]
-        t_idx = PIXART_TIMESTEP_IDX if PIXART_TIMESTEP_IDX >= 0 else T + PIXART_TIMESTEP_IDX
+        t_idx = resolve_pixart_timestep(
+            T, ckpt=ckpt, config_global=g, override=PIXART_TIMESTEP_IDX
+        )
+        if i == 0:
+            print(f"[overlap] PixArt timestep {t_idx} of {T}")
         x_pixart_slice = x_pixart[t_idx]
 
         # matching sigma for that timestep
