@@ -165,7 +165,9 @@ def main():
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
     sae_p = cfg_file.get("sae_params", {})
-    g_ckpt = (ckpt.get("config") or {}).get("global", {}) if isinstance(ckpt.get("config"), dict) else {}
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+    g_ckpt = ckpt_cfg.get("global", {})
+    sae_p_ckpt = ckpt_cfg.get("sae_params", {})
 
     def pick(k, default=None):
         if k in g_ckpt: return g_ckpt[k]
@@ -181,7 +183,11 @@ def main():
         diffusion_models=set(ckpt.get("diffusion_models", g_file.get("diffusion_models", []))),
         model_tokens=model_tokens_eff,
         timestep_dim=int(pick("timestep_dim", 256)),
-        top_k=int(sae_p.get("top_k", pick("top_k", 256))),
+        # Checkpoint's own sae_params wins -- this sets the model's actual TopK width,
+        # which must match what it was trained with. Live config.yaml (sae_p) and the
+        # legacy global-block fallback (pick) are last resorts for older checkpoints
+        # that didn't persist sae_params.
+        top_k=int(sae_p_ckpt.get("top_k", sae_p.get("top_k", pick("top_k", 256)))),
         cls_pool_mode=str(pick("cls_pool_mode", "none")),
         use_tide=bool(pick("use_tide", False)),
     )

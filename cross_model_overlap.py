@@ -99,7 +99,9 @@ def load_universal_sae(ckpt_path, config_path, device):
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
     sae_p  = cfg_file.get("sae_params", {})
-    g_ckpt = (ckpt.get("config") or {}).get("global", {}) if isinstance(ckpt.get("config"), dict) else {}
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+    g_ckpt = ckpt_cfg.get("global", {})
+    sae_p_ckpt = ckpt_cfg.get("sae_params", {})
 
     # ckpt config wins, then yaml, then default
     def pick(key, default=None):
@@ -119,7 +121,9 @@ def load_universal_sae(ckpt_path, config_path, device):
         diffusion_models=set(ckpt.get("diffusion_models", g_file.get("diffusion_models", []))),
         model_tokens=model_tokens_effective,
         timestep_dim=int(pick("timestep_dim", 256)),
-        top_k=int(sae_p.get("top_k", pick("top_k", TOP_K))),
+        # Checkpoint's own sae_params wins -- this sets the model's actual TopK width,
+        # which must match what it was trained with.
+        top_k=int(sae_p_ckpt.get("top_k", sae_p.get("top_k", pick("top_k", TOP_K)))),
         cls_pool_mode=str(pick("cls_pool_mode", "none")),
         use_tide=bool(pick("use_tide", False)),
     )

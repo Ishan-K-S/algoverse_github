@@ -286,7 +286,9 @@ def load_universal_sae(
 
     g = cfg.get("global", {})
     sp = cfg.get("sae_params", {})
-    gc = (ckpt.get("config") or {}).get("global", {})
+    ckpt_cfg = ckpt.get("config") or {}
+    gc = ckpt_cfg.get("global", {})
+    spc = ckpt_cfg.get("sae_params", {})
 
     def pick(key, default=None):
         return gc.get(key, g.get(key, default))
@@ -301,7 +303,9 @@ def load_universal_sae(
             )
         ),
         model_tokens=ckpt["model_tokens"],
-        top_k=int(sp.get("top_k", pick("top_k", 64))),
+        # Checkpoint's own sae_params wins -- this sets the model's actual TopK
+        # width, which must match what it was trained with.
+        top_k=int(spc.get("top_k", sp.get("top_k", pick("top_k", 64)))),
         cls_pool_mode=str(pick("cls_pool_mode", "none")),
         use_tide=bool(pick("use_tide", False)),
         timestep_dim=int(pick("timestep_dim", 256)),
@@ -671,7 +675,10 @@ def main():
         args.device,
     )
 
-    spatial_aligner = build_spatial_aligner(cfg)
+    # Checkpoint's own spatial_align_to wins over live config.yaml, which may have
+    # moved on since the run that produced this checkpoint (V12).
+    eval_g = getattr(model, "_training_global", cfg.get("global", {}))
+    spatial_aligner = build_spatial_aligner({"global": eval_g, "model_zoo": cfg.get("model_zoo", {})})
 
     diffusion_models = set(
         cfg.get("global", {}).get("diffusion_models", [])

@@ -79,6 +79,7 @@ def main():
     with open(args.config) as f:
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
+    g_ckpt = (ckpt.get("config") or {}).get("global", {}) if isinstance(ckpt.get("config"), dict) else {}
     model_tokens_native = ckpt.get("model_tokens_native", ckpt["model_tokens"])
     align_to = ckpt.get("spatial_align_to", g_file.get("spatial_align_to", None))
     aligner = build_spatial_aligner_from_config({"spatial_align_to": align_to}, model_tokens_native)
@@ -97,6 +98,10 @@ def main():
         use_class_tokens=bool(g_file.get("use_class_tokens", False)),
         return_metadata=True,
         diffusion_models=list(set(ckpt.get("diffusion_models", g_file.get("diffusion_models", [])))),
+        # Reuse the exact stats the model was trained with, rather than recomputing
+        # from a fresh (previously unseeded) random cache sample every invocation.
+        standardization_stats=ckpt.get("standardization_stats"),
+        stats_seed=g_ckpt.get("stats_seed", g_file.get("stats_seed", 0)),
     )
     n_use = min(args.n_images, len(ds))
     print(f"[rank] collecting activations from {n_use} images")

@@ -63,7 +63,9 @@ def main():
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
     sae_p = cfg_file.get("sae_params", {})
-    g_ckpt = (ckpt.get("config") or {}).get("global", {}) if isinstance(ckpt.get("config"), dict) else {}
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt.get("config"), dict) else {}
+    g_ckpt = ckpt_cfg.get("global", {})
+    sae_p_ckpt = ckpt_cfg.get("sae_params", {})
 
     def pick(k, default=None):
         if k in g_ckpt: return g_ckpt[k]
@@ -79,7 +81,9 @@ def main():
         diffusion_models=set(ckpt.get("diffusion_models", g_file.get("diffusion_models", []))),
         model_tokens=model_tokens_eff,
         timestep_dim=int(pick("timestep_dim", 256)),
-        top_k=int(sae_p.get("top_k", pick("top_k", 64))),
+        # Checkpoint's own sae_params wins -- this sets the model's actual TopK
+        # width, which must match what it was trained with.
+        top_k=int(sae_p_ckpt.get("top_k", sae_p.get("top_k", pick("top_k", 64)))),
         cls_pool_mode=str(pick("cls_pool_mode", "none")),
         use_tide=bool(pick("use_tide", False)),
     )
@@ -103,6 +107,10 @@ def main():
         use_class_tokens=bool(g_file.get("use_class_tokens", False)),
         return_metadata=True,
         diffusion_models=list(model.diffusion_models),
+        # Reuse the exact stats the model was trained with, rather than recomputing
+        # from a fresh (previously unseeded) random cache sample every invocation.
+        standardization_stats=ckpt.get("standardization_stats"),
+        stats_seed=pick("stats_seed", 0),
     )
     n_use = min(args.n_images, len(ds))
     print(f"[diag] analyzing {n_use}/{len(ds)} images, ALL PixArt timesteps each")
