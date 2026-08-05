@@ -122,3 +122,32 @@ All checks: **PASS** (evidence above; full command transcripts available in this
 - **Next step:** run this fixed script against the real epoch-29 checkpoint and cache in
   Colab per the plan's stated verification, and report whether the heatmaps' spatial contrast
   and `n_active`/peakiness actually improve at t=10 vs. t=14.
+
+### Addendum — revision after the initial commit (`6c1a2ee` → `79f5bfa`)
+
+The first implementation of this fix changed `load_checkpoint`'s return type from a 2-tuple
+to a 3-tuple (to thread the raw checkpoint dict through). That silently broke its two other
+existing callers, `pixart_timestep_autopsy.py:137` and `pixart_attn1_sanity_check.py:118`,
+both of which destructure `model, model_tokens_native = load_checkpoint(...)`. This was caught
+by extending the smoke test to run `pixart_timestep_autopsy.py` end-to-end against the
+synthetic checkpoint, which raised `ValueError: not enough values to unpack`.
+
+Revised to follow `REPAIR_PLAN.md` Fix 0.2's explicitly recommended approach instead: keep
+`load_checkpoint`'s 2-tuple return, and set `model._standardization_stats` /
+`model._training_global` attributes on the returned model (mirroring the pattern
+`top_activating_images.load_universal_sae` already uses). Both downstream scripts already
+read those attributes via `getattr(model, "...", g)`, so this repairs them without touching
+either file — matching the plan's statement that this approach fixes them "for free." Commit
+`79f5bfa` has the corrected diff; `6c1a2ee`'s content was superseded, not reverted (both
+commits are on this local branch, not pushed).
+
+Re-verified with the same synthetic setup: `model._training_global['fixed_timestep_idx']` and
+`model._standardization_stats['PixArt']` are now set and carry the checkpoint's values (not
+live yaml's); `resolve_pixart_timestep` still resolves to 10; and a full run of
+`pixart_timestep_autopsy.py main()` against the synthetic checkpoint now succeeds, logging
+`[stats] Using standardization statistics persisted in the checkpoint` instead of recomputing
+from a random sample. All checks pass. `pixart_attn1_sanity_check.py` was not run end-to-end
+(it requires loading real PixArt-XL diffusion weights via `PixArtActivationExtractor`, which
+is infeasible in this sandbox and would border on the "no full pipeline runs" constraint) —
+its dependency on `load_checkpoint`'s attributes was verified directly instead (checks above),
+which is the only part this fix touches.
