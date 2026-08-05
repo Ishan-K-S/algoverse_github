@@ -420,3 +420,142 @@ Same environment caveat as Fix 0.1/0.2 (no GPU/Colab access; scratch CPU venv). 
   `HOOK_ATTN_NAME` is made to actually take effect for PixArt), this docstring/verdict text would
   need updating again.
 - Not verified against real data/Colab (same gap as Fix 0.1/0.2 throughout).
+
+---
+
+## Fix 0.4 — repair wandb training metrics
+
+**Addresses:** V11 (MEDIUM)
+**Commit:** `a87413b`
+**Files modified:** `train.py`
+
+### Issue
+
+Several wandb keys logged by `train_universal_sae`'s per-step logging block were uninformative,
+miscalibrated, or actively misleading:
+
+- `train/latent_sparsity` = `(z == 0).float().mean()`. Hard TopK guarantees exactly `top_k`
+  nonzeros per token always, so this was the constant `(latent_dim - top_k) / latent_dim` for
+  the entire run — zero information, every run, forever.
+- `train/source_model` logged the source model's *name* as a string (e.g. `"PixArt"`). wandb
+  stores string-valued keys as a non-numeric column that will not render on a line chart.
+- `train/latent_align_loss` logged the **unweighted** per-pair average
+  (`latent_align_loss / n_align_pairs`) under a name that implies it's the term's actual
+  contribution to the objective — it's multiplied by `latent_align_weight` before being added to
+  `loss`, so the logged number understated (or overstated) the real contribution by exactly that
+  factor with no way to tell from the chart alone.
+- The partition-diagnostic "is this feature used by this model" threshold was hardcoded to
+  `1e-3`, completely decoupled from `resample_dead_threshold` (the parameter the dead-feature
+  resampler itself uses for the identical concept). Changing `resample_dead_threshold` silently
+  stopped matching what this diagnostic reported as dead.
+- `partition/score = max_excl / max(used_by_all, 1)`. When `used_by_all == 0` — total
+  partitioning between models, the *exact* failure this metric exists to detect — the denominator
+  silently became `1`, so the metric's units jumped from a ratio to a raw feature count instead
+  of reporting the value it actually is: undefined. A chart reader would see a small-ish finite
+  number and not realize the dictionary had completely split.
+- `partition/usage_cosine_*` (cosine similarity between two models' per-feature usage-rate
+  vectors) is bounded in `[0,1]` since both inputs are non-negative firing rates. It saturates
+  high whenever a handful of near-always-on features are shared by both models, regardless of how
+  poorly the rest of the ~12k-feature dictionary is shared, and cannot express anti-correlation.
+
+### Root cause
+
+Each metric was written once, independently, without re-deriving what it actually measures once
+the surrounding config changed (TopK replacing ReLU+L1, `resample_dead_threshold` being made
+configurable, etc.) — the same "metric drift" pattern seen in the eval scripts fixed in Fix 0.2,
+just inside the training loop itself this time.
+
+### Changes
+
+All changes are confined to the wandb-logging `if use_wandb and WANDB_AVAILABLE and (batch_idx %
+log_every == 0):` block, after `loss`/`optimizer.step()` are already computed — this is a
+logging-only change, nothing here feeds back into the loss, forward/backward pass, or optimizer
+state:
+
+- Deleted the `train/latent_sparsity` line.
+- Replaced `train/source_model` (string) with `train/source_model_idx =
+  model.model_names.index(source)` (int, stable ordering set at construction).
+- Split into `train/latent_align_loss_unweighted` (the old expression, unchanged) and
+  `train/latent_align_loss_weighted` (`latent_align_weight * unweighted`, the actual
+  contribution to `loss`).
+- Partition "used" threshold: `e > 1e-3` → `e > resample_dead_threshold` (an existing parameter
+  of `train_universal_sae`, already in scope).
+- `partition/score`: now `max_excl / used_by_all` when `used_by_all > 0`; `float("inf")` when
+  `used_by_all == 0` but some model has exclusive usage; `float("nan")` when neither (dictionary
+  entirely dead).
+- Added `partition/usage_cosine_centered_<A>_vs_<B>` (cosine of each model's usage vector after
+  subtracting its own mean — equivalent to a Pearson correlation across features, can go
+  negative) and `partition/usage_jaccard_<A>_vs_<B>` (intersection/union of the two
+  threshold-crossing boolean sets, `nan` if the union is empty) alongside the existing raw
+  cosine, rather than replacing it.
+
+### Why necessary
+
+This is Stage 0 / Fix 0.4 in `REPAIR_PLAN.md`, needed so training runs after this point produce
+wandb charts that are actually diagnostic — in particular so `partition/score`'s discontinuity
+doesn't hide the one failure mode (total partitioning) the metric exists to catch, and so the
+existing `usage_cosine` reading of "0.857, looks fine" (flagged elsewhere as unsupported, see
+V11 in the plan) can be cross-checked against a metric that isn't structurally biased toward
+looking healthy.
+
+### Verification performed
+
+Same environment caveat as prior fixes (no GPU/Colab; scratch CPU venv, now also with `einops`
+installed since `train.py` imports it at module level). Test script: `test_fix04.py` (scratch
+dir). Stubbed the `wandb` module in `sys.modules` *before* importing `train.py` (so
+`WANDB_AVAILABLE` picks it up), with a fake `wandb.log(d, step=...)` that records every logged
+dict — no network/auth needed, and this exercises the real `import wandb` / `WANDB_AVAILABLE`
+gate in `train.py`, not a mock of the function under test.
+
+Built a synthetic 8-image cache (same schema as before) and ran `train.train_universal_sae(...)`
+for real (`use_wandb=True`, `log_every=1`, `curriculum_epochs=0` so cross-recon/alignment are
+active immediately, `resample_dead=True`) against a tiny real `UniversalSAE` (D=6/5,
+latent_dim=32, top_k=4) with a real `torch.optim.Adam`, on CPU, for one short "epoch" (4 batches
+of 2 images from an 8-image `DataLoader`). Checked every logged dict across all 4 steps:
+
+- `train/latent_sparsity` absent; `train/source_model` (string) absent; `train/source_model_idx`
+  present and an `int` at every step.
+- `train/latent_align_loss_weighted / train/latent_align_loss_unweighted == 3.0` exactly
+  (the `latent_align_weight` passed in), whenever the unweighted term was nonzero.
+- Every numeric logged value at every step was finite, *except* `partition/score`, which was
+  checked against `partition/used_by_all_models` at the same step: `inf`/`nan` exactly when
+  `used_by_all_models == 0`, a plain ratio otherwise — never the other way around.
+- `partition/usage_cosine_centered_*` and `partition/usage_jaccard_*` both appeared once both
+  models' usage EMAs existed (steps 1-3; absent at step 0, correctly, since only one model's EMA
+  exists after a single batch).
+- Re-ran the identical training with `resample_dead_threshold=0.9` instead of the default
+  `1e-3` and confirmed `partition/used_by_all_models` dropped to `0` across all logged steps
+  (a 0.9 firing-rate threshold is realistically uncrossable) — proving the partition diagnostic's
+  threshold is actually wired to the parameter rather than still hardcoded.
+- **Differential check against the pre-fix code**: `git stash`ed the fix and re-ran the identical
+  `test_fix04.py` unmodified. Every discriminating check failed exactly as predicted:
+  `train/latent_sparsity` present at every step, `train/source_model` present as a string
+  (`"DinoV2"`/`"PixArt"`) with `train/source_model_idx` missing, `usage_cosine_centered_*` and
+  `usage_jaccard_*` never appeared, and `used_by_all_models` was identical between the
+  `threshold=1e-3` and `threshold=0.9` runs (proving the old hardcoded `1e-3` really was
+  decoupled from the parameter). Restored the fix (`git stash pop`) and re-ran to confirm all
+  checks pass again.
+- **Independent review**: dispatched a fresh-context subagent (required per the working method
+  for core-pipeline-file changes) to review the diff against REPAIR_PLAN.md's V11 section. It
+  traced `source` back through `_pick_source` to confirm `model.model_names.index(source)` can
+  never raise `ValueError` in the production call path (`uni_demo.py`, where both `model_dims`
+  and the dataset's `sources` derive from the same `MODEL_ZOO.keys()`), verified the
+  mean-centered-cosine and Jaccard math, verified `partition/score`'s three branches, and
+  confirmed nothing in the diff touches loss computation, the forward/backward pass, or optimizer
+  state. Reported zero findings.
+
+### Remaining uncertainty
+
+- Not verified against a real training run on the actual COCO/PixArt cache or a real wandb
+  project (same Colab-access gap as every prior fix) — the synthetic run proves the logging code
+  path is correct, not what the real run's `partition/score`/`usage_cosine_centered`/etc. values
+  actually look like on trustworthy data.
+- Per the plan's own note: this changes chart semantics for `partition/score` (units differ
+  around `used_by_all == 0`) and adds/removes/renames several keys, so wandb runs after this fix
+  are not directly comparable to runs before it on those specific keys. The plan says to encode
+  this in the run tag when the next real training run happens — not done here since no real run
+  was launched in this session.
+- The verification test used `resample_dead=True` with a very short run (4 steps, `resample_interval=2`)
+  specifically to also exercise the resampler in the same pass; it was not the focus of this fix
+  (that's V2, a separate Stage 1 item) and was not independently re-verified here beyond "it ran
+  without crashing and revived the expected number of features."
