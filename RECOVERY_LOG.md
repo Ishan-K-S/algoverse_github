@@ -151,3 +151,140 @@ from a random sample. All checks pass. `pixart_attn1_sanity_check.py` was not ru
 is infeasible in this sandbox and would border on the "no full pipeline runs" constraint) —
 its dependency on `load_checkpoint`'s attributes was verified directly instead (checks above),
 which is the only part this fix touches.
+
+---
+
+## Fix 0.2 — route top_k / standardization stats / spatial aligner through the checkpoint
+
+**Addresses:** V12 (MEDIUM–HIGH)
+**Commit:** `3d86c82`
+**Files modified:** `dictionary_diagnostic.py`, `cross_model_overlap.py`,
+`top_activating_images.py`, `dictionary_diagnostic_all_timesteps.py`, `input_rank_diagnostic.py`
+
+### Issue
+
+Several eval/diagnostic scripts rebuild a `UniversalSAE` from a checkpoint's `state_dict`
+(dims, latent size, token counts all correctly sourced from the checkpoint), but read the
+model's `top_k` (TopK width), standardization stats, and/or spatial-alignment target from the
+*live* `config.yaml` instead of the checkpoint's own saved training config. `config.yaml`'s
+`top_k` moved 512 → 128 in a recent commit, so any of these scripts run today against an older
+checkpoint would silently reconstruct a wrong-shaped SAE and report firing statistics for a
+model that never existed. Per `REPAIR_PLAN.md`'s V12 table, exactly which of {top_k, timestep,
+standardization stats, aligner} was broken varied per file:
+
+| Script | top_k | std. stats | aligner |
+|---|---|---|---|
+| `dictionary_diagnostic.py` | yaml ❌ | ckpt ✅ (already) | ckpt ✅ (already) |
+| `cross_model_overlap.py` | yaml ❌ | ckpt ✅ (already) | ckpt ✅ (already) |
+| `top_activating_images.py` | yaml ❌ | ckpt ✅ (already) | yaml ❌ |
+| `dictionary_diagnostic_all_timesteps.py` | yaml ❌ | none, seed=None ❌ | ckpt ✅ (already) |
+| `input_rank_diagnostic.py` | n/a (no model built) | none, seed=None ❌ | ckpt ✅ (already) |
+
+(`pixart_timestep_autopsy.py` and `pixart_attn1_sanity_check.py` needed no further changes —
+both call `visualize_feature_activations.load_checkpoint`, which Fix 0.1 already repaired for
+them; confirmed by the Fix 0.1 addendum above.)
+
+### Root cause
+
+Each of these scripts independently reimplements "rebuild a UniversalSAE from a checkpoint,"
+and each implementation picked a slightly different (and in these 5 cases, wrong) precedence
+order between the checkpoint's own persisted config and the live `config.yaml` passed on the
+command line. The correct pattern (checkpoint's own value wins, live yaml is only a fallback
+for older checkpoints lacking the field) already existed elsewhere in the repo
+(`feature_duplication_diagnostic.py:165`, `run_inference_on_images.py`) — these 5 scripts just
+hadn't been brought in line with it.
+
+### Changes
+
+- `dictionary_diagnostic.py`, `cross_model_overlap.py`, `dictionary_diagnostic_all_timesteps.py`:
+  added `sae_p_ckpt = ckpt_cfg.get("sae_params", {})` alongside the existing `g_ckpt`/`g_file`
+  global-block lookup, and changed `top_k=int(sae_p.get("top_k", pick("top_k", N)))` to
+  `top_k=int(sae_p_ckpt.get("top_k", sae_p.get("top_k", pick("top_k", N))))` — checkpoint's own
+  `sae_params.top_k` now wins, live yaml's `sae_params.top_k` is the fallback, and the legacy
+  global-block key is the last resort, unchanged from before.
+- `top_activating_images.py`: same `top_k` fix in `load_universal_sae` (added `spc = ckpt_cfg.get("sae_params", {})`,
+  changed the `top_k=` line to prefer it). Separately, `main()`'s aligner construction changed
+  from `build_spatial_aligner(cfg)` (live yaml's global block) to
+  `build_spatial_aligner({"global": eval_g, "model_zoo": cfg.get("model_zoo", {})})` where
+  `eval_g = getattr(model, "_training_global", cfg.get("global", {}))` — reusing the
+  `_training_global` attribute `load_universal_sae` already sets (checkpoint values merged over
+  live yaml), so the alignment target now matches what the checkpoint actually trained with.
+- `dictionary_diagnostic_all_timesteps.py`, `input_rank_diagnostic.py`: added
+  `standardization_stats=ckpt.get("standardization_stats")` and a deterministic `stats_seed`
+  fallback (`pick("stats_seed", 0)` / `g_ckpt.get("stats_seed", g_file.get("stats_seed", 0))`)
+  to their `CocoActivationDataset(...)` construction. Previously neither was passed, so
+  `data.py` recomputed stats from a fresh, unseeded random 1000-file sample of the cache on
+  every invocation of these two scripts.
+
+Explicitly out of scope (left untouched, per the V12 table and to avoid scope creep):
+`input_rank_diagnostic.py`'s other known bugs (`ZeroDivisionError` at `pr_d/pr_p`, dead
+`if False` branch, `torch.load` without `weights_only=False`) are V16 items for Fix 0.3, not
+V12; `sae_mask.py` is also V16/Fix 0.3, not part of Fix 0.2's file list.
+
+### Why necessary
+
+This is Stage 0 / Fix 0.2 in `REPAIR_PLAN.md`, needed so that every downstream diagnostic
+(dictionary partitioning, cross-model overlap, top-activating-images, input rank) is measuring
+the checkpoint that actually exists rather than a hypothetical one matching today's
+`config.yaml`. Explicitly depended on by Fix 0.4 (wandb metrics) and everything in Stage 1+,
+which all lean on these diagnostics being trustworthy.
+
+### Verification performed
+
+Same environment caveat as Fix 0.1 (no GPU/Colab access; scratch CPU venv with
+torch/numpy/pyyaml/pillow/tqdm/matplotlib). Built a synthetic 3-image cache + checkpoint (same
+shapes/schema as Fix 0.1's `test_fix01.py`) where the checkpoint's `sae_params.top_k=4`
+deliberately differs from live `config.yaml`'s `sae_params.top_k=99`.
+
+Test script: `test_fix02.py` (scratch dir). For `dictionary_diagnostic.py`,
+`dictionary_diagnostic_all_timesteps.py`, and `input_rank_diagnostic.py`: ran each via
+`subprocess` (their real CLI entry points) twice against the synthetic checkpoint/cache, since
+these three take `--repo_root`/argparse CLI args designed for exactly this. For
+`top_activating_images.py`: ran its real CLI (`--skip_coco_labels` to avoid needing COCO
+annotation files) twice. For `cross_model_overlap.py` (no argparse — it's written as a
+Colab-cell-style script with module-level constants, not a CLI tool): called its
+`load_universal_sae(ckpt_path, config_path, device)` function directly, since that's the exact
+function this fix changed and the only feasible way to exercise it without running its
+`if __name__ == "__main__"` block (which mounts Drive, does GPU-oriented batch processing, etc.
+— unrelated to what changed).
+
+Results (all PASS): all 5 scripts report/use `top_k=4` (the checkpoint's value), not `99` (live
+yaml's); `dictionary_diagnostic_all_timesteps.py` and `input_rank_diagnostic.py` no longer log
+`[stats] Computing standardisation stats...` and produce byte-identical `.npz` output across two
+runs (previously nondeterministic); `top_activating_images.py`'s aligner log line shows the
+correct `4x4` target grid; all outputs were byte-identical/JSON-identical across repeated runs.
+
+**Differential check against the pre-fix code:** `git stash`ed the fix and re-ran the identical
+`test_fix02.py` unmodified. It failed exactly as predicted: `dictionary_diagnostic.py` and
+`dictionary_diagnostic_all_timesteps.py` reported `top_k = 99` (leaked from live yaml);
+`dictionary_diagnostic_all_timesteps.py`'s output was non-deterministic across the two runs and
+logged stats recomputation; `input_rank_diagnostic.py` also recomputed stats;
+`cross_model_overlap.py`'s `load_universal_sae` returned `model.top_k == 99`. Restored the fix
+(`git stash pop`) and re-ran to confirm all checks pass again — confirms the test discriminates
+old vs. new behavior. `git status --short` after restoring showed only the 5 intended files
+modified (no stray `__pycache__`/artifact diffs).
+
+**Independent review:** per the working method (fixes touching more than one file get a
+subagent review before committing), dispatched a fresh-context subagent to review the diff
+against `REPAIR_PLAN.md`'s V12 table and Fix 0.2 spec. It cross-checked each file's diff against
+exactly which V12 columns were marked broken for that file, checked the fallback-chain
+precedence and guard-clause safety (`ckpt.get("config")` could be `None`/missing `sae_params` on
+older checkpoints), and checked for scope creep. Reported zero findings; flagged one latent
+pre-existing pattern (an unguarded `ckpt.get("standardization_stats")` could `KeyError` inside
+`data.py` for a checkpoint trained with `standardize: false`, saving `{}`) but confirmed it's
+not a regression — this diff copies the same pattern already used by the reference-correct
+scripts (`feature_duplication_diagnostic.py`, `run_inference_on_images.py`), not a new defect.
+
+### Remaining uncertainty
+
+- Not verified against the real epoch-29 checkpoint / cache (same Colab-access gap as Fix 0.1).
+  The synthetic test proves the *code path* correctly prefers checkpoint values; it doesn't
+  demonstrate what numbers change on the real checkpoint (whose live-yaml top_k may or may not
+  currently disagree with what it was trained on — that's itself unknown without checking).
+- The pre-existing `standardization_stats={}` / `KeyError` landmine noted by the reviewing
+  subagent (for checkpoints trained with `standardize: false`) is unfixed, matching the rest of
+  the codebase's current behavior. Not introduced by this fix; would be a V14/hygiene item if
+  addressed.
+- `cross_model_overlap.py`'s `if __name__ == "__main__"` block (Drive mounting, full 2000-image
+  batch run, matplotlib plotting) was not exercised end-to-end — only the specific function this
+  fix changed (`load_universal_sae`) was verified directly.
