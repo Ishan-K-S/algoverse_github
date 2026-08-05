@@ -288,3 +288,135 @@ scripts (`feature_duplication_diagnostic.py`, `run_inference_on_images.py`), not
 - `cross_model_overlap.py`'s `if __name__ == "__main__"` block (Drive mounting, full 2000-image
   batch run, matplotlib plotting) was not exercised end-to-end — only the specific function this
   fix changed (`load_universal_sae`) was verified directly.
+
+---
+
+## Fix 0.3 — repair broken scripts and correct stale/false premises
+
+**Addresses:** V16 (MEDIUM)
+**Commit:** `470b7f1`
+**Files modified:** `top_activating_images.py`, `sae_mask.py`, `input_rank_diagnostic.py`,
+`pixart_attn1_sanity_check.py`
+
+### Issue
+
+Four scripts had bugs ranging from "crashes with default args" to "produces a report of the
+wrong coordinate system" to "explains its own output using a false premise":
+
+1. `top_activating_images.py main()`: `CHECKPOINT_PATH = None` is the documented default;
+   `os.path.isfile(None)` raises `TypeError`, which `genericpath.isfile`'s
+   `except (OSError, ValueError)` does not catch, so the auto-discovery path the docstring
+   advertises crashes outright.
+2. `sae_mask.py`: called `load_activation_for_image` with no `spatial_aligner=` and applied no
+   standardization at all, so it fed raw, unstandardized, native-grid (e.g. 32x32) PixArt
+   activations into an SAE trained on standardized, 16x16-pooled ones. `infer_grid_size` then
+   reported the wrong grid, and every `--patches`/`--box` index the tool computed pointed at the
+   wrong image region.
+3. `input_rank_diagnostic.py`: `ZeroDivisionError` in the interpretation section when
+   `participation_ratio` is exactly `0.0` — total collapse, the exact condition the script
+   exists to detect. Also a dead `"X_per_feature_std" if False else "rank_90"` ternary, and
+   `torch.load(...)` without `weights_only=False` (a problem once torch >= 2.6's default
+   changed).
+4. `pixart_attn1_sanity_check.py`: its docstring, an inline comment, and three separate
+   verdict-text branches all asserted or implied that switching a hook from `attn2` to `attn1`
+   was being tested. A prior finding (traced through the extractor's full commit history, not
+   part of this fix) established that `PixArtActivationExtractor.extract_activations` has always
+   hooked the entire last transformer block for PixArt, never `.attn1` or `.attn2` individually,
+   and that `HOOK_ATTN_NAME` is dead code on that code path. The script's own `assert
+   extractor.HOOK_ATTN_NAME == "attn1"` passes (the attribute really is set to that string) while
+   proving nothing about what was actually hooked — a false-confidence check.
+
+### Root cause
+
+(1)-(3) are independent, unrelated bugs in scripts that receive less use/testing than the main
+diagnostics — normal script rot. (4) is a stale docstring/verdict left over from before the
+extractor's actual hooking behavior was traced; the script was never updated after that finding,
+so its explanatory text and its own assert actively mislead a reader into thinking an attn1-only
+ablation occurred when it didn't.
+
+### Changes
+
+- `top_activating_images.py`: `if not os.path.isfile(checkpoint)` → `if checkpoint is None or
+  not os.path.isfile(checkpoint)`, copying the pattern already used correctly in `sae_mask.py`.
+- `sae_mask.py`: added the same checkpoint-preferred `_training_global`/`build_spatial_aligner`
+  construction `top_activating_images.py`'s `main()` now uses (Fix 0.2), passed
+  `spatial_aligner=` into `load_activation_for_image`, and added a standardization step
+  (align-then-standardize, matching `top_activating_images.compute_top_activations`'s order and
+  logic verbatim) using `model._standardization_stats`, raising the same clear `ValueError` that
+  function raises if a checkpoint lacks persisted stats.
+- `input_rank_diagnostic.py`: guarded the `pr_d/pr_p` print behind `if pr_p > 0`, printing "fully
+  collapsed (participation_ratio=0)" otherwise; deleted the dead `if False` ternary (always
+  evaluated to `"rank_90"`, so this is a behavioral no-op); added `weights_only=False` to
+  `torch.load`. Also corrected the interpretation text's stale "train on random timesteps"
+  advice (the opposite of the project's current `fixed_timestep_idx` decision) since it's in the
+  same block being touched for the crash fix — see "Remaining uncertainty" below for why this is
+  flagged as a deliberate scope extension rather than folded in silently.
+- `pixart_attn1_sanity_check.py`: corrected the module docstring, the `HOOK_ATTN_NAME` assert's
+  comment, a stale comment referencing a `pixart_timestep_autopsy.py` `ref_thresh` bug that no
+  longer exists, and all three verdict-text branches (`IMPROVED`, `SAE ISSUE`, `REAL UPSTREAM
+  FAILURE`) that phrased their conclusion in terms of "attn1 vs attn2." No control flow, logic,
+  or computed values were changed — comments and printed/docstring strings only.
+
+### Why necessary
+
+This is Stage 0 / Fix 0.3 in `REPAIR_PLAN.md`. (1)-(3) block anyone from actually running these
+tools (crash) or make their output actively wrong (misaligned masking, an uncaught exception on
+the exact input the tool is meant to flag). (4) is a research-integrity issue: a script that
+prints a confident "IMPROVED: the attn2->attn1 hook change looks like the fix" verdict when no
+such hook change occurred would mislead whoever reads its output into believing an ablation was
+tested that wasn't.
+
+### Verification performed
+
+Same environment caveat as Fix 0.1/0.2 (no GPU/Colab access; scratch CPU venv). Built a synthetic
+3-image cache + checkpoint (same schema as before). Test script: `test_fix03.py` (scratch dir).
+
+- **`top_activating_images.py`**: since `WEIGHTS_DIR` is a hardcoded module constant (no
+  `--weights_dir` CLI flag), ran in-process with the constant monkeypatched to a temp dir holding
+  the synthetic checkpoint, and `sys.argv` set with `--checkpoint` *omitted* — the exact bug
+  path. Passed (no `TypeError`, checkpoint auto-discovered and used).
+- **`sae_mask.py`**: ran via its real CLI (`--source PixArt --patches 0,1`) and checked the
+  output JSON's `metadata.grid_size` — `4` (the DinoV2-aligned grid) after the fix.
+- **`input_rank_diagnostic.py`**: crafting a genuine `participation_ratio == 0.0` through the
+  *real* align+standardize+SVD pipeline turned out to be numerically fragile — an initial attempt
+  broadcasting one random nonzero vector across every token/image left ~1e-7-scale float32
+  residue after `avg_pool2d`/centering, which sits above `effective_rank`'s `eps=1e-10` threshold
+  and produced a spurious rank-1 result instead of a true collapse (caught by checking the actual
+  printed `participation_ratio` rather than trusting the setup). Switched to an exact-zero
+  activation array (`np.zeros`), which stays exactly representable through centering, and
+  confirmed `participation_ratio` prints as `0.0 / 5` and the interpretation section prints the
+  guarded "fully collapsed" message with exit code 0 (no crash).
+- **Differential check against the pre-fix code**: `git stash`ed the fix and re-ran the identical
+  `test_fix03.py` unmodified. All three reproduced exactly: `top_activating_images.py` raised
+  `TypeError: _path_isfile: path should be string, bytes, os.PathLike or integer, not NoneType`;
+  `sae_mask.py` reported `grid_size=8` (PixArt's raw native grid, wrong); `input_rank_diagnostic.py`
+  raised `ZeroDivisionError: division by zero` at the exact `pr_d/pr_p` line REPAIR_PLAN.md's V16
+  section describes. Restored the fix (`git stash pop`) and re-ran to confirm all checks pass
+  again. `git status --short` showed only the 4 intended files modified.
+- **`pixart_attn1_sanity_check.py`**: not runnable end-to-end (requires loading real PixArt-XL
+  diffusion weights, infeasible in this sandbox — same constraint noted for Fix 0.1). Verified by
+  `ast.parse` (syntax) and manual read-through of every changed string; not exercised at runtime.
+- **Independent review**: dispatched a fresh-context subagent to review the diff against
+  REPAIR_PLAN.md's V16 catalog. It found one incomplete spot — the `SAE ISSUE` verdict branch in
+  `pixart_attn1_sanity_check.py` still said "the raw attn1 activation" unqualified, contradicting
+  the file's own new docstring disclaimer — which was corrected in this same commit before
+  committing (re-verified with `ast.parse` and the full `test_fix03.py` re-run afterward, both
+  still pass). It also flagged the `input_rank_diagnostic.py` advice-text rewrite (see below).
+
+### Remaining uncertainty
+
+- **Scope note, `input_rank_diagnostic.py`**: the reviewing subagent flagged that the corrected
+  interpretation-text advice (removing "train on random timesteps," adding a preprocessing-
+  unification suggestion) goes beyond Fix 0.3's literal three-line list for this file
+  (`:162`/`:173`/`:78`), even though it addresses a separately-documented V16 observation ("stale
+  advice... recommends random timesteps — the opposite of the current decision") in the same
+  print block already being touched for the crash fix. This is a print-string-only change (zero
+  behavioral/logic risk) but is flagged here as a deliberate, judgment-call scope extension
+  rather than folded in silently, per the instruction to be explicit about anything beyond the
+  fix's literal scope.
+- `pixart_attn1_sanity_check.py`'s corrected text was not validated against a real run of the
+  script (requires real PixArt-XL weights) — the correction is a careful read-through, not an
+  observed-output confirmation. If the extractor's hooking behavior changes in the future (e.g.
+  `HOOK_ATTN_NAME` is made to actually take effect for PixArt), this docstring/verdict text would
+  need updating again.
+- Not verified against real data/Colab (same gap as Fix 0.1/0.2 throughout).
