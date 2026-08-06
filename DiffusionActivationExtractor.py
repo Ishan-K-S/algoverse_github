@@ -697,8 +697,10 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         text_inputs_1 = tokenized.input_ids.to(self.device)
         # For an empty string, only ~1 of 256 positions is real content (EOS);
         # everything else is padding. Without this mask, cross-attention in
-        # every hooked block attends over 255 pad embeddings as if they were
-        # real context (REPAIR_PLAN.md V4).
+        # every transformer block (all 28, during the single forward pass --
+        # only ONE block's output is ever hooked/captured, see HOOK_DEPTH_FRAC
+        # below) attends over 255 pad embeddings as if they were real context
+        # (REPAIR_PLAN.md V4).
         attention_mask_1 = tokenized.attention_mask.to(self.device)
 
 

@@ -390,9 +390,16 @@ def _reset_adam_state_slice(optimizer, param, rows=None, cols=None) -> None:
     dead. `rows` indexes dim 0, `cols` indexes dim 1 — pass whichever axis the
     feature lives on (W_enc.weight: feature = row; W_dec.weight: feature =
     column). The per-tensor `step` count is left alone (it can't be reset per
-    row); with exp_avg/exp_avg_sq zeroed but `step` intact, bias correction is
-    ~1 while m=0.1*g, v=0.001*g^2 after the first backward, so the first
-    revived update is ~3.2x the nominal lr-scaled step, not ~1x.
+    row), so beta2's bias correction (1 - 0.999^step) is NOT reset and keeps
+    whatever value the tensor's global step count has already reached -- it is
+    NOT ~1 right after a resample (that only holds asymptotically, after
+    ~thousands of steps). With exp_avg/exp_avg_sq zeroed, m=0.1*g and
+    v=0.001*g^2 after the first backward; numerically verified (real
+    torch.optim.Adam, lr=1) across this project's actual resample_interval=500
+    schedule: the first revived update is ~2.0x the nominal lr-scaled step at
+    global step 500 (the first resample event), rising to ~3.1x by step 3500
+    (the last) as beta2's bias correction converges -- not a fixed ~3.2x, and
+    not ~1x either way.
     """
     state = optimizer.state.get(param, None)
     if not state:
