@@ -111,6 +111,41 @@ def per_token_cofire_jaccard(z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tens
     return jaccard.mean()
 
 
+def per_token_cofire_jaccard_chance(z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+    """
+    The value per_token_cofire_jaccard would take if the two models picked their
+    active features INDEPENDENTLY at each position, given the number each
+    actually activates there.
+
+    Without this, the co-fire number is uninterpretable. Hard TopK puts exactly
+    top_k nonzeros in every token for both models, so with top_k=128 and
+    latent_dim=12288 the chance level is 128*128/12288 / (256 - 128*128/12288)
+    ~= 0.0052 -- a raw reading of 0.02 is 4x chance, not "2% agreement, basically
+    nothing." Computed from the OBSERVED per-token active counts rather than
+    assumed to be top_k, so it stays correct if a criterion other than hard TopK
+    is ever used.
+
+    z_a, z_b: (B, N, K), same alignment requirement as per_token_cofire_jaccard.
+    Returns a 0-d tensor. This is a ratio of expectations (E|A n B| / E|A u B|),
+    not the expectation of the ratio -- close enough to read a chart against, not
+    an exact null distribution.
+    """
+    if z_a.shape != z_b.shape:
+        raise ValueError(
+            f"per_token_cofire_jaccard_chance requires matching shapes, got "
+            f"{tuple(z_a.shape)} vs {tuple(z_b.shape)}"
+        )
+    n_features = z_a.shape[-1]
+    n_a = (z_a != 0).sum(dim=-1).float()
+    n_b = (z_b != 0).sum(dim=-1).float()
+    exp_intersection = n_a * n_b / n_features
+    exp_union = n_a + n_b - exp_intersection
+    chance = torch.where(
+        exp_union > 0, exp_intersection / exp_union, torch.zeros_like(exp_union)
+    )
+    return chance.mean()
+
+
 def feature_heatmap_iou(
     z_a: torch.Tensor,
     z_b: torch.Tensor,

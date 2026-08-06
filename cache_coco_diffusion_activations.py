@@ -237,6 +237,13 @@ if __name__ == "__main__":
     # Set to None to fall back to the old full-trajectory extraction (e.g. to
     # rebuild a multi-timestep cache for pixart_timestep_autopsy.py-style
     # timestep sweeps -- those need several distinct timesteps, not one).
+    #
+    # NOTE: that fallback is the old *protocol*, not the old *numbers*. The
+    # micro-conditioning fix (pixel resolution instead of latent dims) and the
+    # T5 attention masks apply to both branches, so a full-trajectory re-cache
+    # will NOT reproduce the pre-Fix-2.1 cache byte-for-byte. That is intended
+    # -- both were bugs on both paths -- but it means old and new caches are not
+    # interchangeable and should not be mixed in one combined_cache directory.
     USE_DIFT_SINGLE_TIMESTEP = True
     single_timestep = None
     if USE_DIFT_SINGLE_TIMESTEP:

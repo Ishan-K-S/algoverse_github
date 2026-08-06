@@ -734,8 +734,12 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         pooled_prompt_embeds_2 = prompt_embeds_2[0]
         prompt_embeds_2 = prompt_embeds_2.hidden_states[-2]"""
         
-        # Encode with T5
-        prompt_embeds_3 = self.text_encoder(text_inputs_1)[0]
+        # Encode with T5. The mask goes to T5's OWN self-attention here, which is a
+        # separate thing from the encoder_attention_mask handed to the transformer's
+        # cross-attention below -- without it, the one real token's representation is
+        # computed while attending over 255 pad positions. Matches what diffusers'
+        # PixArtAlphaPipeline.encode_prompt does.
+        prompt_embeds_3 = self.text_encoder(text_inputs_1, attention_mask=attention_mask_1)[0]
         
         """# Concatenate CLIP embeddings along feature dimension
         clip_prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
@@ -893,6 +897,13 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         one entry in each of activations/timesteps/sigmas, so it composes with
         the existing (T, N, D)-shaped cache format at T=1 without changing any
         downstream shape assumptions.
+
+        The single_timestep=None branch keeps the old reverse-diffusion loop
+        structure unchanged, but it is NOT numerically identical to the pre-Fix-2.1
+        code: _get_transformer_input's micro-conditioning fix (pixel resolution
+        instead of the 8x-downsampled latent's dims) and the T5 attention masks
+        apply to BOTH branches, and both change what the transformer computes.
+        Re-running the full trajectory will not reproduce the pre-fix cache.
 
         generator: optional torch.Generator (or list of per-image Generators,
         see `_make_noise`) so extraction is reproducible.

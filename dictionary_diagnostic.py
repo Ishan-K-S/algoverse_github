@@ -221,6 +221,11 @@ def main():
         # a Drive-mounted cache is hours. It's also more correct: standardising
         # eval data with different stats than training used shifts every code.
         standardization_stats=ckpt.get("standardization_stats"),
+        # Only used if the checkpoint has no persisted stats and this falls back to
+        # recomputing them: training fits stats to the POOLED distribution
+        # (REPAIR_PLAN.md V6/Fix 2.2), so the fallback has to pool too or it
+        # silently standardises with a different std than training used.
+        spatial_aligner=aligner,
     )
     n_use = min(args.n_images, len(ds))
     print(f"[diag] analyzing {n_use}/{len(ds)} images")

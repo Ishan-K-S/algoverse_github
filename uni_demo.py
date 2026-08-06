@@ -293,7 +293,11 @@ if __name__ == "__main__":
         val_dataset,
         batch_size=_parse_int_field(CONFIG.get("batch_size", 32), "CONFIG.global.batch_size"),
         shuffle=False,
-        num_workers=0,
+        # Same worker count as train. Against the current 15-timestep cache every
+        # read is a full zlib inflate of a ~35MB array (REPAIR_PLAN.md V13), so a
+        # single-threaded val pass every epoch adds real wall-clock to the exact
+        # bottleneck Stage 2 exists to remove.
+        num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
         pin_memory=True,
     )
     print(f"[uni_demo] Val dataset   : {len(val_dataset)} images, {len(val_dataloader)} batches")

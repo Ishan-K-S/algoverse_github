@@ -111,6 +111,10 @@ def main():
         # from a fresh (previously unseeded) random cache sample every invocation.
         standardization_stats=ckpt.get("standardization_stats"),
         stats_seed=pick("stats_seed", 0),
+        # Only used on the recompute fallback: training fits stats to the POOLED
+        # distribution (REPAIR_PLAN.md V6/Fix 2.2), so pooling here too keeps a
+        # fallback recomputation on the same scale training used.
+        spatial_aligner=aligner,
     )
     n_use = min(args.n_images, len(ds))
     print(f"[diag] analyzing {n_use}/{len(ds)} images, ALL PixArt timesteps each")

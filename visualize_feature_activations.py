@@ -512,6 +512,11 @@ def main():
         use_class_tokens=False,
         standardization_stats=getattr(model, "_standardization_stats", None),
         stats_seed=eval_g.get("stats_seed", 0),
+        # Only used if the checkpoint has no persisted stats and this falls back to
+        # recomputing: training fits stats to the POOLED distribution
+        # (REPAIR_PLAN.md V6/Fix 2.2), so the fallback has to pool too, or heatmaps
+        # get rendered from inputs standardised on a different scale than training.
+        spatial_aligner=aligner,
     )
     failures = []
     for stem_query in args.stem:

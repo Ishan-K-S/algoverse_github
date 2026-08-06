@@ -217,6 +217,10 @@ def run():
         return_metadata=True,
         diffusion_models=list(model.diffusion_models),
         standardization_stats=ckpt_stats,
+        # Only used if ckpt_stats is None and this falls back to recomputing:
+        # training fits stats to the POOLED distribution (REPAIR_PLAN.md V6/Fix 2.2),
+        # so the fallback has to pool too or it standardises with a different std.
+        spatial_aligner=aligner,
     )
 
     n_use = len(ds) if MAX_IMAGES is None else min(MAX_IMAGES, len(ds))

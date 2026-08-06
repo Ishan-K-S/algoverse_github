@@ -8,7 +8,11 @@ from einops import rearrange
 from tqdm import tqdm
 import os
 
-from feature_usage import compute_feature_usage, per_token_cofire_jaccard
+from feature_usage import (
+    compute_feature_usage,
+    per_token_cofire_jaccard,
+    per_token_cofire_jaccard_chance,
+)
 
 try:
     import wandb
@@ -47,10 +51,27 @@ def cosine_reconstruction_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor
 def _ensure_bt(values: torch.Tensor, batch_size: int) -> torch.Tensor:
     """
     Ensure per-batch timesteps/noise levels are shaped (B, T).
+
+    Does NOT blanket-`squeeze()`. That drops EVERY size-1 dim, which is fine for
+    the 15-timestep cache but silently corrupts a T=1 cache -- the shape Fix 2.1's
+    DIFT single-timestep extraction produces:
+      (B, 1) -> squeeze -> (B,)  -> re-expanded to (B, B)   [wrong shape]
+      (1, 1) -> squeeze -> ()    -> ValueError               [hard crash at B=1]
+    The (B, B) case happened to stay numerically correct only because every image
+    in a single-timestep cache shares the same raw t, so any column read the right
+    value. That is a coincidence, not a guarantee, and the B=1 crash is real: it
+    fires whenever len(dataset) % batch_size == 1.
     """
-    values = values.squeeze()
+    if values.dim() > 2:
+        # Collapse any extra middle dims, keeping batch leading.
+        values = values.reshape(values.shape[0], -1)
+    if values.dim() == 0:
+        values = values.reshape(1, 1)
     if values.dim() == 1:
-        values = values.unsqueeze(0).expand(batch_size, -1)
+        # A bare (T,) schedule shared by every item in the batch.
+        values = values.unsqueeze(0)
+    if values.shape[0] == 1 and batch_size > 1:
+        values = values.expand(batch_size, -1)
     if values.dim() != 2 or values.shape[0] != batch_size:
         raise ValueError(
             f"_ensure_bt expected shape (B, T); got {tuple(values.shape)} for B={batch_size}"
@@ -586,7 +607,10 @@ def evaluate_universal_sae(
     feature_usage.per_token_cofire_jaccard): the per-TOKEN feature-set
     agreement between every pair of models present in a batch, as opposed to
     every existing metric in this project, which aggregates over tokens
-    before comparing models.
+    before comparing models. Reported alongside "..._chance_..." (what the same
+    batch would score under independent feature selection) and "..._lift" (the
+    ratio of the two) -- hard TopK makes the raw Jaccard a small number by
+    construction, so the lift is the figure to read, not the raw value.
     """
     was_training = model.training
     model.eval()
@@ -701,6 +725,16 @@ def evaluate_universal_sae(
                     cofire_sums[key] = cofire_sums.get(key, 0.0) + jaccard.item()
                     cofire_counts[key] = cofire_counts.get(key, 0) + 1
 
+                    # Chance level for the SAME batch, so the metric above is
+                    # readable on its own. Hard TopK makes raw co-fire a small
+                    # number by construction (~0.005 at top_k=128/K=12288), so
+                    # without this the first person to see 0.02 can't tell 4x
+                    # chance from "basically zero."
+                    chance_key = f"cofire_jaccard_chance_{name_a}_vs_{name_b}"
+                    chance = per_token_cofire_jaccard_chance(z_a, z_b)
+                    cofire_sums[chance_key] = cofire_sums.get(chance_key, 0.0) + chance.item()
+                    cofire_counts[chance_key] = cofire_counts.get(chance_key, 0) + 1
+
     if was_training:
         model.train()
 
@@ -709,6 +743,18 @@ def evaluate_universal_sae(
         result["val/sae_loss"] = sum(result.values()) / len(result)
     for k in cofire_sums:
         result[f"val/{k}"] = cofire_sums[k] / cofire_counts[k]
+    # Lift over chance: the number to actually read. 1.0 = the two models agree on
+    # which features fire at a position no more than two independent TopK draws
+    # would; >1 is real per-token correspondence, which is the project's stated goal.
+    for k in list(cofire_sums):
+        if k.startswith("cofire_jaccard_chance_"):
+            continue
+        chance_key = k.replace("cofire_jaccard_", "cofire_jaccard_chance_", 1)
+        if chance_key in cofire_sums:
+            chance_val = result[f"val/{chance_key}"]
+            result[f"val/{k}_lift"] = (
+                result[f"val/{k}"] / chance_val if chance_val > 0 else float("nan")
+            )
     result["val/n_batches"] = float(n_batches)
     return result
 
@@ -1077,6 +1123,25 @@ def train_universal_sae(
         grad_norm = None
         if grad_clip_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            # Visibility when wandb is off: train/grad_norm_preclip is logged only
+            # inside the wandb-gated block below, and the plan's own tiny-scale
+            # verification runs specify use_wandb=false. grad_clip_norm=1.0 is a
+            # starting value, not a measured one -- if the real pre-clip norm sits
+            # 10-100x above it, this clip is a large silent LR reduction across the
+            # whole run rather than a guard on resample spikes.
+            if (
+                float(grad_norm) > 10.0 * grad_clip_norm
+                and not getattr(model, "_warned_grad_clip", False)
+            ):
+                print(
+                    f"[grad-clip] WARNING: pre-clip grad norm {float(grad_norm):.1f} is >10x "
+                    f"grad_clip_norm={grad_clip_norm} at step {global_step_actual}. Clipping is "
+                    f"rescaling every gradient by ~{grad_clip_norm / float(grad_norm):.4f}x, i.e. "
+                    f"acting as a large effective LR reduction, not just a spike guard. Read "
+                    f"train/grad_norm_preclip (or run once with grad_clip_norm=0) and re-tune "
+                    f"this to ~2-5x the typical norm. Warning printed once per process."
+                )
+                model._warned_grad_clip = True
         optimizer.step()
         if hasattr(model, "normalize_decoder_dictionaries_"):
             model.normalize_decoder_dictionaries_()
