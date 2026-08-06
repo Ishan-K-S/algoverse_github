@@ -112,9 +112,13 @@ sae_params:
                                   # resample_interval or it's a no-op; keep the two equal unless
                                   # you actually want to skip the first N events.
   resample_end_step: 0            # stop resampling at/after this step (0 = no limit)
-  grad_clip_norm: 1.0             # clip total grad norm before optimizer.step(); <=0 disables.
-                                  # Nothing else in the repo bounds a resample-induced spike.
-                                  # This value is a starting guess -- check train/grad_norm_preclip.
+  grad_clip_norm: 0               # clip total grad norm before optimizer.step().
+                                  # 0 = MEASURE ONLY: train/grad_norm_preclip is still logged,
+                                  # gradients are untouched. Starts here deliberately -- nobody
+                                  # has measured this model's real gradient norm, and a threshold
+                                  # far below it acts as a silent LR cut across the whole run
+                                  # rather than a guard on resample spikes. Read the metric on
+                                  # your first run, then set this to ~2-5x the typical norm.
 model_zoo:
   # Vision encoders
   DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid

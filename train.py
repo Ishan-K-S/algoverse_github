@@ -1115,12 +1115,18 @@ def train_universal_sae(
             loss = loss + latent_align_weight * (latent_align_loss / n_align_pairs)
 
         loss.backward()
-        grad_norm = None
+        # ALWAYS measure the gradient norm; clip only when a positive threshold is
+        # set. max_norm=inf makes clip_grad_norm_ a pure measurement, so
+        # grad_clip_norm=0 means "report the norm, don't touch the gradients" --
+        # which is what you want on a first run, before the right threshold is known.
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            grad_clip_norm if grad_clip_norm > 0 else float("inf"),
+        )
         if grad_clip_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             # grad_norm_preclip is only logged under wandb, so warn on the console
-            # too: if the real norm sits far above the (unmeasured) 1.0 default,
-            # this clip is a silent LR cut, not a spike guard.
+            # too: if the real norm sits far above the configured threshold, this
+            # clip is a silent LR cut, not a spike guard.
             if (
                 float(grad_norm) > 10.0 * grad_clip_norm
                 and not getattr(model, "_warned_grad_clip", False)
@@ -1129,9 +1135,9 @@ def train_universal_sae(
                     f"[grad-clip] WARNING: pre-clip grad norm {float(grad_norm):.1f} is >10x "
                     f"grad_clip_norm={grad_clip_norm} at step {global_step_actual}. Clipping is "
                     f"rescaling every gradient by ~{grad_clip_norm / float(grad_norm):.4f}x, i.e. "
-                    f"acting as a large effective LR reduction, not just a spike guard. Read "
-                    f"train/grad_norm_preclip (or run once with grad_clip_norm=0) and re-tune "
-                    f"this to ~2-5x the typical norm. Warning printed once per process."
+                    f"acting as a large effective LR reduction, not just a spike guard. Set "
+                    f"grad_clip_norm=0 to measure without clipping (train/grad_norm_preclip is "
+                    f"still logged), then re-tune to ~2-5x the typical norm. Printed once."
                 )
                 model._warned_grad_clip = True
         optimizer.step()
