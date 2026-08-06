@@ -10,7 +10,10 @@ For each image, saves:
   label:      ()
 """
 
+import inspect
 import os
+import zlib
+from typing import Optional
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -20,6 +23,16 @@ from coco_dataset_setup import CocoData, select_images
 from DiffusionActivationExtractor import SD3ActivationExtractor, FLUXActivationExtractor, PixArtActivationExtractor
 
 from huggingface_hub import login
+
+
+def _stem_seed(filename: str) -> int:
+    """
+    Deterministic 32-bit seed derived from a filename, so re-extracting the
+    same image (on any machine, any run) draws the same noise (REPAIR_PLAN.md
+    V4/Fix 2.1 item 5). Python's built-in hash() is randomized per-process
+    unless PYTHONHASHSEED is fixed, so it can't be used here.
+    """
+    return zlib.crc32(filename.encode("utf-8"))
 
 
 def login_to_huggingface() -> None:
@@ -63,15 +76,31 @@ def cache_diffusion_activations(
     batch_size: int = 4,
     num_workers: int = 2,
     image_list=None,
+    single_timestep: Optional[int] = None,
+    seed_from_filenames: bool = False,
 ):
     """
-    extractor: SD3ActivationExtractor or FLUXActivationExtractor.
-      Must expose `.preprocess` compatible with torchvision transforms, and
-      `.extract_activations(image_batch)` that returns ActivationOutput with
-      activations (list of (B,N,D)), sigmas(list[float]), timesteps(list[tensor]).
+    extractor: SD3ActivationExtractor, FLUXActivationExtractor, or
+      PixArtActivationExtractor. Must expose `.preprocess` compatible with
+      torchvision transforms, and `.extract_activations(image_batch)` that
+      returns ActivationOutput with activations (list of (B,N,D)),
+      sigmas(list[float]), timesteps(list[tensor]).
     image_list : list[str] or None
         Pre-selected image filenames (from select_images()). If None, all images
         in coco_root are used.
+    single_timestep : int or None
+        Raw diffusion timestep (0..999) to noise directly to for a single
+        forward pass, DIFT-style (REPAIR_PLAN.md Fix 2.1). Only meaningful for
+        PixArtActivationExtractor -- ignored (via signature introspection) for
+        extractors that don't accept it, so this stays a no-op for SD3/FLUX.
+        See pixart_timestep.resolve_pixart_raw_timestep for picking the value.
+        None keeps the old default: the full num_inference_steps trajectory.
+    seed_from_filenames : bool
+        If True, derive a deterministic per-image noise seed from each
+        filename (see `_stem_seed`) and pass it to the extractor, so
+        re-running this script reproduces the exact same cached activations.
+        Also only takes effect for extractors whose extract_activations
+        accepts a `generator` argument.
     """
     print(f"[diffusion-cache] ---- Starting diffusion caching ----")
     print(f"[diffusion-cache] source     : {source_name}")
@@ -97,6 +126,18 @@ def cache_diffusion_activations(
 
     #os.makedirs(cache_root, exist_ok=True)
 
+    extract_params = inspect.signature(extractor.extract_activations).parameters
+    supports_single_timestep = "single_timestep" in extract_params
+    supports_generator = "generator" in extract_params
+    if single_timestep is not None and not supports_single_timestep:
+        print(f"[diffusion-cache] WARNING: single_timestep was requested but "
+              f"{type(extractor).__name__}.extract_activations doesn't accept it -- ignoring, "
+              f"falling back to the extractor's default trajectory.")
+    if seed_from_filenames and not supports_generator:
+        print(f"[diffusion-cache] WARNING: seed_from_filenames was requested but "
+              f"{type(extractor).__name__}.extract_activations doesn't accept a generator -- "
+              f"extraction will remain unseeded.")
+
     for i, (x, y) in enumerate(tqdm(dl, desc=f"Caching {source_name}", dynamic_ncols=True)):
         # x is already preprocessed tensor from extractor.preprocess
         #x is images and y is filename
@@ -109,7 +150,15 @@ def cache_diffusion_activations(
         if i == 0:
             print(f"[diffusion-cache] First batch image shape : {tuple(x.shape)}")
 
-        out = extractor.extract_activations(x)
+        extract_kwargs = {}
+        if supports_single_timestep and single_timestep is not None:
+            extract_kwargs["single_timestep"] = single_timestep
+        if supports_generator and seed_from_filenames:
+            extract_kwargs["generator"] = [
+                torch.Generator().manual_seed(_stem_seed(fn)) for fn in y
+            ]
+
+        out = extractor.extract_activations(x, **extract_kwargs)
         # out.activations: list length T, each (B,N,D)
         # stack -> (T,B,N,D) -> (B,T,N,D)
         acts_t = torch.stack([a.detach().cpu() for a in out.activations], dim=0)
@@ -179,6 +228,33 @@ if __name__ == "__main__":
     selection_file = os.path.join(colab_path_to_cache, "selected_images.txt")
     image_list = select_images(colab_coco_root, 2000, selection_file)
 
+    # DIFT-style single-timestep extraction (REPAIR_PLAN.md Fix 2.1) instead of
+    # the old 15-step null-prompt generation trajectory: noise the clean latent
+    # directly to the timestep training actually pins (fixed_timestep_idx in
+    # config.yaml, currently 10), take one forward pass. ~15x less I/O (V13),
+    # a real anchor to the input image instead of a ~1-3%-signal null-prompt
+    # hallucination (V4), and reproducible via seed_from_filenames.
+    # Set to None to fall back to the old full-trajectory extraction (e.g. to
+    # rebuild a multi-timestep cache for pixart_timestep_autopsy.py-style
+    # timestep sweeps -- those need several distinct timesteps, not one).
+    USE_DIFT_SINGLE_TIMESTEP = True
+    single_timestep = None
+    if USE_DIFT_SINGLE_TIMESTEP:
+        from pixart_timestep import resolve_pixart_raw_timestep
+        import yaml
+        config_global = {}
+        config_path = "/content/algoverse_github/config.yaml"
+        if os.path.isfile(config_path):
+            with open(config_path, "r") as f:
+                config_global = (yaml.safe_load(f) or {}).get("global", {})
+        extractor.scheduler.set_timesteps(extractor.num_inference_steps, device=extractor.device)
+        single_timestep = resolve_pixart_raw_timestep(
+            extractor.scheduler.timesteps.tolist(), config_global=config_global,
+        )
+        print(f"[diffusion-cache] DIFT single-timestep mode: raw t={single_timestep} "
+              f"(resolved from config.yaml's fixed_timestep_idx against a "
+              f"{extractor.num_inference_steps}-step schedule)")
+
     cache_diffusion_activations(
         extractor=extractor,
         source_name=source_name,
@@ -187,4 +263,6 @@ if __name__ == "__main__":
         batch_size=2,
         num_workers=2,
         image_list=image_list,
+        single_timestep=single_timestep,
+        seed_from_filenames=True,
     )

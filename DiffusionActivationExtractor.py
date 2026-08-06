@@ -645,6 +645,11 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
+        # Pixel resolution the model actually sees, matching the CenterCrop above.
+        # AdaLayerNormSingle's micro-conditioning wants PIXEL dims, not latent dims
+        # (REPAIR_PLAN.md V4) -- source this from the same place preprocessing does
+        # instead of reading it off the (8x-downsampled) latent tensor.
+        self._pixel_resolution = 512
     
     def _load_pipeline(self):
         """Load PixArt pipeline components."""
@@ -680,16 +685,22 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     def _encode_null_prompt(self, batch_size: int) -> dict:
         """Encode empty prompt using the one T5 text encoder."""
         null_prompt = [""] * batch_size
-        
+
         # Tokenize for T5
-        text_inputs_1 = self.tokenizer(
+        tokenized = self.tokenizer(
             null_prompt,
             padding="max_length",
             max_length=256,
             truncation=True,
             return_tensors="pt",
-        ).input_ids.to(self.device)
-        
+        )
+        text_inputs_1 = tokenized.input_ids.to(self.device)
+        # For an empty string, only ~1 of 256 positions is real content (EOS);
+        # everything else is padding. Without this mask, cross-attention in
+        # every hooked block attends over 255 pad embeddings as if they were
+        # real context (REPAIR_PLAN.md V4).
+        attention_mask_1 = tokenized.attention_mask.to(self.device)
+
 
 
         """# Tokenize for CLIP-G
@@ -739,6 +750,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         
         return {
             "prompt_embeds": prompt_embeds_3,
+            "encoder_attention_mask": attention_mask_1,
             #"pooled_prompt_embeds": pooled_prompt_embeds,
         }
     
@@ -753,11 +765,18 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         """Prepare inputs for PixArt transformer."""
         batch_size = latents.shape[0]
         B, C, H, W = latents.shape
-        
+
+        # aspect_ratio is scale-invariant (H/W is the same in pixel or latent
+        # space for a uniformly-downsampled crop), but AdaLayerNormSingle's
+        # micro-conditioning wants PIXEL resolution, not the 8x-downsampled
+        # latent's (H, W) -- e.g. 512x512, not 64x64 (REPAIR_PLAN.md V4). Every
+        # AdaLN modulation in every block was being told the image is 64x64,
+        # out of distribution for this checkpoint.
         aspect_ratio = torch.tensor([H / W], device=self.device).unsqueeze(0).repeat(B, 1)
+        pixel_h = pixel_w = self._pixel_resolution
 
         added_cond_kwargs = {
-        "resolution": torch.tensor([H, W], device=self.device).unsqueeze(0).repeat(B, 1),
+        "resolution": torch.tensor([pixel_h, pixel_w], device=self.device).unsqueeze(0).repeat(B, 1),
         "aspect_ratio": aspect_ratio,
         }
 
@@ -767,13 +786,16 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             prompt_embeds = prompt_embeds["prompt_embeds"],
 
         )"""
-        
-        return {
+
+        transformer_inputs = {
             "hidden_states": latents,
             "timestep": timestep.expand(batch_size).to(self.dtype),
             "encoder_hidden_states": prompt_embeds["prompt_embeds"],
             "added_cond_kwargs": added_cond_kwargs,
         }
+        if "encoder_attention_mask" in prompt_embeds:
+            transformer_inputs["encoder_attention_mask"] = prompt_embeds["encoder_attention_mask"]
+        return transformer_inputs
     def _process_model_output(self, model_output, latents):
         # PixArt outputs (B, 2*C, H, W): [epsilon | learned_variance_logits].
         # DDIMScheduler only wants the epsilon half (B, C, H, W).
@@ -820,12 +842,58 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         sigmas.append(0.0)   # terminal sigma (clean image)
         return sigmas
 
+    def _make_noise(self, ref: torch.Tensor, generator=None) -> torch.Tensor:
+        """
+        Sample noise shaped like `ref`. `generator` may be a single
+        torch.Generator (shared across the whole batch), a list of one
+        Generator per batch item (for reproducible PER-IMAGE noise), or None
+        (old unseeded `torch.randn_like` behaviour). Generators are always
+        consumed on CPU regardless of self.device, so a seed derived from an
+        image's filename reproduces the same noise on any machine
+        (REPAIR_PLAN.md V4 -- extraction was previously unseeded, so no two
+        runs, and no run against a re-downloaded cache, ever matched).
+        """
+        if generator is None:
+            return torch.randn_like(ref)
+        if isinstance(generator, (list, tuple)):
+            if len(generator) != ref.shape[0]:
+                raise ValueError(
+                    f"Got {len(generator)} generators for a batch of {ref.shape[0]}"
+                )
+            rows = [torch.randn(ref.shape[1:], generator=g, device="cpu") for g in generator]
+            noise = torch.stack(rows, dim=0)
+        else:
+            noise = torch.randn(ref.shape, generator=generator, device="cpu")
+        return noise.to(device=ref.device, dtype=ref.dtype)
+
     @torch.no_grad()
-    def extract_activations(self, image: torch.Tensor) -> ActivationOutput:
+    def extract_activations(
+        self,
+        image: torch.Tensor,
+        single_timestep: Optional[int] = None,
+        generator=None,
+    ) -> ActivationOutput:
         """
         Overridden for PixArt / DDIMScheduler, which does not expose .sigmas.
         The flow-matching noise-addition formula is also replaced by the standard
         DDPM forward-process: x_t = sqrt(alpha_t)*x_0 + sqrt(1-alpha_t)*eps.
+
+        single_timestep: if given (a raw diffusion timestep, 0..999 -- see
+        pixart_timestep.resolve_pixart_raw_timestep), skip the reverse-diffusion
+        trajectory entirely: noise the CLEAN latent directly to this one
+        timestep and take a SINGLE forward pass (DIFT-style; Tang et al.,
+        "Emergent Correspondence from Image Diffusion"). This is what the
+        project's t=10 cache-index pin was implicitly imitating -- the default
+        (single_timestep=None) path instead *generates forward* under a null
+        prompt from ~1-3% real signal, which is a different and much noisier
+        protocol (REPAIR_PLAN.md V4) and produces 15x more data than training
+        ever reads (V13). When set, the returned ActivationOutput has exactly
+        one entry in each of activations/timesteps/sigmas, so it composes with
+        the existing (T, N, D)-shaped cache format at T=1 without changing any
+        downstream shape assumptions.
+
+        generator: optional torch.Generator (or list of per-image Generators,
+        see `_make_noise`) so extraction is reproducible.
         """
         batch_size = image.shape[0]
         image = image.to(device=self.device, dtype=self.dtype)
@@ -841,13 +909,10 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         timesteps = self.scheduler.timesteps
         sigmas = self._get_ddim_sigmas()   # <-- derived, not scheduler.sigmas
 
-        # Step 4: Add noise at the highest noise level using DDPM forward process
-        noise = torch.randn_like(clean_latents)
-        initial_t = int(timesteps[0])
-        alpha = self.scheduler.alphas_cumprod[initial_t].item()
-        noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
-
-        # Step 5: Set up hook to capture activations
+        # Step 5 (numbering kept from the original method): set up hook to
+        # capture activations. Step 4 (noise addition) happens per-branch below
+        # since the single-timestep path noises directly to the chosen t
+        # instead of timesteps[0].
         activations_list = []
         timesteps_list = []
         sigmas_list = []
@@ -870,25 +935,45 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         last_block = self._get_last_block()
         hook_handle = last_block.register_forward_hook(hook_fn)
 
-        # Step 6: Denoise step by step, capturing activations at each step
-        latents = noisy_latents
-
         try:
-            for i, t in enumerate(timesteps):
-                transformer_inputs = self._get_transformer_input(latents, t, prompt_embeds)
-                model_output = self.transformer(**transformer_inputs, return_dict=False)[0]
-                noise_pred = self._process_model_output(model_output, latents)
+            if single_timestep is not None:
+                # DIFT-style: one noise level, one forward pass, no reverse loop.
+                noise = self._make_noise(clean_latents, generator)
+                alpha = self.scheduler.alphas_cumprod[int(single_timestep)].item()
+                noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
+                t = torch.tensor(int(single_timestep), device=self.device)
+
+                transformer_inputs = self._get_transformer_input(noisy_latents, t, prompt_embeds)
+                self.transformer(**transformer_inputs, return_dict=False)  # hook captures the activation
 
                 timesteps_list.append(t.clone())
-                sigmas_list.append(sigmas[i])   # per-step sigma from _get_ddim_sigmas
+                sigmas_list.append(float(((1 - alpha) / alpha) ** 0.5))
+                latents = noisy_latents
+            else:
+                # Step 4: Add noise at the highest noise level using DDPM forward process
+                noise = self._make_noise(clean_latents, generator)
+                initial_t = int(timesteps[0])
+                alpha = self.scheduler.alphas_cumprod[initial_t].item()
+                noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
 
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # Step 6: Denoise step by step, capturing activations at each step
+                latents = noisy_latents
+                for i, t in enumerate(timesteps):
+                    transformer_inputs = self._get_transformer_input(latents, t, prompt_embeds)
+                    model_output = self.transformer(**transformer_inputs, return_dict=False)[0]
+                    noise_pred = self._process_model_output(model_output, latents)
+
+                    timesteps_list.append(t.clone())
+                    sigmas_list.append(sigmas[i])   # per-step sigma from _get_ddim_sigmas
+
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         finally:
             hook_handle.remove()
 
         if not activations_list:
             raise RuntimeError(
-                f"[PixArt] No activations captured after {self.num_inference_steps} steps. "
+                f"[PixArt] No activations captured "
+                f"({'single_timestep=' + str(single_timestep) if single_timestep is not None else str(self.num_inference_steps) + ' steps'}). "
                 "The forward hook may not have fired — check that the hooked transformer block exists and produces an output tensor."
             )
         print(f"[PixArt] Captured {len(activations_list)} activations, "

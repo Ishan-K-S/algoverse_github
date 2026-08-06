@@ -83,13 +83,22 @@ class DinoV2(BaseModel):
         if self.use_half:
             self.model = self.model.half()
 
+        # Resize(224) [int, not tuple] + CenterCrop(224): short side to 224, aspect
+        # preserved, then a square crop -- the same crop strategy PixArt's
+        # preprocessing already uses (Resize(512)+CenterCrop(512)). The previous
+        # Resize((224,224)) squashed the whole frame anisotropically, so DinoV2 and
+        # PixArt were looking at different regions of every non-square image
+        # (REPAIR_PLAN.md V3): DinoV2 saw the full frame stretched, PixArt saw a
+        # cropped square. Per-token cross-model alignment requires both grids to
+        # cover the same pixels.
         self.preprocess = transforms.Compose(
             [
                 transforms.Resize(
-                    (224, 224),
+                    224,
                     interpolation=transforms.InterpolationMode.BICUBIC,
                     antialias=True,
                 ),
+                transforms.CenterCrop(224),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]

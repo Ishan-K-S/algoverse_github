@@ -65,3 +65,27 @@ def resolve_pixart_timestep(
             return _clamp(int(from_yaml), total_steps)
 
     return total_steps - 1
+
+
+def resolve_pixart_raw_timestep(
+    scheduler_timesteps,
+    ckpt: Optional[Dict[str, Any]] = None,
+    config_global: Optional[Dict[str, Any]] = None,
+    override: Optional[int] = None,
+) -> int:
+    """
+    Same precedence as resolve_pixart_timestep, but returns a raw diffusion
+    timestep (0..999) instead of a cache-array index.
+
+    `scheduler_timesteps` is a DDIMScheduler's `.timesteps` (descending, one
+    entry per discretized inference step, e.g. 15 entries for
+    num_inference_steps=15) -- pass the same schedule length the cache index
+    was chosen against, so an index like 10 keeps meaning the same noise level
+    it always has, whether or not the cache itself still stores all steps.
+    Used by the DIFT-style single-timestep extraction path (REPAIR_PLAN.md
+    Fix 2.1) to pick the one raw `t` to noise a clean latent to directly,
+    instead of slicing an index out of a pre-cached (T, N, D) trajectory.
+    """
+    total_steps = len(scheduler_timesteps)
+    idx = resolve_pixart_timestep(total_steps, ckpt=ckpt, config_global=config_global, override=override)
+    return int(scheduler_timesteps[idx])
