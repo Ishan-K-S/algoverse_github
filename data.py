@@ -113,6 +113,7 @@ class CocoActivationDataset(Dataset):
         diffusion_models: Optional[List[str]] = None,
         standardization_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
         stats_seed: Optional[int] = None,
+        spatial_aligner: Optional[Any] = None,
     ):
         super().__init__()
 
@@ -125,6 +126,20 @@ class CocoActivationDataset(Dataset):
         self.return_metadata = return_metadata
         self.diffusion_models = set(diffusion_models or [])
         self.stats_seed = stats_seed
+        # Used ONLY to compute standardization stats on the post-alignment
+        # distribution (REPAIR_PLAN.md V6) -- NOT applied to the activations
+        # __getitem__ returns. Per-channel affine (standardize) and spatial
+        # average-pooling (align) are both linear in the token/spatial axis,
+        # so they commute exactly: (avgpool(x) - mean) / std == avgpool((x -
+        # mean) / std) for the same per-channel mean/std constants. The actual
+        # bug was never *where* standardization runs relative to alignment --
+        # it was that the mean/std were fit to individual tokens' variance
+        # instead of the pooled token's variance, which is lower (averaging
+        # correlated neighbours reduces variance). Computing stats here on
+        # aligned samples fixes the constants that get used; leaving
+        # __getitem__'s and train.py's existing standardize-then-align
+        # sequence untouched is equivalent, not a shortcut.
+        self.spatial_aligner = spatial_aligner
 
         # ------------------------------------------------------------------ #
         # Discover image stems from existing cache files.
@@ -179,6 +194,32 @@ class CocoActivationDataset(Dataset):
     # Standardisation helpers
     # ---------------------------------------------------------------------- #
 
+    def _apply_spatial_align_for_stats(self, act: torch.Tensor, source: str) -> torch.Tensor:
+        """
+        Apply self.spatial_aligner (if any) to a per-image activation before
+        it feeds the Welford accumulator below, so the computed std reflects
+        the POOLED token's variance, not each individual native token's
+        variance (REPAIR_PLAN.md V6). Averaging correlated neighbouring
+        tokens together lowers variance below 1 even when every input token
+        is already unit-variance, so a std fit to un-pooled tokens
+        under-normalizes whatever this source looks like after alignment.
+
+        SpatialAligner.align expects (B, N, D). A 2-D vision activation
+        (N, D) gets a throwaway batch dim; a 3-D diffusion activation
+        (T, N, D) already has a leading axis that plays that role exactly
+        (pooling only touches the N/D axes, so this is correct regardless of
+        which single timestep training eventually slices out of T).
+        """
+        if self.spatial_aligner is None or source not in self.spatial_aligner.native_grid_sizes:
+            return act
+        if act.dim() == 2:
+            return self.spatial_aligner.align(act.unsqueeze(0), source=source).squeeze(0)
+        if act.dim() == 3:
+            return self.spatial_aligner.align(act, source=source)
+        raise ValueError(
+            f"Unsupported activation rank {act.dim()} for spatial alignment: {tuple(act.shape)}"
+        )
+
     def _compute_standardization_stats(self, sample_size: int = 1000):
         """
         Compute per-source mean and std from a random sample of the cache.
@@ -207,6 +248,7 @@ class CocoActivationDataset(Dataset):
             for idx in tqdm(sample_indices, desc=f"Stats {source}"):
                 act = self._load_activation(source, int(idx))
                 act = _maybe_strip_cls(act, source, self.use_class_tokens)
+                act = self._apply_spatial_align_for_stats(act, source)
                 tokens = _flatten_tokens_for_stats(act).float()  # (K, D)
 
                 if welford_mean is None:

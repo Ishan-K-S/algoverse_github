@@ -199,6 +199,26 @@ if __name__ == "__main__":
     use_wandb = _init_wandb(cfg, run_name)
     log_every = _parse_int_field(CONFIG.get("wandb_log_every", 50), "CONFIG.global.wandb_log_every")
 
+    # ----- Spatial aligner (built BEFORE the dataset, not after) -----
+    # Build spatial aligner from config (None if disabled).
+    # When enabled, model_tokens is rewritten to post-alignment counts so
+    # the model and any downstream consumers see the effective token grid.
+    # Moved ahead of dataset construction (REPAIR_PLAN.md V6) so the dataset
+    # can compute standardization stats on the POOLED distribution -- a std
+    # fit to individual native tokens under-normalizes whatever a source
+    # looks like after alignment, since averaging correlated neighbouring
+    # tokens lowers variance below what any one token had on its own.
+    spatial_aligner = build_spatial_aligner_from_config(CONFIG, model_tokens)
+    if spatial_aligner is not None:
+        effective_tokens = spatial_aligner.effective_token_counts()
+        print(f"[spatial-align] enabled: pooling all models to N={spatial_aligner.target_n_tokens}")
+        for m_name in model_tokens:
+            print(f"  {m_name:10s}: native={model_tokens[m_name]:5d}  effective={effective_tokens[m_name]:5d}")
+        model_tokens_effective = dict(effective_tokens)
+    else:
+        print(f"[spatial-align] disabled (no spatial_align_to in config)")
+        model_tokens_effective = dict(model_tokens)
+
     # ----- Dataset -----
     combined_npz = bool(CONFIG.get("combined_npz", True))
 
@@ -212,6 +232,7 @@ if __name__ == "__main__":
         return_metadata=combined_npz,
         diffusion_models=list(diffusion_models),
         stats_seed=CONFIG.get("stats_seed"),
+        spatial_aligner=spatial_aligner,
     )
 
     # Optionally recompute standardisation stats with a configured sample size
@@ -237,20 +258,6 @@ if __name__ == "__main__":
         CONFIG.get("latent_dim", CONFIG.get("nb_components", default_latent)),
         "CONFIG.global.latent_dim",
     )
-
-    # Build spatial aligner from config (None if disabled).
-    # When enabled, model_tokens is rewritten to post-alignment counts so
-    # the model and any downstream consumers see the effective token grid.
-    spatial_aligner = build_spatial_aligner_from_config(CONFIG, model_tokens)
-    if spatial_aligner is not None:
-        effective_tokens = spatial_aligner.effective_token_counts()
-        print(f"[spatial-align] enabled: pooling all models to N={spatial_aligner.target_n_tokens}")
-        for m_name in model_tokens:
-            print(f"  {m_name:10s}: native={model_tokens[m_name]:5d}  effective={effective_tokens[m_name]:5d}")
-        model_tokens_effective = dict(effective_tokens)
-    else:
-        print(f"[spatial-align] disabled (no spatial_align_to in config)")
-        model_tokens_effective = dict(model_tokens)
 
     model = UniversalSAE(
         model_dims=model_dims,
