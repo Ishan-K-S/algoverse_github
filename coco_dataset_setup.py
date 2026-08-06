@@ -35,6 +35,93 @@ def select_images(coco_root: str, n: int, save_path: str, seed: int = 42) -> lis
     return selected
 
 
+def split_train_val(
+    identifiers: list,
+    save_dir: str,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+    train_filename: str = "train_stems.txt",
+    val_filename: str = "val_stems.txt",
+) -> tuple:
+    """
+    Deterministically split a list of identifiers (image filenames or cache
+    stems -- this function doesn't care which) into disjoint train/val sets,
+    persisted to disk next to selected_images.txt (REPAIR_PLAN.md V7/Fix 2.3).
+
+    Idempotent like select_images(): if both files already exist, loads and
+    returns them unchanged rather than re-splitting -- so every diagnostic and
+    every resumed run sees the exact same split.
+
+    Every prior number in this project (including the fixed_timestep_idx
+    choice itself) was measured on the same data used to train, so there was
+    no generalization measurement anywhere. This exists to fix that; it will
+    make the headline numbers look worse, which is the point.
+    """
+    train_path = os.path.join(save_dir, train_filename)
+    val_path = os.path.join(save_dir, val_filename)
+
+    if os.path.exists(train_path) and os.path.exists(val_path):
+        with open(train_path) as f:
+            train_list = [line.strip() for line in f if line.strip()]
+        with open(val_path) as f:
+            val_list = [line.strip() for line in f if line.strip()]
+
+        # Fail loudly, not silently, if the cache this split was made from has
+        # since changed (e.g. a Fix 2.1 re-cache under a different image set)
+        # -- otherwise new stems belong to neither persisted list and quietly
+        # vanish from training instead of landing in either split.
+        persisted = set(train_list) | set(val_list)
+        current = set(identifiers)
+        if persisted != current:
+            missing_from_cache = persisted - current
+            new_in_cache = current - persisted
+            raise RuntimeError(
+                f"[split_train_val] Persisted split at {save_dir} no longer matches the "
+                f"current cache: {len(missing_from_cache)} persisted stem(s) are no longer "
+                f"in the cache, {len(new_in_cache)} cached stem(s) aren't in the persisted "
+                f"split. The cache was likely re-generated since this split was created. "
+                f"Delete {train_filename!r}/{val_filename!r} in {save_dir} to regenerate the "
+                f"split against the current cache (this will produce a NEW split -- old "
+                f"results measured on the old split will not be directly comparable)."
+            )
+
+        print(f"[split_train_val] Loaded persisted split: "
+              f"{len(train_list)} train / {len(val_list)} val from {save_dir}")
+        return train_list, val_list
+
+    if not (0.0 < val_fraction < 1.0):
+        raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+
+    items = sorted(set(identifiers))
+    if not items:
+        raise RuntimeError("[split_train_val] Got an empty identifier list to split.")
+
+    rng = random.Random(seed)
+    shuffled = items[:]
+    rng.shuffle(shuffled)
+
+    n_val = max(1, int(round(len(shuffled) * val_fraction)))
+    if n_val >= len(shuffled):
+        raise RuntimeError(
+            f"[split_train_val] val_fraction={val_fraction} leaves no training images "
+            f"out of {len(shuffled)} total."
+        )
+    val_list = sorted(shuffled[:n_val])
+    train_list = sorted(shuffled[n_val:])
+
+    overlap = set(train_list) & set(val_list)
+    assert not overlap, f"[split_train_val] train/val overlap (should be impossible): {overlap}"
+
+    os.makedirs(save_dir, exist_ok=True)
+    with open(train_path, 'w') as f:
+        f.write('\n'.join(train_list) + '\n')
+    with open(val_path, 'w') as f:
+        f.write('\n'.join(val_list) + '\n')
+    print(f"[split_train_val] Created new split (seed={seed}): "
+          f"{len(train_list)} train / {len(val_list)} val, saved to {save_dir}")
+    return train_list, val_list
+
+
 class CocoData(Dataset):
 
     def __init__(self, path_to_data, transform, image_list=None, max_images=None, seed=42):

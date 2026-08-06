@@ -24,8 +24,9 @@ from torch.utils.data import DataLoader
 
 from data import CocoActivationDataset
 from universal_sae import UniversalSAE
-from train import train_universal_sae
+from train import train_universal_sae, evaluate_universal_sae
 from spatial_align import build_spatial_aligner_from_config
+from coco_dataset_setup import split_train_val
 
 # ---------------------------------------------------------------------------
 # wandb setup
@@ -222,6 +223,27 @@ if __name__ == "__main__":
     # ----- Dataset -----
     combined_npz = bool(CONFIG.get("combined_npz", True))
 
+    # ----- Train/val split (REPAIR_PLAN.md V7/Fix 2.3) -----
+    # Every number this project has produced -- every heatmap, every
+    # top-activating-image, and the fixed_timestep_idx choice itself -- was
+    # measured on the same 2000 images used to train. Discover the cached
+    # stems the same way CocoActivationDataset does (anchor on the combined
+    # suffix or the first source's suffix) so the split operates on exactly
+    # the image set that's actually available, then persist an 80/20 split
+    # next to selected_images.txt so it's stable across runs and resumes.
+    anchor_suffix = "_combined.npz" if combined_npz else f"_{sources[0]}.npz"
+    all_stems = sorted(
+        f[: -len(anchor_suffix)] for f in os.listdir(cache_root) if f.endswith(anchor_suffix)
+    )
+    train_stems, val_stems = split_train_val(
+        all_stems,
+        save_dir=cache_root,
+        val_fraction=float(CONFIG.get("val_fraction", 0.2)),
+        seed=_parse_int_field(CONFIG.get("val_split_seed", 42), "CONFIG.global.val_split_seed"),
+    )
+    print(f"[uni_demo] Train/val split: {len(train_stems)} train / {len(val_stems)} val "
+          f"(val_fraction={CONFIG.get('val_fraction', 0.2)})")
+
     dataset = CocoActivationDataset(
         cache_root=cache_root,
         sources=sources,
@@ -233,6 +255,7 @@ if __name__ == "__main__":
         diffusion_models=list(diffusion_models),
         stats_seed=CONFIG.get("stats_seed"),
         spatial_aligner=spatial_aligner,
+        allowed_stems=train_stems,
     )
 
     # Optionally recompute standardisation stats with a configured sample size
@@ -247,8 +270,33 @@ if __name__ == "__main__":
         num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
         pin_memory=True,
     )
-    print(f"[uni_demo] Dataset size  : {len(dataset)} images")
+    print(f"[uni_demo] Dataset size  : {len(dataset)} images (train split)")
     print(f"[uni_demo] Dataloader    : {len(dataloader)} batches  (batch_size={CONFIG.get('batch_size', 32)})")
+
+    # Held-out val dataset: same cache, same standardization stats and spatial
+    # aligner as train (stats/alignment are properties of the pipeline, not
+    # something the val set should compute independently), disjoint images.
+    val_dataset = CocoActivationDataset(
+        cache_root=cache_root,
+        sources=sources,
+        combined_npz=combined_npz,
+        standardize=bool(CONFIG.get("standardize", True)),
+        divide_norm=bool(CONFIG.get("divide_norm", False)),
+        use_class_tokens=bool(CONFIG.get("use_class_tokens", True)),
+        return_metadata=combined_npz,
+        diffusion_models=list(diffusion_models),
+        standardization_stats=getattr(dataset, "standardization_stats", None),
+        spatial_aligner=spatial_aligner,
+        allowed_stems=val_stems,
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=_parse_int_field(CONFIG.get("batch_size", 32), "CONFIG.global.batch_size"),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+    print(f"[uni_demo] Val dataset   : {len(val_dataset)} images, {len(val_dataloader)} batches")
 
     # ----- Build UniversalSAE -----
     exp_factor = _parse_int_field(CONFIG.get("exp_factor", 8), "CONFIG.global.exp_factor")
@@ -372,9 +420,29 @@ if __name__ == "__main__":
         print(f"[epoch] {epoch + 1}/{nb_epochs} done in {dt:.2f}s  "
               f"lr={current_lr:.2e}")
 
+        # Held-out validation pass (REPAIR_PLAN.md V7/Fix 2.3): the only
+        # number in this project measured on images the model never trained
+        # on. No backward pass, no resampling, no curriculum/alignment terms.
+        val_metrics = evaluate_universal_sae(
+            model=model,
+            dataloader=val_dataloader,
+            diffusion_models=diffusion_models,
+            device=device,
+            fixed_timestep_idx=(
+                None if CONFIG.get("fixed_timestep_idx", None) is None
+                else int(CONFIG["fixed_timestep_idx"])
+            ),
+            spatial_aligner=spatial_aligner,
+        )
+        val_loss_str = ", ".join(
+            f"{k.replace('val/loss_', '')}={v:.4f}"
+            for k, v in val_metrics.items() if k.startswith("val/loss_")
+        )
+        print(f"[epoch] {epoch + 1}/{nb_epochs} val: {val_loss_str}")
+
         if use_wandb and WANDB_AVAILABLE:
             wandb.log({"epoch/time_seconds": dt, "epoch/index": epoch,
-                       "epoch/lr": current_lr})
+                       "epoch/lr": current_lr, **val_metrics})
 
         if (epoch % save_every == 0) or (epoch + 1 == nb_epochs):
             ckpt_path = os.path.join(ckpt_dir, f"usae_epoch_{epoch}.pth")

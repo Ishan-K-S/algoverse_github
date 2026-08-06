@@ -114,6 +114,7 @@ class CocoActivationDataset(Dataset):
         standardization_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
         stats_seed: Optional[int] = None,
         spatial_aligner: Optional[Any] = None,
+        allowed_stems: Optional[List[str]] = None,
     ):
         super().__init__()
 
@@ -163,6 +164,22 @@ class CocoActivationDataset(Dataset):
                 f"No cached files found in '{cache_root}' with suffix '{anchor_suffix}'. "
                 "Make sure you have run the caching scripts first."
             )
+
+        # Restrict to a train/val split (REPAIR_PLAN.md V7/Fix 2.3). Filtering
+        # by stem (not by re-deriving a split here) so the caller decides which
+        # half this instance is -- e.g. uni_demo.py computes one split and
+        # builds two CocoActivationDataset instances from it, one per side.
+        if allowed_stems is not None:
+            allowed = {_img_stem(s) for s in allowed_stems}
+            before = len(self.stems)
+            self.stems = [s for s in self.stems if _img_stem(s) in allowed]
+            if len(self.stems) == 0:
+                raise RuntimeError(
+                    f"allowed_stems filtered out all {before} cached images in '{cache_root}' -- "
+                    "the split and the cache directory don't refer to the same image set."
+                )
+            print(f"[CocoActivationDataset] Restricted to {len(self.stems)}/{before} images "
+                  f"via allowed_stems")
 
         print(f"[CocoActivationDataset] Found {len(self.stems)} images "
               f"(combined_npz={combined_npz}, sources={sources})")

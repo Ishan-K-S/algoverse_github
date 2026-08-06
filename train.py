@@ -554,6 +554,127 @@ def resample_dead_features(
     return n_dead
 
 
+@torch.no_grad()
+def evaluate_universal_sae(
+    model: nn.Module,
+    dataloader,
+    diffusion_models: Set[str],
+    device,
+    fixed_timestep_idx: Optional[int] = None,
+    spatial_aligner=None,
+) -> Dict[str, float]:
+    """
+    Held-out reconstruction-loss pass (REPAIR_PLAN.md V7/Fix 2.3): no
+    backward pass, no optimizer step, no dead-feature resampling, no
+    curriculum gating, no latent-alignment loss -- just self+cross MSE for
+    every (source, target) pair the model can structurally reconstruct,
+    averaged over the whole dataloader. Intended for a held-out val split so
+    at least one number in this project is a genuine generalization
+    measurement instead of being read off the training data.
+
+    Unlike training's _pick_source (one source per step, to amortize one
+    gradient update), every source present in each batch is evaluated here,
+    since there's no update cost to amortize during eval.
+
+    Returns a flat dict of {"val/loss_<source>_to_<target>": mean_mse, ...}
+    plus "val/sae_loss" (mean over all pair losses, unweighted) and
+    "val/n_batches". Caller (e.g. uni_demo.py) decides whether/how to log it.
+    """
+    was_training = model.training
+    model.eval()
+
+    # Same patch train_universal_sae applies (train.py, "Critical: ..." comment
+    # above its own copy): can_cross_reconstruct() reads model.model_tokens to
+    # decide if cross-model reconstruction is structurally possible. Applied
+    # here too (idempotent) so eval doesn't silently skip every cross-pair if
+    # it's ever called before any training epoch has run.
+    if spatial_aligner is not None:
+        target_n = spatial_aligner.target_n_tokens
+        for name in list(model.model_tokens.keys()):
+            if name in spatial_aligner.native_grid_sizes:
+                model.model_tokens[name] = target_n
+
+    sums: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    n_batches = 0
+
+    for (acts, meta), _y in dataloader:
+        n_batches += 1
+        for source in acts.keys():
+            if source in diffusion_models:
+                x_src_full = acts[source].to(device)
+                batch_size = x_src_full.shape[0]
+                src_ts_bt = _get_sigmas_bt(meta, source, batch_size, x_src_full.device)
+                if src_ts_bt is None:
+                    raise KeyError(
+                        f"Missing timestep metadata for diffusion source '{source}'. "
+                        f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
+                    )
+                x_src, t_src, src_layer, src_t_idx, src_layers, src_steps = _extract_source_slice(
+                    x_src_full, is_diffusion=True, timestep_values_bt=src_ts_bt,
+                    fixed_timestep_idx=fixed_timestep_idx,
+                )
+                if spatial_aligner is not None:
+                    x_src = spatial_aligner.align(x_src, source=source)
+                _z_pre, z = model.encode(x_src, source=source, sigma=t_src)
+            else:
+                x_src = acts[source].to(device)
+                batch_size = x_src.shape[0]
+                x_src, _t, src_layer, src_t_idx, src_layers, src_steps = _extract_source_slice(
+                    x_src, is_diffusion=False,
+                )
+                if spatial_aligner is not None:
+                    x_src = spatial_aligner.align(x_src, source=source)
+                _z_pre, z = model.encode(x_src, source=source, sigma=None)
+
+            for target, x_target in acts.items():
+                if not model.can_cross_reconstruct(source, target):
+                    continue
+                x_target = x_target.to(device)
+
+                if target in diffusion_models:
+                    tgt_ts_bt = _get_sigmas_bt(meta, target, batch_size, x_target.device)
+                    if tgt_ts_bt is None:
+                        raise KeyError(
+                            f"Missing timestep metadata for diffusion target '{target}'. "
+                            f"Expected timesteps_by_model/timesteps or sigmas_by_model/sigmas."
+                        )
+                    x_target_t, t_tgt, _tl, _ti = _extract_target_slice(
+                        x_target, is_diffusion=True,
+                        timestep_values_bt=tgt_ts_bt,
+                        source_layer_idx=src_layer, source_total_layers=src_layers,
+                        source_timestep_idx=src_t_idx, source_total_steps=src_steps,
+                        fixed_timestep_idx=fixed_timestep_idx,
+                    )
+                    if spatial_aligner is not None:
+                        x_target_t = spatial_aligner.align(x_target_t, source=target)
+                    x_hat = model.decode(z, target=target, sigma=t_tgt)
+                else:
+                    x_target_t, _t, _tl, _ti = _extract_target_slice(
+                        x_target, is_diffusion=False, timestep_values_bt=None,
+                        source_layer_idx=src_layer, source_total_layers=src_layers,
+                    )
+                    if spatial_aligner is not None:
+                        x_target_t = spatial_aligner.align(x_target_t, source=target)
+                    x_hat = model.decode(z, target=target, sigma=None)
+
+                x_target_t = _pool_target_for_loss(model, x_target_t)
+                loss = mse_flat(x_hat, x_target_t)
+
+                key = f"{source}_to_{target}"
+                sums[key] = sums.get(key, 0.0) + loss.item()
+                counts[key] = counts.get(key, 0) + 1
+
+    if was_training:
+        model.train()
+
+    result = {f"val/loss_{k}": sums[k] / counts[k] for k in sums}
+    if result:
+        result["val/sae_loss"] = sum(result.values()) / len(result)
+    result["val/n_batches"] = float(n_batches)
+    return result
+
+
 def train_universal_sae(
     model: nn.Module,
     dataloader,
