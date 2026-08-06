@@ -1582,3 +1582,167 @@ inputs), a maintainability note rather than a defect, left as-is to avoid refact
   expensive relative to training itself, but not measured against real data/timing in this session.
 
 ---
+
+## Fix 3.2 — unify feature-usage definitions, add per-token co-fire metric
+
+**Addresses:** V16 (last bullet, MEDIUM), Stage 3's "add the metric that measures the actual goal"
+**Commit:** `363a1b0`
+**Files modified:** `train.py`, `dictionary_diagnostic.py`, `cross_model_overlap.py`
+**Files added:** `feature_usage.py`
+
+### Issue
+
+Two related problems: (1) "does this model use dictionary feature k" was answered three
+incompatible ways across the codebase — `train.py`'s partition diagnostic used a usage-EMA rate
+threshold (continuous, whole-training-run), `dictionary_diagnostic.py` used "fired on ≥1 token of
+≥1 image in a fixed sample" (ever/never), `cross_model_overlap.py` used "in the per-image top-K by
+max|activation|, for ≥1 image" (top-K membership) — so a "used" count from one script was never
+comparable to another's, and `dictionary_diagnostic.py` comparing wandb's `partition/score` to its
+own `partition_score` was comparing incommensurable quantities. (2) Every existing cross-model
+metric (`partition/usage_cosine`, `dictionary_diagnostic.py`'s per-image Jaccard/cosine,
+`cross_model_overlap.py`'s top-K Jaccard) aggregates over the token axis *before* comparing the two
+models — but the project's stated goal ("the same dictionary features fire on the same content
+across models") is explicitly a per-token/per-position claim, which none of the existing metrics can
+detect even in principle.
+
+### Root cause
+
+Each script's "used"/"overlap" logic was written independently as each was created, with no shared
+reference implementation — the same pattern of drift already seen and partially fixed in V12 (eval
+scripts reading live config instead of the checkpoint) and V8 (stale hook-target assumptions).
+
+### Changes
+
+**New `feature_usage.py`** — three functions, all pure-tensor, no dependency on any other module in
+this repo (checked: only imports `typing.Optional` and `torch`, so no circular-import risk with
+`train.py`/`dictionary_diagnostic.py`/`cross_model_overlap.py` importing it):
+- `compute_feature_usage(activations, criterion, threshold=1e-3, top_k=None) -> (K,) bool`: one
+  function, three criteria (`"rate_above_threshold"`, `"ever_fired"`, `"top_k_per_sample"`), each
+  reproducing exactly one of the three scripts' historical definitions. Calling it with the same
+  criterion from two different scripts is now guaranteed identical (one implementation), instead of
+  two independent reimplementations that could silently drift.
+- `per_token_cofire_jaccard(z_a, z_b) -> scalar`: the actual new per-token metric. Given two
+  ALREADY spatially-aligned `(B, N, K)` latent codes (meaningless otherwise — REPAIR_PLAN.md V3),
+  computes Jaccard(active-feature-set) at each `(batch, token)` position independently, then
+  averages — as opposed to every prior metric's per-image or per-corpus aggregate.
+- `feature_heatmap_iou(z_a, z_b, feature_idx, threshold=0.0) -> float`: IoU of one feature's
+  active-token mask between two aligned models across a batch. **Implemented but not wired into any
+  call site in this commit** — the plan's Fix 3.2 wording is "per-token co-fire and/or heatmap IoU,"
+  and per-token co-fire alone satisfies that bar. Left available for a future diagnostic (e.g. a
+  per-feature heatmap-IoU histogram in `cross_model_overlap.py`, analogous to its existing per-image
+  Jaccard histogram) without needing new infrastructure.
+
+**`train.py`**:
+- `evaluate_universal_sae` (Fix 2.3's held-out eval pass) now also computes
+  `per_token_cofire_jaccard` for every pair of models present in each val batch — gated on
+  `spatial_aligner is not None` (per-token comparison is meaningless without a common grid), so this
+  metric is computed on the **val split**, per the plan's explicit instruction. Each source's `z`
+  (already computed for the reconstruction-loss part of the function) is stashed in a per-batch
+  dict; after the source/target loop, every unordered pair is compared via
+  `per_token_cofire_jaccard`, returned as `val/cofire_jaccard_<A>_vs_<B>`. A defensive shape-mismatch
+  guard (should never fire under the current pipeline, since `spatial_aligner` forces every source to
+  the same `target_n_tokens` and all sources in one batch share the same `B`) now **prints a warning**
+  before skipping, rather than silently continuing — added after independent review flagged that the
+  original silent `continue` would hide a real bug if this guard ever actually fired.
+- The pre-existing partition-diagnostic "used" computation
+  (`e > resample_dead_threshold`, from Fix 0.4) now calls
+  `compute_feature_usage(e, criterion="rate_above_threshold", threshold=resample_dead_threshold)` —
+  behaviorally identical, but the actual boolean-threshold logic now lives in one shared place.
+
+**`dictionary_diagnostic.py`**: two inline reimplementations replaced with calls to the shared
+function — the "did feature k fire on any token of this image" check (`(z_d != 0).any(dim=(0,1))` →
+`compute_feature_usage(z_d, criterion="ever_fired")`) and the per-image top-K selection
+(`torch.topk(scores_d, k=...)` → `compute_feature_usage(scores_d.unsqueeze(0),
+criterion="top_k_per_sample", top_k=...)` then `.nonzero()` to recover indices — both call sites'
+results are immediately converted to a `set()`, so the change from score-ordered to index-ordered
+output is inconsequential).
+
+**`cross_model_overlap.py`**: `top_feature_set`'s per-image top-K selection changed the same way.
+
+### Why necessary
+
+This is Stage 3's "add the metric that measures the actual goal" in `REPAIR_PLAN.md`
+(`PROJECT_STATUS.md` Phase 2) plus V16's last bullet. The existing aggregate-co-usage metrics can
+report a healthy-looking `usage_cosine` or partition score while the actual, stated research goal
+(per-token semantic correspondence) is completely absent — this gives the project at least one
+metric that can't be fooled that way, once real (post-Fix-2.1) data exists to run it on.
+
+### Verification performed
+
+Same scratch CPU venv as prior fixes. Two test scripts against the REAL `feature_usage.py`/
+`train.py`:
+- **`test_fix32.py`**: unit-level checks on all three `compute_feature_usage` criteria (including a
+  direct equivalence check against the literal old formulas — `torch.equal` against
+  `(z != 0).any(dim=(0,1))` for `ever_fired`, and a set-equality check against per-row `torch.topk`
+  unions for `top_k_per_sample` — not just "looks plausible," byte/set-identical to what the code
+  used to compute), plus error-path checks (wrong input rank, missing `top_k`, unknown criterion).
+  `per_token_cofire_jaccard`: identical inputs → exactly 1.0; fully disjoint active sets → exactly
+  0.0; a hand-computed partial-overlap case (`{0,1}` vs `{1,2}`) → exactly 1/3; both-empty active
+  sets → 0.0, not NaN; shape mismatch raises. `feature_heatmap_iou`: a hand-computed
+  partially-overlapping case → exactly 0.5; a feature that never fires for either model → 0.0, not a
+  division error.
+- **`test_fix32_eval_wiring.py`**: exercised the REAL `evaluate_universal_sae` end-to-end. Confirmed
+  no `cofire_jaccard` key appears when `spatial_aligner=None`; confirmed exactly one
+  `val/cofire_jaccard_DinoV2_vs_PixArt` key appears (correctly alphabetized) when a real
+  `SpatialAligner` is passed, with a finite value in `[0, 1]`. **Strongest check**: built a second
+  model where PixArt's `W_enc`/`b_pre` were copied from DinoV2's, fed the *identical* input tensor to
+  both "models," and confirmed the resulting `cofire_jaccard` is **exactly 1.0** — a genuine
+  ground-truth sanity check (identical encoder + identical input must produce identical firing
+  patterns at every token), not just "some plausible-looking number."
+
+**Differential check against the pre-fix code** (`git stash -u`/`git stash pop`, since
+`feature_usage.py` is a new untracked file that needed explicit inclusion): re-ran both test scripts
+unmodified against the stashed pre-fix code. `test_fix32.py` failed immediately at import
+(`ModuleNotFoundError: No module named 'feature_usage'`); `test_fix32_eval_wiring.py`'s Check A
+(no-aligner case) still passed trivially (nothing to break there), but Check B failed exactly as
+predicted (`val/cofire_jaccard_DinoV2_vs_PixArt` key genuinely absent pre-fix). Restored and
+re-confirmed both pass, then re-ran `test_fix11.py`/`test_fix12.py`/`test_fix22.py`/`test_fix23.py`
+as a full regression check on `train.py`'s accumulated changes across this session — all still pass.
+
+**Independent review:** dispatched a fresh-context subagent to review the diff plus the new file
+against V16's last bullet and Fix 3.2's spec. It independently re-verified the `ever_fired` and
+`top_k_per_sample` substitutions are mathematically/set-equivalent to the exact original formulas at
+the exact shapes each call site actually uses (not just "similar looking"); confirmed `zs_by_source`
+is populated on both the diffusion and non-diffusion branches of the per-source loop; confirmed the
+pairwise-enumeration pattern is correct and would generalize cleanly to 3+ models without further
+code changes; confirmed no circular import; confirmed the `dictionary_diagnostic.py`/
+`cross_model_overlap.py` edits are surgical (only the described lines). It flagged one **medium**
+finding — the shape-mismatch guard silently `continue`d instead of logging, which would hide a real
+bug if it ever actually fired (effectively dead code today, since `spatial_aligner` and shared-batch
+`B` make the mismatch condition unreachable under the current pipeline) — fixed in this same commit
+(added a `print` warning before the `continue`) and re-verified with both test scripts re-run
+afterward. One informational note: `feature_heatmap_iou` is implemented but genuinely unused/unwired
+anywhere in this commit — noted above as a deliberate scope choice (per-token co-fire alone satisfies
+Fix 3.2's "and/or" requirement), not an oversight.
+
+### Remaining uncertainty — DEFERRED / REQUIRES EXTERNAL EXPERIMENT
+
+- **Not verified against the real cache/checkpoint or a real Colab training run** (same gap as every
+  prior fix). All verification used synthetic tensors and toy models; the actual
+  `val/cofire_jaccard_DinoV2_vs_PixArt` VALUE for the real project — and whether it tells a different
+  story than `partition/usage_cosine`'s "0.857, looks fine" reading the plan already flags as
+  unsupported — is unmeasured. Per `REPAIR_PLAN.md`'s own framing (this metric is "only meaningful
+  after Fix 2.1" since per-token comparison requires the pixel-correspondence bug, V3, to be fixed
+  first), this is explicitly a **REQUIRES EXTERNAL EXPERIMENT** item gated on Fix 2.1's actual
+  re-cache having run:
+  ```
+  # After a real Fix 2.1 re-cache and at least one training epoch, in the Colab/GPU
+  # environment: val/cofire_jaccard_DinoV2_vs_PixArt is now logged to wandb automatically
+  # by uni_demo.py's existing epoch loop (Fix 2.3) -- no separate script needed. Compare
+  # its trend across epochs against partition/usage_cosine_DinoV2_vs_PixArt's trend.
+  ```
+  Expected result / success criteria: a finite value in `[0, 1]` every epoch; whether it's
+  meaningfully lower than `usage_cosine` (confirming the aggregate metric was overstating shared
+  structure, per the plan's H1-adjacent concern) is the actual research question this metric exists
+  to answer, not something to predict in advance.
+- **`feature_heatmap_iou` is unwired** (see above) — a natural follow-up is a per-feature heatmap-IoU
+  histogram in `cross_model_overlap.py`, alongside its existing per-image Jaccard histogram, for
+  whichever features `compute_feature_usage(criterion="rate_above_threshold")` marks as used by both
+  models on the real (post-Fix-2.1) checkpoint.
+- **This is the last item in `REPAIR_PLAN.md`'s ordered repair plan that doesn't require GPU/real
+  data to implement.** Fix 3.1 ("re-run the diagnosis on repaired inputs") is explicitly a
+  re-measurement step with no code to write — it *is* the external experiment, gated on Fixes 2.1-2.3
+  having actually been run for real. All Stage 0-3 code changes REPAIR_PLAN.md calls for are now
+  complete on this branch.
+
+---
