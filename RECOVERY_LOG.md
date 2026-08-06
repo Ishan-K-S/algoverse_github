@@ -706,6 +706,30 @@ synthetic model's gradient magnitudes were apparently too small for the 3-5x spi
 manifest at this size; the churn-loop signature via `used_by_none`/event-frequency is the
 discriminating evidence here, not the loss ratio.)
 
+**CORRECTION — this differential result is confounded, and should not be read as evidence the
+churn loop is fixed** (added by a later review pass). Both reported signals (event frequency
+15/15 → 3/15, and `used_by_none` returning to 0 between events) are direct mechanical outputs of
+change #5 in this very fix — the usage-EMA reset. #5 sets a revived feature's EMA to
+`2 × dead_threshold`; at the training loop's EMA decay of 0.95 that takes ~14 steps to fall back
+below `dead_threshold`. The test ran at `resample_interval=4`, so #5 **by construction** prevents
+a revived feature from being re-flagged dead at the next ~3 events, and **by construction** drives
+`used_by_none` to 0 between events. The test measured the metric the change edits, using a metric
+the change edits. It cannot distinguish "the churn loop is broken" from "the dead-counter was
+reset."
+
+Worse, the confound does not transfer to the real configuration in either direction: at
+`resample_interval=501`, `0.95^501 ≈ 6e-12`, so the EMA reset has decayed to nothing long before
+the next event and has no effect at all on real-scale event frequency. So the toy run neither
+demonstrates the fix nor rules it out at the scale that matters.
+
+What this fix's evidence actually supports, unchanged: the isolated `test_fix11.py` checks
+(timestep threading, `probs == recon_err`, `replacement=False`, EMA reset firing) all verify the
+individual mechanisms directly and remain valid. The *end-to-end claim* that the churn cycle is
+resolved is **not** verified and is downgraded to a hypothesis pending the real run described
+below. A non-confounded version of that run needs `resample_interval` set well above the EMA
+recovery window (>~60 steps at decay 0.95), or `used_by_none` measured immediately *before* each
+resample event rather than between events.
+
 **Independent review:** dispatched a fresh-context subagent to review the diff against
 `REPAIR_PLAN.md`'s V2 write-up and Fix 1.1's 9-point prescription. It verified all 9 changes are
 present and correctly wired (including tracing that `ema_attrs[model_name]` aliases the real
@@ -970,8 +994,34 @@ extractor actually used — SD3/FLUX are dead code per `REPAIR_PLAN.md` §7):
   already used for the old path's `timesteps[0]`, just evaluated at the chosen t instead), take
   **one** forward pass (hook fires once), no `scheduler.step` call, no reverse-diffusion loop. The
   returned `ActivationOutput` has exactly one entry in `activations`/`timesteps`/`sigmas`. When
-  `single_timestep=None` (the default), behavior is unchanged byte-for-byte from before this fix —
-  this is purely additive.
+  `single_timestep=None` (the default), the reverse-diffusion **loop structure** is unchanged —
+  see the CORRECTION below for what is *not* unchanged.
+
+**CORRECTION (added by a later review pass; the original wording in this entry was wrong).**
+This entry originally claimed the `single_timestep=None` path is "unchanged byte-for-byte from
+before this fix — this is purely additive." **That is false.** The loop *body* is unchanged, but
+it calls `_get_transformer_input`, which this same fix changed to send `resolution=[512, 512]`
+instead of `[64, 64]` and to add `encoder_attention_mask`. Both change what the transformer
+computes, on **both** branches. Re-running the old full-trajectory protocol will therefore
+**not** reproduce the pre-Fix-2.1 cache.
+
+The code is right and the change is intended — the micro-conditioning and attention-mask defects
+were bugs on both paths, so fixing them on both is correct. What was wrong was the claim, and the
+verification behind it: the check diffed the *loop bodies* char-for-char, a strictly smaller unit
+than "the default path's behavior," and the conclusion was then stated at the larger scope. This
+is the same class of error the self-audit below was chartered to catch, in the self-audit's own
+output. Practical consequence: old and new PixArt caches are not interchangeable and must not be
+mixed in one `combined_cache` directory. Now noted in code at
+`cache_coco_diffusion_activations.py`'s `USE_DIFT_SINGLE_TIMESTEP` flag and in
+`extract_activations`'s docstring.
+
+**Follow-up fix in the same code path (same review pass):** `_encode_null_prompt` originally
+passed the mask only to the transformer's cross-attention; `self.text_encoder(text_inputs_1)` was
+still called without `attention_mask=`, so T5's own self-attention still ran over 255 pad
+positions. Now fixed (`attention_mask=attention_mask_1`), matching diffusers'
+`PixArtAlphaPipeline.encode_prompt`. Low impact — the prompt is `""` for every image, so the
+resulting embedding is a dataset-wide constant either way — but it is a real part of the same V4
+defect and was left half-done.
 
 **`pixart_timestep.py`** — added `resolve_pixart_raw_timestep(scheduler_timesteps, ckpt=None,
 config_global=None, override=None)`, which resolves an index the same way the existing
@@ -1219,10 +1269,15 @@ comment precision against independently-rederived math):**
 
 **4. Everything else checked and found already accurate** (verified independently, not just
 re-read): the DIFT single-timestep branch's noise formula and absence of `scheduler.step`; `_make_noise`'s
-three cases; `_pixel_resolution`'s wiring; `encoder_attention_mask`'s full path; the claim that the
+three cases; `_pixel_resolution`'s wiring; `encoder_attention_mask`'s full path; ~~the claim that the
 `single_timestep=None` default path is byte-for-byte/RNG-stream-identical to the pre-fix code
 (verified by extracting and directly diffing the old vs. new loop bodies char-for-char, not just
-trusting the earlier subagent review's structural read); the `resample_enc_scale`/cosine-1.0 claim
+trusting the earlier subagent review's structural read)~~ — **RETRACTED, see the CORRECTION in Fix
+2.1 above.** That check diffed the loop *bodies*, which are indeed identical, and then stated the
+conclusion at the level of the whole default *path*, which is not: the loop calls
+`_get_transformer_input`, which this fix changed for both branches. This audit pass missed it
+because it inherited the earlier entry's framing instead of re-deriving the unit of comparison;
+the `resample_enc_scale`/cosine-1.0 claim
 in Fix 1.1 (re-derived: `W_enc[k]·(x-b_pre) = enc_scale·‖x-b_pre‖` exactly, by construction);
 `resolve_pixart_raw_timestep`'s index→raw-timestep mapping; `HOOK_ATTN_NAME`'s AdaLN-conditioning
 comment at a different line (correctly describes conditioning that genuinely applies to all 28
@@ -1744,5 +1799,147 @@ Fix 3.2's "and/or" requirement), not an oversight.
   re-measurement step with no code to write — it *is* the external experiment, gated on Fixes 2.1-2.3
   having actually been run for real. All Stage 0-3 code changes REPAIR_PLAN.md calls for are now
   complete on this branch.
+
+---
+
+## Review pass — correctness audit of Fixes 0.1–3.2, plus 8 follow-up fixes
+
+**Addresses:** findings from a full re-read of `REPAIR_PLAN.md` + `RECOVERY_LOG.md` against the
+actual code (`git diff 03b80ff..HEAD`), at the user's request to check that the changes were
+correct and helpful.
+**Files modified:** `DiffusionActivationExtractor.py`, `cache_coco_diffusion_activations.py`,
+`train.py`, `feature_usage.py`, `uni_demo.py`, `config.yaml`, `dictionary_diagnostic.py`,
+`dictionary_diagnostic_all_timesteps.py`, `cross_model_overlap.py`, `input_rank_diagnostic.py`,
+`visualize_feature_activations.py`, `PROJECT_STATUS.md`, `RECOVERY_LOG.md`
+
+### What the audit confirmed
+
+Every prescribed change in Fixes 0.1–3.2 is present and does what the log claims. Verified by
+tracing the mechanism, not by confirming a diff exists — including: `load_checkpoint` keeps its
+2-tuple return on **both** branches (the early-return refactor doesn't reintroduce the bug the
+Fix 0.1 addendum fixed); `ema = ema_attrs[model_name]; ema[dead_idx] = ...` genuinely aliases the
+live `model._usage_ema_*` tensor; the single-timestep sigma formula is byte-identical to
+`_get_ddim_sigmas`; `__main__` builds the extractor with `num_inference_steps=15`, so
+`resolve_pixart_raw_timestep` maps cache index 10 to the *same* raw `t` the old cache's index 10
+held (the likeliest place for silent drift, and it doesn't drift); `evaluate_universal_sae`'s
+source/target/pool/MSE path mirrors the training path line-for-line, so `val/loss_*` really is
+comparable to `train/loss_*`; and Fix 3.2's `top_k_per_sample` substitutions are exactly
+equivalent (`.abs()` is a no-op on `z.abs().amax(...)` scores).
+
+### Problems found and fixed
+
+1. **A materially false claim in Fix 2.1, repeated by the self-audit.** The log said the
+   `single_timestep=None` path was "unchanged byte-for-byte... purely additive," verified by
+   diffing the loop bodies. The loop bodies *are* identical, but they call
+   `_get_transformer_input`, which the same fix changed for both branches. Corrected in place at
+   both sites (see the CORRECTION blocks in Fix 2.1 and the self-audit), and noted in code at
+   `USE_DIFT_SINGLE_TIMESTEP` and in `extract_activations`'s docstring. This is the same class of
+   error the self-audit was chartered to catch, occurring inside the self-audit's own output — the
+   audit inherited the earlier entry's framing instead of re-deriving the unit of comparison.
+2. **Fix 1.1's end-to-end differential result is confounded by Fix 1.1's own change #5.** Both
+   reported signals are mechanical outputs of the usage-EMA reset at `resample_interval=4`.
+   Downgraded to a hypothesis in place, with a description of what a non-confounded run needs. No
+   code change — the fix is fine, the evidence for it wasn't.
+3. **T5 self-attention was still unmasked.** Fix 2.1 threaded `attention_mask` to the
+   transformer's cross-attention but left `self.text_encoder(text_inputs_1)` unmasked, so T5's own
+   self-attention still ran over 255 pad positions. Now passes `attention_mask=attention_mask_1`,
+   matching diffusers' `PixArtAlphaPipeline.encode_prompt`. Low impact (the prompt is `""` for
+   every image, so the embedding is a dataset-wide constant either way) but half a fix is worse
+   than a documented gap.
+4. **`grad_clip_norm: 1.0` was invisible exactly where it matters.** `train/grad_norm_preclip` is
+   logged only inside the wandb-gated block, and the plan's own tiny-scale verification runs
+   specify `use_wandb=false`. Since 1.0 is a starting value rather than a measured one, a real
+   pre-clip norm 10–100× above it would act as a large silent LR reduction across the whole run.
+   Added a once-per-process console warning when the pre-clip norm exceeds 10× the threshold,
+   printing the actual rescale factor. Value left at 1.0 per the plan; **read the warning/metric
+   before trusting it.**
+5. **Val dataloader ran single-threaded** (`num_workers=0`) over 400 images every epoch, against a
+   cache where every read is a full zlib inflate of a ~35MB array (V13) — adding wall-clock to the
+   exact bottleneck Stage 2 exists to remove. Now matches the train worker count.
+6. **`per_token_cofire_jaccard` shipped without a chance baseline.** Hard TopK makes the raw value
+   small by construction (~0.0052 at `top_k=128`/`K=12288`), so `0.02` is 4× chance but reads as
+   "basically nothing." Added `per_token_cofire_jaccard_chance` (computed from *observed*
+   per-token active counts, so it stays correct under any selection rule) and a `..._lift` ratio,
+   both logged per pair. The lift is the figure to read.
+7. **Fix 2.2's `spatial_aligner=` was only wired in `uni_demo.py`.** Harmless today because Fix 0.2
+   makes every eval script use the checkpoint's persisted stats — but any fallback to
+   recomputation (older checkpoint, missing stats) would silently fit stats to the unpooled
+   distribution, i.e. reintroduce V6 for that run. Wired into all five eval scripts that build
+   both an aligner and a dataset. Pure safety net: zero behavior change whenever checkpoint stats
+   exist.
+8. **V2(e) was unaddressed and unmentioned.** `resample_interval: 500` is even and `_pick_source`
+   alternates on `global_step % 2`, so *every* resample event landed on a DinoV2-source step for
+   the entire run. `resample_interval` (and `resample_start_step`) 500 → **501**, so event parity
+   alternates. This is a real behavior change — events now fire at 501/1002/1503/… — and should be
+   noted in the next `run_tag`.
+9. **`_ensure_bt` corrupts the shape of a T=1 cache — a real bug, not in `REPAIR_PLAN.md`, and
+   armed specifically by Fix 2.1.** `values.squeeze()` with no argument drops *every* size-1 dim.
+   Harmless on the 15-timestep cache, but on the `(1, 1024, 1152)` cache Fix 2.1 produces the
+   collated `(B, 1)` timestep tensor collapses to `(B,)` and is then re-expanded to **`(B, B)`**,
+   and at `B == 1` it collapses to 0-d and raises `ValueError`. Two consequences:
+   - **Latent crash:** any run where `len(dataset) % batch_size == 1` dies on the last batch once
+     the DIFT cache lands. Today's numbers (1600 train / 400 val, batch 16) happen to divide
+     evenly, so it would not have fired immediately — it would have fired the first time anyone
+     changed the image count, batch size, or `val_fraction`.
+   - **Silent wrong-shape:** at `B > 1` the `(B, B)` tensor made `t_bt[:, idx]` return *image 0's*
+     timestep for every image. That is numerically invisible today only because every image in a
+     single-timestep cache shares the same raw `t` — a coincidence, not a guarantee.
+   Rewritten to normalize without a blanket squeeze. Verified across all six real `(B, T)` shapes
+   plus the three defensive shapes (bare `(T,)`, `(1, T)`, 0-d scalar) with no regressions, and
+   confirmed that distinct per-image timesteps now survive (`[100,200,300,400]` in, same out —
+   the old version returned `[100,100,100,100]`).
+10. **`apply_topk`'s docstring claimed a straight-through estimator that does not exist.**
+   `REPAIR_PLAN.md` §2 identified this ("The docstring calls it a 'straight-through trick'; it is
+   not") but no Fix had it in scope, so it survived the whole repair. `mask` comes from
+   `torch.zeros_like` and carries no grad, so `d(out)/d(z_pre)` is exactly `mask` — gradient
+   reaches selected indices only and is exactly zero elsewhere, which is the opposite of what
+   straight-through means. Docstring and inline comment corrected, with the reason
+   `pre_topk_align_weight` exists spelled out (it is the only learning signal unselected features
+   get). Comment-only; zero behavior change.
+11. **`PROJECT_STATUS.md` had never been updated**, despite `REPAIR_PLAN.md` §7 calling for it once
+   Stage 0 landed. It was still presenting the flat-heatmap evidence (V1), the `used_by_none`
+   "puzzle" (V2a), the `usage_cosine = 0.857` "looks fine" reading (V11), and the `0.948`
+   calibration (V5/V6) as model findings. Rewritten: findings marked retracted/qualified inline
+   rather than deleted (the observations were real, the attributions weren't), the phased plan
+   marked superseded with current state and an explicit next-five-steps list, and the "run this
+   next" block repointed from `pixart_timestep_autopsy.py` to Fix 0.1's render.
+
+### Verification performed
+
+No GPU/cache in this environment, same constraint as every prior entry. All modified files
+`ast.parse` clean. Change 9 (`_ensure_bt`) was verified by reimplementing both the old and new
+logic in numpy and running every shape the pipeline can produce — the old version reproduced the
+`(B, B)` corruption and the `B=1` crash exactly as described, the new one returns `(B, T)` for all
+of them and preserves per-image timestep values. Changes 3, 5, 7, 8 are one-to-few-line edits
+whose correctness is structural
+and was checked by reading the call sites (aligner built before dataset in all five scripts;
+`attention_mask` is the documented kwarg for `T5EncoderModel.forward`; `num_workers` reads the
+same config key train does; `_clamp` handles the new interval identically). Changes 4 and 6 are
+additive: 4 is a print guarded by `getattr(model, "_warned_grad_clip", False)` and cannot raise
+(`float(nan) > x` is `False`, so it won't fire on a NaN norm); 6 adds new dict keys and cannot
+affect the loss, the existing keys, or any control flow, with the `chance_val > 0` guard
+returning `nan` rather than dividing by zero.
+
+### Remaining uncertainty
+
+- **Unchanged and unchangeable here: nothing in this project has been validated against real
+  data.** All nine fixes plus these eight follow-ups rest on synthetic CPU tests. The audit raises
+  confidence that the *code* is right; it says nothing about the research question.
+- **Change 8 (`resample_interval: 501`) is untested at any scale** — it is a config value, not a
+  code path, and the parity argument is arithmetic, but it does move every resample event.
+- Change 4's 10× warning threshold is arbitrary. It exists to make the situation visible, not to
+  decide it.
+- V13's `mmap_mode` / `.copy()` amplifiers in `data.py` remain unfixed (out of every fix's file
+  list so far, and largely mooted by Fix 2.1's re-cache — but only once that re-cache runs).
+- **New failure mode introduced by Fix 2.2, left deliberately as a loud crash:** with
+  `use_class_tokens: true`, `_apply_spatial_align_for_stats` now passes a 257-token DinoV2
+  activation to `SpatialAligner.align`, which raises `ValueError: ... expected N=256 (grid 16x16),
+  got N=257. If your activations include a CLS/register token, strip it before calling align()`.
+  `config.yaml` sets `use_class_tokens: false`, so this cannot fire today. Not guarded, on
+  purpose: per-token spatial alignment with a CLS token in the sequence is genuinely ill-defined,
+  the message is self-explanatory and actionable, and silently skipping alignment there would
+  reintroduce V6 for that run.
+- Change 9 fixes the shape corruption; it does **not** mean the T=1 path is validated end to end.
+  That still needs the real 16-image re-cache from Fix 2.1's own verification ordering.
 
 ---
