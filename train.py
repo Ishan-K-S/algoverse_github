@@ -665,6 +665,16 @@ def train_universal_sae(
     in_curriculum = epoch < curriculum_epochs
     resampled_since_log = 0
 
+    # Curriculum boundary (V10): self-recon gradient share, cross-recon MSE, and
+    # both alignment cosine terms all switch on/change weight in the same step,
+    # producing an analytically-predictable ~8x jump in total_loss. Without this
+    # reset, the EMA blends through the jump over several steps and
+    # total_loss_ema renders it as a smooth ramp instead of the step it is.
+    was_in_curriculum = getattr(model, "_last_in_curriculum", in_curriculum)
+    if was_in_curriculum and not in_curriculum:
+        ema_loss = None
+    model._last_in_curriculum = in_curriculum
+
     for batch_idx, ((acts, meta), _y) in enumerate(tqdm(dataloader, desc="train", dynamic_ncols=True)):
         global_step_actual = global_step + batch_idx
         if 0 < global_step_actual + 1 <= warmup_steps:
@@ -884,6 +894,13 @@ def train_universal_sae(
 
         sae_loss = None
         if reconstruction_weight_total > 0:
+            # Weighted AVERAGE, not weighted sum: self_weight/cross_weight only ever
+            # matter as a ratio (REPAIR_PLAN.md V9). Raising cross_weight with
+            # self_weight fixed does not add cross-recon gradient magnitude -- it
+            # shrinks self-recon's share of a fixed-magnitude total. Kept this way
+            # (rather than dropping the normalization) because it keeps the loss
+            # scale stable across the curriculum boundary, where the number of
+            # active reconstruction terms itself changes (see V10 below).
             sae_loss = reconstruction_loss / reconstruction_weight_total
             loss = loss + sae_loss
 
