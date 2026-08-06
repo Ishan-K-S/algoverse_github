@@ -1138,3 +1138,275 @@ regression introduced here.
   the existing extraction code — the old cache and old extraction path are untouched and fully
   available, so no existing cache/checkpoint has been invalidated by this commit itself (only an
   actual re-cache run, not yet performed, would do that).
+
+---
+
+## Self-audit — corrections to Fix 1.1 and Fix 2.1, and a closed verification gap
+
+**Commit:** `bc8986b` (comment corrections); integration test below is not a separate commit (test
+files live outside the repo, in the session's scratch directory)
+**Trigger:** explicit user request, after this session's earlier fixes were already committed, to
+audit every comment/docstring/flag written this session against what the code actually executes —
+"this codebase has a history of comments describing a fix that the code doesn't actually implement,"
+per the user, referencing V8 (the `attn1`/`attn2` hook finding) and the V16 stale-docstring catalog.
+This is exactly the failure mode Fix 0.3 fixed once already (in `pixart_attn1_sanity_check.py`'s
+docstring); worth checking whether this session's own new comments repeated it.
+
+### What the audit checked, and found
+
+**1. `HOOK_ATTN_NAME = "attn1"` — user's specific concern, checked, confirmed NOT a new issue.**
+The user asked to confirm `extract_activations` still hooks the whole block, not `attn1`, despite
+`HOOK_ATTN_NAME = "attn1"` being declared. Confirmed: `PixArtActivationExtractor`'s hook line
+(`last_block = self._get_last_block(); hook_handle = last_block.register_forward_hook(hook_fn)`)
+hooks the block object itself, never `getattr(last_block, self.HOOK_ATTN_NAME)`. This is **V8**,
+already documented in `REPAIR_PLAN.md` as a correction to `PROJECT_STATUS.md` (the cache has always
+held the full post-block residual stream, `HOOK_ATTN_NAME` is dead code for PixArt) and was not
+touched or claimed-fixed by this session's Fix 2.1 work — Fix 2.1 only added a `single_timestep`
+parameter and fixed micro-conditioning/attention-mask/noise-seeding, none of which relate to which
+submodule is hooked. No regression, no misleading new claim about hook targeting was introduced.
+
+**2. "Unconfirmed caller" — user's specific concern, checked, found a real verification gap and closed it.**
+The user pointed out that Fix 2.1's own tests never actually confirmed
+`cache_coco_diffusion_activations.py` passes `single_timestep=`/`generator=` to the REAL
+`PixArtActivationExtractor.extract_activations` — `test_fix21_cache_script.py` used a hand-written
+fake extractor CLASS with the new signature "by construction," and `test_fix21_extractor.py` called
+`extract_activations` directly, never through `cache_diffusion_activations()`. Neither proved the
+two were actually wired together for the real class. This mattered specifically because
+`extract_activations` is decorated with `@torch.no_grad()`, and `cache_diffusion_activations`'s
+kwarg-gating relies on `inspect.signature(extractor.extract_activations).parameters` — if the
+decorator didn't preserve the signature, the gating would silently disable the new path even though
+the method supports it, and nobody would notice since the fallback (dropping the new kwargs with a
+printed warning) doesn't raise.
+- Checked directly: `inspect.signature` on the real bound method (decorator intact) correctly shows
+  `single_timestep`/`generator` as parameters — `torch.no_grad()`'s implementation preserves the
+  wrapped signature. Not a bug, but genuinely unconfirmed before this check.
+- Wrote a new integration test exercising the REAL `PixArtActivationExtractor` class (only model
+  components — transformer/VAE/scheduler/tokenizer — faked; `_load_pipeline` no-op'd, no
+  network/GPU) through the REAL, unmodified `cache_diffusion_activations()`. Confirmed on disk: the
+  resolved raw timestep reaches the transformer's `timestep` argument on every call;
+  `scheduler.step` is never invoked; the cache file has a `T=1` leading dimension; the cache's
+  `timesteps` array on disk equals the resolved raw timestep. A differential run with
+  `single_timestep=None` confirmed the old 15-step trajectory and `T=15` cache remain unaffected.
+  All checks passed — this closes the gap; it was a missing test, not a bug in the code, but the
+  user was right that it hadn't actually been confirmed. (First attempt at this test used a
+  simplified `FakeBlock`/`FakeTransformer` that never patchified `(B,C,H,W)` into `(B,N,D)` token
+  format the way a real DiT block does — this caused a `RuntimeError` in
+  `cache_coco_diffusion_activations.py`'s stack/permute logic on the first run, since the fake's
+  4-D output didn't match the 3-D `(B,N,D)` shape production code assumes. Fixed the fake to
+  patchify/unpatchify like a real block; unrelated to the actual code under test.)
+
+**3. Comment-accuracy sweep across this session's changes found two real inaccuracies (neither
+flagged by the earlier per-fix subagent reviews, since those reviewed logic correctness, not
+comment precision against independently-rederived math):**
+
+- **`train.py`'s `_reset_adam_state_slice` docstring (Fix 1.1)** claimed a fixed "~3.2x" multiplier,
+  reasoning "bias correction is ~1" once `exp_avg`/`exp_avg_sq` are zeroed. This is wrong: `step` is
+  NOT reset (by design — it can't be, per-row), so beta2's bias correction `(1 - 0.999^step)` keeps
+  whatever value the tensor's *global* step count has already reached, and 0.999's bias correction
+  does not approach 1 until thousands of steps in — nowhere near "~1" at this project's actual
+  `resample_interval=500` schedule. Numerically verified with real `torch.optim.Adam` (lr=1) at
+  every resample step this project actually hits: **1.99x at step 500 (the first resample event),
+  2.52x at 1000, 2.79x at 1500, 2.94x at 2000, 3.03x at 2500, 3.08x at 3000, 3.11x at 3500 (the
+  last)** — a fixed ~3.2x is the asymptotic value as step→∞, never actually reached in this run.
+  Corrected the docstring to state the measured range and explain why it moves. This was a real
+  inaccuracy in an already-committed comment — flagged and fixed here, not silently absorbed.
+- **`DiffusionActivationExtractor.py`'s `_encode_null_prompt` comment (Fix 2.1)** said "cross-
+  attention in every hooked block attends over 255 pad embeddings." Since only ONE block is ever
+  hooked (for activation capture — see point 1 above), "every hooked block" is confusing at best,
+  reads as implying multiple hooked blocks at worst. The actual mechanism: the attention mask
+  affects cross-attention computed in every one of the ~28 transformer blocks during the single
+  forward pass; only one block's *output* is captured. Corrected the wording.
+
+**4. Everything else checked and found already accurate** (verified independently, not just
+re-read): the DIFT single-timestep branch's noise formula and absence of `scheduler.step`; `_make_noise`'s
+three cases; `_pixel_resolution`'s wiring; `encoder_attention_mask`'s full path; the claim that the
+`single_timestep=None` default path is byte-for-byte/RNG-stream-identical to the pre-fix code
+(verified by extracting and directly diffing the old vs. new loop bodies char-for-char, not just
+trusting the earlier subagent review's structural read); the `resample_enc_scale`/cosine-1.0 claim
+in Fix 1.1 (re-derived: `W_enc[k]·(x-b_pre) = enc_scale·‖x-b_pre‖` exactly, by construction);
+`resolve_pixart_raw_timestep`'s index→raw-timestep mapping; `HOOK_ATTN_NAME`'s AdaLN-conditioning
+comment at a different line (correctly describes conditioning that genuinely applies to all 28
+blocks, not a hooked-block conflation).
+
+### Why this matters
+
+Comments and docstrings are read by whoever picks this repair up next; an inaccurate one is worse
+than no comment, because it actively misleads rather than leaving a gap someone knows to fill. The
+Adam-multiplier correction in particular matters for anyone tuning `resample_interval` or
+`resample_enc_scale`: the true post-resample disruption is *smaller* early in a run and *larger*
+late in a run, the opposite of what a flat "~3.2x" implies.
+
+### Remaining uncertainty
+
+- No further inaccuracies were found in this pass, but this is not a guarantee none remain — this
+  was a targeted audit (every comment this session wrote, checked against independently-rederived
+  math or a new/existing test), not an exhaustive formal verification.
+- The corrected Adam-multiplier range (1.99x-3.11x) is specific to this project's exact
+  `resample_interval=500`-driven step schedule; it would shift if that changes. It does NOT depend
+  on the configured `lr` value itself — checked empirically (not just reasoned analytically) at
+  `lr` in `{1.0, 0.1, 0.0005}` (this project's actual `lr: 0.0005`), all giving the identical
+  1.9855x ratio at step 500 to 4 decimal places, since `eps=1e-8` is negligible next to
+  `sqrt(v_hat)` at these gradient magnitudes.
+
+---
+
+## Fix 2.2 — compute standardization stats on the post-alignment distribution
+
+**Addresses:** V6 (HIGH)
+**Commit:** `766d12f`
+**Files modified:** `data.py`, `uni_demo.py`
+
+### Issue
+
+`config.yaml` sets `spatial_align_to: DinoV2`, so PixArt's native 32×32 token grid is average-pooled
+down to DinoV2's 16×16 grid (via `SpatialAligner.align()`, called from `train.py`) before either
+model's activations reach the SAE. Standardization statistics (per-channel mean/std, computed in
+`data.py`'s `_compute_standardization_stats`) were fit to the RAW, UNPOOLED per-token distribution.
+Averaging spatially correlated neighbouring tokens together reduces variance below what any
+individual token had — `Var[mean(X1..X4)] = (1 + 3ρ)/4 · Var[X]` for pairwise correlation ρ, which
+is `< Var[X]` whenever ρ < 1 — a real statistical property of pooling correlated variables, not a
+bug in the pooling arithmetic itself (`spatial_align.py`'s `avg_pool2d` reshape/permute logic is
+correct, and was verified correct back in the original diagnostic pass, V6's "what is NOT wrong"
+note). A std fit to the unpooled distribution therefore under-normalizes the pooled representation
+the SAE actually consumes: `loss_DinoV2_to_PixArt` (identity-mapped target, correctly unit-variance)
+and `loss_PixArt_to_DinoV2` (source pooled through a mis-calibrated std) were never on comparable
+scales, and neither was validly comparable to the "≈1.0 = predicting the mean" reading the project's
+central finding rests on.
+
+### Root cause
+
+`_compute_standardization_stats` was written before spatial alignment existed in the pipeline (or at
+least, never updated to know about it) and has no visibility into whether/how its output will be
+pooled later in `train.py`. The pooling itself happens in a completely different module (`train.py`,
+via a `SpatialAligner` built in `uni_demo.py`) with no shared reference to what statistics were used
+upstream.
+
+### Changes
+
+`REPAIR_PLAN.md`'s literal instruction is "apply spatial alignment before standardization." This
+implementation achieves the identical numerical outcome with a smaller, lower-risk diff, based on a
+mathematical fact checked directly (not assumed): per-channel affine standardization
+(`(x - mean) / std`, with `mean`/`std` constant across the token axis) and spatial resampling
+(`SpatialAligner.align` — average-pooling for downsampling, nearest/bilinear/bicubic for upsampling)
+both act linearly along the token axis and **commute exactly**: `align((x - mean) / std) ==
+(align(x) - mean) / std`, for downsampling (pooling is a weighted average with position-independent
+affine terms factoring out), upsampling (nearest-neighbor duplication and partition-of-unity
+interpolation kernels both preserve constants exactly), and independently for each timestep of a
+diffusion source's `(T, N, D)` tensor (alignment only touches the `N`/`D` axes, leaving `T`
+untouched, so pooling before vs. after picking a single timestep is identical for whichever timestep
+gets picked). Given this, **the actual bug was never about the order the two operations run in at
+runtime** — it was that the mean/std constants were fit to the wrong distribution's variance. Fixing
+that fixes the numbers regardless of which order the (mathematically-equivalent) operations run in.
+
+Concretely:
+- `CocoActivationDataset.__init__` (`data.py`) gained an optional `spatial_aligner=None` parameter
+  (duck-typed, avoiding a hard import of `SpatialAligner` — matches the file's existing loose-typing
+  style), stored as `self.spatial_aligner`.
+- Added `_apply_spatial_align_for_stats(self, act, source)`: returns `act` unchanged if no aligner is
+  set or `source` isn't registered with it; for a 2-D vision `(N, D)` activation, adds/removes a
+  throwaway batch dim around `SpatialAligner.align` (which requires `(B, N, D)`); for a 3-D diffusion
+  `(T, N, D)` activation, calls `align` directly (the leading `T` axis plays the "batch" role
+  harmlessly, per the per-timestep-independence argument above).
+- `_compute_standardization_stats` calls this right after `_maybe_strip_cls` and before
+  `_flatten_tokens_for_stats`, so the Welford accumulator sees the POOLED distribution.
+- **`__getitem__` and every one of `train.py`'s ~7 existing `spatial_aligner.align(...)` call sites
+  (including inside `resample_dead_features`) are completely untouched** — still standardize (using
+  the now-correctly-computed stats) then align, in that literal order, which the commutativity
+  argument makes numerically identical to the reverse order.
+- `uni_demo.py`: moved the `spatial_aligner = build_spatial_aligner_from_config(...)` block from
+  after dataset construction to before it, and passed `spatial_aligner=spatial_aligner` into
+  `CocoActivationDataset(...)`. `model_tokens` (the only input `build_spatial_aligner_from_config`
+  needs besides live config) was already available earlier in the file, so nothing else needed to
+  move.
+
+### Why necessary
+
+This is Stage 2 / Fix 2.2 in `REPAIR_PLAN.md`, explicitly dependent on Fix 2.1 (re-cache) per the
+plan's ordering — it "makes the '≈1.0 = predicting the mean' reading of the loss finally valid," a
+precondition for any of Stage 3's re-measurement work meaning anything.
+
+### Verification performed
+
+Same scratch CPU venv as prior fixes. `test_fix22.py` built a synthetic combined-npz cache (2000
+images, one source "PixArt", native grid 4×4→16 tokens, pooled to target grid 2×2→4 tokens) with a
+**known, controllable spatial correlation structure**: each 2×2 block shares one common per-block
+value (variance 1) plus independent per-token noise (variance 1) — giving every individual token
+variance 2 (ρ=0.5 within a block) and an analytically-predictable pooled variance of `1 + 1/4 =
+1.25`. Ran the REAL `CocoActivationDataset`/`SpatialAligner` against this cache:
+- **Pre-fix simulation** (`spatial_aligner=None` at construction, reproducing the old behavior):
+  stats fit to raw tokens gave std ≈ √2 ≈ 1.41 (matching the per-token variance prediction exactly).
+  Standardizing with this std then pooling (mimicking `__getitem__` + `train.py`'s unchanged call
+  sequence) gave a post-align std of **~0.79-0.83 — outside `[0.95, 1.05]`**, reproducing the V6 bug
+  quantitatively, not just qualitatively.
+- **Post-fix** (`spatial_aligner=<the real aligner>` passed to the dataset): stats fit to pooled
+  tokens gave std ≈ √1.25 ≈ 1.118 (matching the pooled-variance prediction exactly) — measurably
+  smaller than the pre-fix std, as expected. Standardizing with this corrected std then pooling gave
+  a post-align std of **0.996-1.006** and mean of **-0.002 to -0.013** — inside `[0.95, 1.05]` and
+  `|mean| < 0.05`, **REPAIR_PLAN.md's own Fix 2.2 verification bar, met exactly** (initially missed
+  the mean bound at a smaller sample size — 0.0501 vs. the 0.05 cutoff — traced to ordinary sampling
+  noise at n=100 images and resolved by widening the check to n=2000, not a code change).
+- An earlier draft of this test had a methodology bug (computed variance *within each image's 4
+  pooled tokens* via `.var(dim=0)` on a `(4, D)` per-image tensor, then averaged across images — a
+  within-group-variance statistic that underestimates the true pooled-distribution variance, since
+  subtracting each small group's own empirical mean removes real variance). Caught by cross-checking
+  against a from-scratch debug script that flattened across both the image and token axes before
+  computing variance, which gave a materially different (and correct) answer; fixed the test to
+  match. Recorded here per the standing instruction to flag rather than silently absorb
+  test-methodology mistakes.
+- **Regression check:** constructing `CocoActivationDataset` with no `spatial_aligner` argument at
+  all produces byte-identical stats to explicitly passing `spatial_aligner=None` (`torch.equal` on
+  both mean and std) — confirms the new parameter's default preserves old behavior exactly.
+
+**Differential check against the pre-fix code** (`git stash`/`git stash pop`): re-ran the identical
+`test_fix22.py` unmodified against the stashed pre-fix `data.py`. Failed immediately with
+`TypeError: CocoActivationDataset.__init__() got an unexpected keyword argument 'spatial_aligner'`
+— confirms the parameter (and therefore the whole fix) was entirely absent pre-fix. Restored and
+re-confirmed all checks pass.
+
+**Independent review:** dispatched a fresh-context subagent to review the diff against
+`REPAIR_PLAN.md`'s V6 write-up and to independently re-derive the commutativity argument this diff's
+smaller footprint depends on — specifically asked to check downsampling, BOTH upsampling modes, and
+the diffusion-timestep-axis case, since if the argument broke in any of those the diff would be
+wrong. It confirmed all three algebraically (including bilinear/bicubic interpolation as a
+partition-of-unity, a case broader than what this diff needed), confirmed `uni_demo.py`'s reordering
+is safe (traced `model_tokens`'s availability), and confirmed via direct `git diff train.py`
+inspection (not just the description) that all 7 `spatial_aligner.align(...)` call sites, including
+the one inside `resample_dead_features`, are genuinely untouched. Reported one low-severity
+observation, not a defect: `_apply_spatial_align_for_stats` pools each of PixArt's 15 cached
+timesteps independently, but they're still merged into one Welford accumulator across all 15 — V6 is
+fixed, but the pre-existing V5 mismatch (training only ever consumes t=10) means these stats won't
+be exactly right for the single t=10 slice until Fix 2.1's re-cache actually lands (`REPAIR_PLAN.md`
+already declares this dependency explicitly).
+
+### Remaining uncertainty
+
+- **Not verified against the real cache or a real Colab training run** (same gap as every prior
+  fix). The synthetic test's correlation structure (block-shared-value + independent noise) is a
+  clean, analytically tractable stand-in for "real DiT patches are spatially correlated" — it proves
+  the mechanism and the code path, not the exact ρ (and therefore exact std correction) real PixArt
+  activations will need. Per the plan's own Fix 2.2 verification bar, the next session (with
+  Colab/GPU access, **after** Fix 2.1's re-cache lands) should run:
+  ```
+  # load 8 batches from the (re-cached) real data, print per-model post-align mean/std:
+  for (acts, meta), _ in itertools.islice(dataloader, 8):
+      for name, x in acts.items():
+          aligned = spatial_aligner.align(x, source=name) if ... else x
+          print(name, aligned.mean().item(), aligned.std().item())
+  ```
+  Success criteria: both models' post-align std in `[0.95, 1.05]`, `|mean| < 0.05` — **REQUIRES
+  EXTERNAL EXPERIMENT** (needs the real, re-cached data).
+  ```
+  # After Fix 2.1's re-cache lands, load 8 real batches from uni_demo.py's actual dataloader and
+  # print per-model post-align mean/std over the channel axis, matching REPAIR_PLAN.md's Fix 2.2
+  # verification step exactly.
+  ```
+- As the subagent review noted, this fix's stats are computed over all 15 cached PixArt timesteps
+  pooled together (via `_flatten_tokens_for_stats`), not the single t=10 slice training actually
+  uses — correct once Fix 2.1's single-timestep re-cache lands (T=1, so "all timesteps" and "the one
+  timestep used" become the same thing), not fully correct against the *current* 15-timestep cache.
+  This is the documented Fix 2.1 dependency, not a new gap.
+- Per the plan's own risk note: this changes the loss scale for both `loss_DinoV2_to_PixArt` and
+  `loss_PixArt_to_DinoV2` — numbers from any future run are not comparable to pre-Fix-2.2 runs.
+  Should be encoded in the run tag when the next real training run happens.
+
+---
