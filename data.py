@@ -127,19 +127,10 @@ class CocoActivationDataset(Dataset):
         self.return_metadata = return_metadata
         self.diffusion_models = set(diffusion_models or [])
         self.stats_seed = stats_seed
-        # Used ONLY to compute standardization stats on the post-alignment
-        # distribution (REPAIR_PLAN.md V6) -- NOT applied to the activations
-        # __getitem__ returns. Per-channel affine (standardize) and spatial
-        # average-pooling (align) are both linear in the token/spatial axis,
-        # so they commute exactly: (avgpool(x) - mean) / std == avgpool((x -
-        # mean) / std) for the same per-channel mean/std constants. The actual
-        # bug was never *where* standardization runs relative to alignment --
-        # it was that the mean/std were fit to individual tokens' variance
-        # instead of the pooled token's variance, which is lower (averaging
-        # correlated neighbours reduces variance). Computing stats here on
-        # aligned samples fixes the constants that get used; leaving
-        # __getitem__'s and train.py's existing standardize-then-align
-        # sequence untouched is equivalent, not a shortcut.
+        # Used ONLY to fit standardization stats to the post-alignment
+        # distribution; never applied to what __getitem__ returns. Standardize
+        # and align commute, so the order elsewhere is fine -- the bug was
+        # fitting std to unpooled token variance.
         self.spatial_aligner = spatial_aligner
 
         # ------------------------------------------------------------------ #
@@ -165,10 +156,8 @@ class CocoActivationDataset(Dataset):
                 "Make sure you have run the caching scripts first."
             )
 
-        # Restrict to a train/val split (REPAIR_PLAN.md V7/Fix 2.3). Filtering
-        # by stem (not by re-deriving a split here) so the caller decides which
-        # half this instance is -- e.g. uni_demo.py computes one split and
-        # builds two CocoActivationDataset instances from it, one per side.
+        # Restrict to a train/val split. Filters by stem rather than deriving
+        # a split here, so the caller owns which half this instance is.
         if allowed_stems is not None:
             allowed = {_img_stem(s) for s in allowed_stems}
             before = len(self.stems)
@@ -213,19 +202,13 @@ class CocoActivationDataset(Dataset):
 
     def _apply_spatial_align_for_stats(self, act: torch.Tensor, source: str) -> torch.Tensor:
         """
-        Apply self.spatial_aligner (if any) to a per-image activation before
-        it feeds the Welford accumulator below, so the computed std reflects
-        the POOLED token's variance, not each individual native token's
-        variance (REPAIR_PLAN.md V6). Averaging correlated neighbouring
-        tokens together lowers variance below 1 even when every input token
-        is already unit-variance, so a std fit to un-pooled tokens
-        under-normalizes whatever this source looks like after alignment.
+        Pool an activation before it feeds the Welford accumulator, so std
+        reflects the POOLED token's variance rather than each native token's
+.
 
-        SpatialAligner.align expects (B, N, D). A 2-D vision activation
-        (N, D) gets a throwaway batch dim; a 3-D diffusion activation
-        (T, N, D) already has a leading axis that plays that role exactly
-        (pooling only touches the N/D axes, so this is correct regardless of
-        which single timestep training eventually slices out of T).
+        align() wants (B, N, D): a 2-D (N, D) gets a throwaway batch dim; a 3-D
+        (T, N, D) already has a leading axis that serves, since pooling only
+        touches N/D.
         """
         if self.spatial_aligner is None or source not in self.spatial_aligner.native_grid_sizes:
             return act

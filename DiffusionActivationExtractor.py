@@ -646,9 +646,8 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
         # Pixel resolution the model actually sees, matching the CenterCrop above.
-        # AdaLayerNormSingle's micro-conditioning wants PIXEL dims, not latent dims
-        # (REPAIR_PLAN.md V4) -- source this from the same place preprocessing does
-        # instead of reading it off the (8x-downsampled) latent tensor.
+        # AdaLayerNormSingle's micro-conditioning wants PIXEL dims, so source it
+        # here rather than reading it off the 8x-downsampled latent tensor.
         self._pixel_resolution = 512
     
     def _load_pipeline(self):
@@ -695,12 +694,9 @@ class PixArtActivationExtractor(BaseActivationExtractor):
             return_tensors="pt",
         )
         text_inputs_1 = tokenized.input_ids.to(self.device)
-        # For an empty string, only ~1 of 256 positions is real content (EOS);
-        # everything else is padding. Without this mask, cross-attention in
-        # every transformer block (all 28, during the single forward pass --
-        # only ONE block's output is ever hooked/captured, see HOOK_DEPTH_FRAC
-        # below) attends over 255 pad embeddings as if they were real context
-        # (REPAIR_PLAN.md V4).
+        # For an empty string only ~1 of 256 positions is real content (EOS).
+        # Without this mask, cross-attention in all 28 blocks treats the other
+        # 255 pad embeddings as real context.
         attention_mask_1 = tokenized.attention_mask.to(self.device)
 
 
@@ -772,12 +768,9 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         batch_size = latents.shape[0]
         B, C, H, W = latents.shape
 
-        # aspect_ratio is scale-invariant (H/W is the same in pixel or latent
-        # space for a uniformly-downsampled crop), but AdaLayerNormSingle's
-        # micro-conditioning wants PIXEL resolution, not the 8x-downsampled
-        # latent's (H, W) -- e.g. 512x512, not 64x64 (REPAIR_PLAN.md V4). Every
-        # AdaLN modulation in every block was being told the image is 64x64,
-        # out of distribution for this checkpoint.
+        # aspect_ratio is scale-invariant, but micro-conditioning wants PIXEL
+        # resolution, not the 8x-downsampled latent's (H, W): 512x512, not 64x64.
+        # Passing 64x64 put every AdaLN modulation out of distribution.
         aspect_ratio = torch.tensor([H / W], device=self.device).unsqueeze(0).repeat(B, 1)
         pixel_h = pixel_w = self._pixel_resolution
 
@@ -856,8 +849,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         (old unseeded `torch.randn_like` behaviour). Generators are always
         consumed on CPU regardless of self.device, so a seed derived from an
         image's filename reproduces the same noise on any machine
-        (REPAIR_PLAN.md V4 -- extraction was previously unseeded, so no two
-        runs, and no run against a re-downloaded cache, ever matched).
+        (extraction was previously unseeded, so no two runs, and no run against a re-downloaded cache, ever matched).
         """
         if generator is None:
             return torch.randn_like(ref)
@@ -892,7 +884,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         project's t=10 cache-index pin was implicitly imitating -- the default
         (single_timestep=None) path instead *generates forward* under a null
         prompt from ~1-3% real signal, which is a different and much noisier
-        protocol (REPAIR_PLAN.md V4) and produces 15x more data than training
+        protocol and produces 15x more data than training
         ever reads (V13). When set, the returned ActivationOutput has exactly
         one entry in each of activations/timesteps/sigmas, so it composes with
         the existing (T, N, D)-shaped cache format at T=1 without changing any

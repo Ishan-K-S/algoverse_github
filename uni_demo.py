@@ -204,7 +204,7 @@ if __name__ == "__main__":
     # Build spatial aligner from config (None if disabled).
     # When enabled, model_tokens is rewritten to post-alignment counts so
     # the model and any downstream consumers see the effective token grid.
-    # Moved ahead of dataset construction (REPAIR_PLAN.md V6) so the dataset
+    # Moved ahead of dataset construction so the dataset
     # can compute standardization stats on the POOLED distribution -- a std
     # fit to individual native tokens under-normalizes whatever a source
     # looks like after alignment, since averaging correlated neighbouring
@@ -223,7 +223,7 @@ if __name__ == "__main__":
     # ----- Dataset -----
     combined_npz = bool(CONFIG.get("combined_npz", True))
 
-    # ----- Train/val split (REPAIR_PLAN.md V7/Fix 2.3) -----
+    # ----- Train/val split -----
     # Every number this project has produced -- every heatmap, every
     # top-activating-image, and the fixed_timestep_idx choice itself -- was
     # measured on the same 2000 images used to train. Discover the cached
@@ -294,7 +294,7 @@ if __name__ == "__main__":
         batch_size=_parse_int_field(CONFIG.get("batch_size", 32), "CONFIG.global.batch_size"),
         shuffle=False,
         # Same worker count as train. Against the current 15-timestep cache every
-        # read is a full zlib inflate of a ~35MB array (REPAIR_PLAN.md V13), so a
+        # read is a full zlib inflate of a ~35MB array, so a
         # single-threaded val pass every epoch adds real wall-clock to the exact
         # bottleneck Stage 2 exists to remove.
         num_workers=_parse_int_field(CONFIG.get("num_workers", 8), "CONFIG.global.num_workers"),
@@ -424,7 +424,7 @@ if __name__ == "__main__":
         print(f"[epoch] {epoch + 1}/{nb_epochs} done in {dt:.2f}s  "
               f"lr={current_lr:.2e}")
 
-        # Held-out validation pass (REPAIR_PLAN.md V7/Fix 2.3): the only
+        # Held-out validation pass: the only
         # number in this project measured on images the model never trained
         # on. No backward pass, no resampling, no curriculum/alignment terms.
         val_metrics = evaluate_universal_sae(

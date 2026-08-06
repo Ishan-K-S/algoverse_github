@@ -82,8 +82,7 @@ def resolve_pixart_raw_timestep(
     num_inference_steps=15) -- pass the same schedule length the cache index
     was chosen against, so an index like 10 keeps meaning the same noise level
     it always has, whether or not the cache itself still stores all steps.
-    Used by the DIFT-style single-timestep extraction path (REPAIR_PLAN.md
-    Fix 2.1) to pick the one raw `t` to noise a clean latent to directly,
+    Used by the DIFT-style single-timestep extraction path to pick the one raw `t` to noise a clean latent to directly,
     instead of slicing an index out of a pre-cached (T, N, D) trajectory.
     """
     total_steps = len(scheduler_timesteps)

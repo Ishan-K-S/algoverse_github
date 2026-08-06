@@ -88,7 +88,7 @@ class DinoV2(BaseModel):
         # preprocessing already uses (Resize(512)+CenterCrop(512)). The previous
         # Resize((224,224)) squashed the whole frame anisotropically, so DinoV2 and
         # PixArt were looking at different regions of every non-square image
-        # (REPAIR_PLAN.md V3): DinoV2 saw the full frame stretched, PixArt saw a
+        #: DinoV2 saw the full frame stretched, PixArt saw a
         # cropped square. Per-token cross-model alignment requires both grids to
         # cover the same pixels.
         self.preprocess = transforms.Compose(

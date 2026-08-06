@@ -28,8 +28,7 @@ from huggingface_hub import login
 def _stem_seed(filename: str) -> int:
     """
     Deterministic 32-bit seed derived from a filename, so re-extracting the
-    same image (on any machine, any run) draws the same noise (REPAIR_PLAN.md
-    V4/Fix 2.1 item 5). Python's built-in hash() is randomized per-process
+    same image (on any machine, any run) draws the same noise. Python's built-in hash() is randomized per-process
     unless PYTHONHASHSEED is fixed, so it can't be used here.
     """
     return zlib.crc32(filename.encode("utf-8"))
@@ -90,7 +89,7 @@ def cache_diffusion_activations(
         in coco_root are used.
     single_timestep : int or None
         Raw diffusion timestep (0..999) to noise directly to for a single
-        forward pass, DIFT-style (REPAIR_PLAN.md Fix 2.1). Only meaningful for
+        forward pass, DIFT-style. Only meaningful for
         PixArtActivationExtractor -- ignored (via signature introspection) for
         extractors that don't accept it, so this stays a no-op for SD3/FLUX.
         See pixart_timestep.resolve_pixart_raw_timestep for picking the value.
@@ -228,22 +227,14 @@ if __name__ == "__main__":
     selection_file = os.path.join(colab_path_to_cache, "selected_images.txt")
     image_list = select_images(colab_coco_root, 2000, selection_file)
 
-    # DIFT-style single-timestep extraction (REPAIR_PLAN.md Fix 2.1) instead of
-    # the old 15-step null-prompt generation trajectory: noise the clean latent
-    # directly to the timestep training actually pins (fixed_timestep_idx in
-    # config.yaml, currently 10), take one forward pass. ~15x less I/O (V13),
-    # a real anchor to the input image instead of a ~1-3%-signal null-prompt
-    # hallucination (V4), and reproducible via seed_from_filenames.
-    # Set to None to fall back to the old full-trajectory extraction (e.g. to
-    # rebuild a multi-timestep cache for pixart_timestep_autopsy.py-style
-    # timestep sweeps -- those need several distinct timesteps, not one).
+    # DIFT-style single-timestep extraction: noise the
+    # clean latent straight to config.yaml's fixed_timestep_idx, one forward pass.
+    # False falls back to the old 15-step trajectory, for timestep sweeps that
+    # need a multi-timestep cache.
     #
-    # NOTE: that fallback is the old *protocol*, not the old *numbers*. The
-    # micro-conditioning fix (pixel resolution instead of latent dims) and the
-    # T5 attention masks apply to both branches, so a full-trajectory re-cache
-    # will NOT reproduce the pre-Fix-2.1 cache byte-for-byte. That is intended
-    # -- both were bugs on both paths -- but it means old and new caches are not
-    # interchangeable and should not be mixed in one combined_cache directory.
+    # That fallback is the old protocol, NOT the old numbers -- the resolution and
+    # attention-mask fixes apply to both branches, so it won't reproduce the
+    # pre-Fix-2.1 cache. Don't mix old and new caches in one directory.
     USE_DIFT_SINGLE_TIMESTEP = True
     single_timestep = None
     if USE_DIFT_SINGLE_TIMESTEP:

@@ -2,7 +2,7 @@
 attn2 (cross-attention to the null prompt) fix PixArt's flat/uniform
 per-patch activations?
 
-CORRECTION (REPAIR_PLAN.md V8): this script's original premise was that the
+CORRECTION: this script's original premise was that the
 existing cache was built with an attn2-only hook and this script tests
 switching to attn1. That premise is false -- `PixArtActivationExtractor
 .extract_activations` has always hooked the *entire last block*

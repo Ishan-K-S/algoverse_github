@@ -156,7 +156,7 @@ def top_feature_set(model, x, source, sigma, top_k, device, aligner=None):
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
     scores = z.abs().amax(dim=(0, 1))
     # feature_usage.compute_feature_usage's "top_k_per_sample" criterion
-    # (REPAIR_PLAN.md V16/Fix 3.2), applied to this single image treated as a
+    #, applied to this single image treated as a
     # one-row batch -- same set of indices torch.topk would give (the caller
     # immediately converts to a set(), so index order doesn't matter), but
     # sharing one implementation with dictionary_diagnostic.py instead of two
@@ -217,9 +217,8 @@ def run():
         return_metadata=True,
         diffusion_models=list(model.diffusion_models),
         standardization_stats=ckpt_stats,
-        # Only used if ckpt_stats is None and this falls back to recomputing:
-        # training fits stats to the POOLED distribution (REPAIR_PLAN.md V6/Fix 2.2),
-        # so the fallback has to pool too or it standardises with a different std.
+        # Only matters on the stats-recompute fallback: training fits
+        # stats to the POOLED distribution, so pool here too.
         spatial_aligner=aligner,
     )
 

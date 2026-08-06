@@ -221,10 +221,8 @@ def main():
         # a Drive-mounted cache is hours. It's also more correct: standardising
         # eval data with different stats than training used shifts every code.
         standardization_stats=ckpt.get("standardization_stats"),
-        # Only used if the checkpoint has no persisted stats and this falls back to
-        # recomputing them: training fits stats to the POOLED distribution
-        # (REPAIR_PLAN.md V6/Fix 2.2), so the fallback has to pool too or it
-        # silently standardises with a different std than training used.
+        # Only matters on the stats-recompute fallback: training fits
+        # stats to the POOLED distribution, so pool here too.
         spatial_aligner=aligner,
     )
     n_use = min(args.n_images, len(ds))
@@ -278,7 +276,7 @@ def main():
 
             # Per-feature firing for this image (did feature k fire on ANY token?)
             # Uses feature_usage.compute_feature_usage's "ever_fired" criterion
-            # (REPAIR_PLAN.md V16/Fix 3.2) so this matches, by construction, any
+            # so this matches, by construction, any
             # other script that asks the same question the same way -- instead
             # of three scripts independently reimplementing "used" slightly
             # differently and producing numbers that were never comparable.
@@ -292,7 +290,7 @@ def main():
             # Top-K scoring metric, via feature_usage.compute_feature_usage's
             # "top_k_per_sample" criterion -- the exact function
             # cross_model_overlap.py's top_feature_set() now also calls
-            # (REPAIR_PLAN.md V16/Fix 3.2), so the two scripts can't drift.
+            #, so the two scripts can't drift.
             scores_d = z_d.abs().amax(dim=(0, 1))
             scores_p = z_p.abs().amax(dim=(0, 1))
             top_d_mask = compute_feature_usage(scores_d.unsqueeze(0), criterion="top_k_per_sample", top_k=args.top_k)

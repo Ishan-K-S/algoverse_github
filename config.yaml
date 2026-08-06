@@ -74,7 +74,7 @@ sae_params:
   self_weight: 1.0
   cross_weight: 2.0           # back to the old 2:1 cross/self ratio. cross-recon is the whole point of a
                               # universal SAE, so it can't stay at 0.
-                              # NOTE (REPAIR_PLAN.md V9): the reconstruction term is a WEIGHTED
+                              # NOTE: the reconstruction term is a WEIGHTED
                               # AVERAGE (divided by self_weight+cross_weight), so only the RATIO
                               # of these two values matters, not their absolute size. Raising
                               # cross_weight here doesn't add cross-recon pressure on top of a
@@ -97,26 +97,24 @@ sae_params:
   # false to disable and reproduce the previous behaviour exactly.
   resample_dead: true
   resample_interval: 501          # global steps between resampling events. ODD on purpose
-                                  # (REPAIR_PLAN.md V2e): _pick_source alternates on
+                                  #: _pick_source alternates on
                                   # global_step % 2, so an EVEN interval made every single
                                   # resample event land on a DinoV2-source step for the whole
                                   # run -- a systematic source asymmetry nobody intended. An
                                   # odd interval alternates the parity across events instead.
   resample_dead_threshold: 1.0e-3 # usage-EMA below which a feature counts as dead
   resample_enc_scale: 0.05        # revived encoder-row norm = this * mean alive encoder norm.
-                                  # Lowered from 0.2 (REPAIR_PLAN.md V2c): revived rows are seeded
-                                  # at cosine 1.0 with their seed token, so 0.2x already fires at
-                                  # legitimate-coefficient magnitude and evicts real features from TopK.
-  resample_max_per_event: 512     # cap features revived per event. Was 4096 (1/3 of the 12288-wide
-                                  # dictionary in a single step, REPAIR_PLAN.md V2) -- now ~4%.
+                                  # Lowered from 0.2: revived rows seed at cosine 1.0 with their
+                                  # seed token, so 0.2x already evicts real features from TopK.
+  resample_max_per_event: 512     # cap features revived per event (~4% of the dictionary).
+                                  # Was 4096, i.e. a third of it in a single step.
   resample_start_step: 501        # don't resample before this step. Must be a multiple of
-                                  # resample_interval or it's a no-op (REPAIR_PLAN.md V2); 200 wasn't.
-                                  # Tracks resample_interval above -- keep them equal unless you
-                                  # actually want to skip the first N events.
+                                  # resample_interval or it's a no-op; keep the two equal unless
+                                  # you actually want to skip the first N events.
   resample_end_step: 0            # stop resampling at/after this step (0 = no limit)
   grad_clip_norm: 1.0             # clip total grad norm before optimizer.step(); <=0 disables.
-                                  # Added per REPAIR_PLAN.md V2 -- resample events can otherwise
-                                  # spike gradients with no clipping anywhere in the repo.
+                                  # Nothing else in the repo bounds a resample-induced spike.
+                                  # This value is a starting guess -- check train/grad_norm_preclip.
 model_zoo:
   # Vision encoders
   DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid

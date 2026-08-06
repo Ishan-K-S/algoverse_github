@@ -587,7 +587,7 @@ def evaluate_universal_sae(
     spatial_aligner=None,
 ) -> Dict[str, float]:
     """
-    Held-out reconstruction-loss pass (REPAIR_PLAN.md V7/Fix 2.3): no
+    Held-out reconstruction-loss pass: no
     backward pass, no optimizer step, no dead-feature resampling, no
     curriculum gating, no latent-alignment loss -- just self+cross MSE for
     every (source, target) pair the model can structurally reconstruct,
@@ -602,9 +602,8 @@ def evaluate_universal_sae(
     Returns a flat dict of {"val/loss_<source>_to_<target>": mean_mse, ...}
     plus "val/sae_loss" (mean over all pair losses, unweighted), "val/n_batches",
     and -- only when spatial_aligner is set, since otherwise different models'
-    tokens don't share a common grid position (REPAIR_PLAN.md V3) --
-    "val/cofire_jaccard_<A>_vs_<B>" (REPAIR_PLAN.md Fix 3.2, see
-    feature_usage.per_token_cofire_jaccard): the per-TOKEN feature-set
+    tokens don't share a common grid position --
+    "val/cofire_jaccard_<A>_vs_<B>": the per-TOKEN feature-set
     agreement between every pair of models present in a batch, as opposed to
     every existing metric in this project, which aggregates over tokens
     before comparing models. Reported alongside "..._chance_..." (what the same
@@ -702,7 +701,7 @@ def evaluate_universal_sae(
                 sums[key] = sums.get(key, 0.0) + loss.item()
                 counts[key] = counts.get(key, 0) + 1
 
-        # Per-token co-fire (REPAIR_PLAN.md Fix 3.2): only meaningful when
+        # Per-token co-fire: only meaningful when
         # spatial_aligner puts every model's tokens on the same grid (V3) --
         # without it, position n means a different image location per model
         # and comparing "did they agree at position n" is not interpretable.
@@ -1106,13 +1105,9 @@ def train_universal_sae(
 
         sae_loss = None
         if reconstruction_weight_total > 0:
-            # Weighted AVERAGE, not weighted sum: self_weight/cross_weight only ever
-            # matter as a ratio (REPAIR_PLAN.md V9). Raising cross_weight with
-            # self_weight fixed does not add cross-recon gradient magnitude -- it
-            # shrinks self-recon's share of a fixed-magnitude total. Kept this way
-            # (rather than dropping the normalization) because it keeps the loss
-            # scale stable across the curriculum boundary, where the number of
-            # active reconstruction terms itself changes (see V10 below).
+            # Weighted AVERAGE: only the self:cross RATIO matters, raising
+            # cross_weight just shrinks self-recon's share.
+            # Kept normalized so loss scale survives the curriculum boundary.
             sae_loss = reconstruction_loss / reconstruction_weight_total
             loss = loss + sae_loss
 
@@ -1123,12 +1118,9 @@ def train_universal_sae(
         grad_norm = None
         if grad_clip_norm > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            # Visibility when wandb is off: train/grad_norm_preclip is logged only
-            # inside the wandb-gated block below, and the plan's own tiny-scale
-            # verification runs specify use_wandb=false. grad_clip_norm=1.0 is a
-            # starting value, not a measured one -- if the real pre-clip norm sits
-            # 10-100x above it, this clip is a large silent LR reduction across the
-            # whole run rather than a guard on resample spikes.
+            # grad_norm_preclip is only logged under wandb, so warn on the console
+            # too: if the real norm sits far above the (unmeasured) 1.0 default,
+            # this clip is a silent LR cut, not a spike guard.
             if (
                 float(grad_norm) > 10.0 * grad_clip_norm
                 and not getattr(model, "_warned_grad_clip", False)
@@ -1173,17 +1165,12 @@ def train_universal_sae(
                 "train/total_loss": loss_value,
                 "train/total_loss_ema": ema_loss,
                 "train/sae_loss": sae_loss.item() if sae_loss is not None else 0.0,
-                # Unweighted per-pair average (what was previously logged as
-                # "train/latent_align_loss") and its actual contribution to the
-                # objective (multiplied by latent_align_weight) -- these differ by
-                # exactly latent_align_weight and were previously conflated under
-                # one unweighted name.
+                # Per-pair average and its real contribution to the objective;
+                # these differ by exactly latent_align_weight.
                 "train/latent_align_loss_unweighted": latent_align_loss_unweighted,
                 "train/latent_align_loss_weighted": latent_align_weight * latent_align_loss_unweighted,
-                # model.model_names has a fixed order set at construction, so this
-                # index is stable across the run. Replaces the previous string-valued
-                # "train/source_model", which wandb stores as non-numeric and cannot
-                # render on a line chart.
+                # Int, not the old string: wandb can't line-chart a string column.
+                # model_names order is fixed at construction, so the index is stable.
                 "train/source_model_idx": model.model_names.index(source),
                 "train/epoch": epoch,
                 "train/global_step": global_step_actual,
@@ -1203,7 +1190,7 @@ def train_universal_sae(
                 # train/latent_sparsity used to be logged here. TopK guarantees exactly
                 # top_k nonzeros per token always, so (z == 0).float().mean() is the
                 # constant (latent_dim - top_k) / latent_dim for the entire run --
-                # zero information. Removed rather than fixed, per REPAIR_PLAN.md V11.
+                # zero information. Removed rather than fixed.
                 attn_loss = attention_component_loss(model)
                 if attn_loss is not None:
                     log_dict["train/attention_component_loss"] = attn_loss.item()
@@ -1222,7 +1209,7 @@ def train_universal_sae(
                     # the resampler agree on what "dead" means (previously hardcoded to
                     # 1e-3 here, decoupled from resample_dead_threshold). Uses
                     # feature_usage.compute_feature_usage's "rate_above_threshold"
-                    # criterion (REPAIR_PLAN.md V16/Fix 3.2) -- the same shared
+                    # criterion -- the same shared
                     # definition dictionary_diagnostic.py's "ever_fired" and
                     # cross_model_overlap.py's "top_k_per_sample" criteria live in,
                     # so "used" always means one of three explicit, named things

@@ -46,7 +46,7 @@ def split_train_val(
     """
     Deterministically split a list of identifiers (image filenames or cache
     stems -- this function doesn't care which) into disjoint train/val sets,
-    persisted to disk next to selected_images.txt (REPAIR_PLAN.md V7/Fix 2.3).
+    persisted to disk next to selected_images.txt.
 
     Idempotent like select_images(): if both files already exist, loads and
     returns them unchanged rather than re-splitting -- so every diagnostic and

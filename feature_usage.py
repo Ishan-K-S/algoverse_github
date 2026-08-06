@@ -1,6 +1,6 @@
 """
 One place for "does this model use dictionary feature k" and "do two models
-agree on which features fire where" (REPAIR_PLAN.md V16 last bullet / Fix 3.2).
+agree on which features fire where".
 
 Before this module existed, train.py, dictionary_diagnostic.py, and
 cross_model_overlap.py each answered "is feature k used" with a different
@@ -84,13 +84,13 @@ def compute_feature_usage(
 
 def per_token_cofire_jaccard(z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
     """
-    Per-token co-fire (REPAIR_PLAN.md Fix 3.2): compares WHICH feature
+    Per-token co-fire: compares WHICH feature
     indices are nonzero AT EACH (image, token) POSITION independently,
     instead of aggregating over tokens first the way every prior metric did.
 
     z_a, z_b: (B, N, K) latent codes for two models, ALREADY spatially
     aligned to the same N (e.g. via SpatialAligner) so position n means the
-    same image location in both -- meaningless otherwise (REPAIR_PLAN.md V3).
+    same image location in both -- meaningless otherwise.
     This function does not and cannot verify that its inputs were aligned;
     that is the caller's responsibility.
 
@@ -153,7 +153,7 @@ def feature_heatmap_iou(
     threshold: float = 0.0,
 ) -> float:
     """
-    IoU (REPAIR_PLAN.md Fix 3.2) between two models' per-token activation
+    IoU between two models' per-token activation
     heatmaps for ONE shared dictionary feature, across a batch of spatially
     aligned images: "does feature k light up the same image REGIONS in both
     models," not just "do both models ever use feature k somewhere."

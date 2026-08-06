@@ -255,14 +255,10 @@ class UniversalSAE(nn.Module):
         Hard TopK on the last dim. Operates on the *signed* pre-activation,
         following Gao et al. — no ReLU before TopK.
 
-        This is plain hard TopK, NOT a straight-through estimator (the docstring
-        and the comment below used to claim otherwise — REPAIR_PLAN.md §2). `mask`
-        is built from torch.zeros_like and carries no grad, so d(out)/d(z_pre) is
-        exactly `mask`: gradient reaches the selected indices only, and is exactly
-        zero everywhere else. A straight-through estimator would deliberately pass
-        gradient to the UNSELECTED entries too; this does not. That is precisely
-        why `pre_topk_align_weight` exists — the pre-TopK alignment term is the
-        only thing giving unselected features any learning signal.
+        Plain hard TopK, NOT a straight-through estimator: `mask` carries no
+        grad, so gradient reaches the selected indices only and is exactly zero
+        elsewhere. This is why pre_topk_align_weight exists -- the pre-TopK
+        alignment term is the only signal unselected features ever get.
         """
         if self.top_k is None:
             return z_pre
