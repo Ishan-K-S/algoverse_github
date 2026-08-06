@@ -8,6 +8,8 @@ from einops import rearrange
 from tqdm import tqdm
 import os
 
+from feature_usage import compute_feature_usage, per_token_cofire_jaccard
+
 try:
     import wandb
 
@@ -577,8 +579,14 @@ def evaluate_universal_sae(
     since there's no update cost to amortize during eval.
 
     Returns a flat dict of {"val/loss_<source>_to_<target>": mean_mse, ...}
-    plus "val/sae_loss" (mean over all pair losses, unweighted) and
-    "val/n_batches". Caller (e.g. uni_demo.py) decides whether/how to log it.
+    plus "val/sae_loss" (mean over all pair losses, unweighted), "val/n_batches",
+    and -- only when spatial_aligner is set, since otherwise different models'
+    tokens don't share a common grid position (REPAIR_PLAN.md V3) --
+    "val/cofire_jaccard_<A>_vs_<B>" (REPAIR_PLAN.md Fix 3.2, see
+    feature_usage.per_token_cofire_jaccard): the per-TOKEN feature-set
+    agreement between every pair of models present in a batch, as opposed to
+    every existing metric in this project, which aggregates over tokens
+    before comparing models.
     """
     was_training = model.training
     model.eval()
@@ -596,10 +604,13 @@ def evaluate_universal_sae(
 
     sums: Dict[str, float] = {}
     counts: Dict[str, int] = {}
+    cofire_sums: Dict[str, float] = {}
+    cofire_counts: Dict[str, int] = {}
     n_batches = 0
 
     for (acts, meta), _y in dataloader:
         n_batches += 1
+        zs_by_source: Dict[str, torch.Tensor] = {}
         for source in acts.keys():
             if source in diffusion_models:
                 x_src_full = acts[source].to(device)
@@ -617,6 +628,7 @@ def evaluate_universal_sae(
                 if spatial_aligner is not None:
                     x_src = spatial_aligner.align(x_src, source=source)
                 _z_pre, z = model.encode(x_src, source=source, sigma=t_src)
+                zs_by_source[source] = z
             else:
                 x_src = acts[source].to(device)
                 batch_size = x_src.shape[0]
@@ -626,6 +638,7 @@ def evaluate_universal_sae(
                 if spatial_aligner is not None:
                     x_src = spatial_aligner.align(x_src, source=source)
                 _z_pre, z = model.encode(x_src, source=source, sigma=None)
+                zs_by_source[source] = z
 
             for target, x_target in acts.items():
                 if not model.can_cross_reconstruct(source, target):
@@ -665,12 +678,37 @@ def evaluate_universal_sae(
                 sums[key] = sums.get(key, 0.0) + loss.item()
                 counts[key] = counts.get(key, 0) + 1
 
+        # Per-token co-fire (REPAIR_PLAN.md Fix 3.2): only meaningful when
+        # spatial_aligner puts every model's tokens on the same grid (V3) --
+        # without it, position n means a different image location per model
+        # and comparing "did they agree at position n" is not interpretable.
+        if spatial_aligner is not None and len(zs_by_source) >= 2:
+            names = sorted(zs_by_source.keys())
+            for i, name_a in enumerate(names):
+                for name_b in names[i + 1:]:
+                    z_a, z_b = zs_by_source[name_a], zs_by_source[name_b]
+                    if z_a.shape != z_b.shape:
+                        # Shouldn't happen: spatial_aligner forces every source to
+                        # the same target_n_tokens, and both z's come from the same
+                        # batch. If it ever does, that's a real bug worth seeing,
+                        # not a silent skip.
+                        print(f"[eval] WARNING: skipping cofire_jaccard_{name_a}_vs_{name_b} "
+                              f"-- shape mismatch {tuple(z_a.shape)} vs {tuple(z_b.shape)} "
+                              f"despite spatial_aligner being set.")
+                        continue
+                    jaccard = per_token_cofire_jaccard(z_a, z_b)
+                    key = f"cofire_jaccard_{name_a}_vs_{name_b}"
+                    cofire_sums[key] = cofire_sums.get(key, 0.0) + jaccard.item()
+                    cofire_counts[key] = cofire_counts.get(key, 0) + 1
+
     if was_training:
         model.train()
 
     result = {f"val/loss_{k}": sums[k] / counts[k] for k in sums}
     if result:
         result["val/sae_loss"] = sum(result.values()) / len(result)
+    for k in cofire_sums:
+        result[f"val/{k}"] = cofire_sums[k] / cofire_counts[k]
     result["val/n_batches"] = float(n_batches)
     return result
 
@@ -1117,8 +1155,17 @@ def train_universal_sae(
                     # Threshold: feature is "used" if EMA firing rate exceeds the same
                     # threshold the dead-feature resampler uses, so this diagnostic and
                     # the resampler agree on what "dead" means (previously hardcoded to
-                    # 1e-3 here, decoupled from resample_dead_threshold).
-                    used_per_model = {n: (e > resample_dead_threshold) for n, e in ema_attrs.items()}
+                    # 1e-3 here, decoupled from resample_dead_threshold). Uses
+                    # feature_usage.compute_feature_usage's "rate_above_threshold"
+                    # criterion (REPAIR_PLAN.md V16/Fix 3.2) -- the same shared
+                    # definition dictionary_diagnostic.py's "ever_fired" and
+                    # cross_model_overlap.py's "top_k_per_sample" criteria live in,
+                    # so "used" always means one of three explicit, named things
+                    # instead of three scripts' silently-differing reimplementations.
+                    used_per_model = {
+                        n: compute_feature_usage(e, criterion="rate_above_threshold", threshold=resample_dead_threshold)
+                        for n, e in ema_attrs.items()
+                    }
                     model_names = sorted(used_per_model.keys())
                     used_stack = torch.stack([used_per_model[n] for n in model_names])  # (M, K)
 

@@ -47,6 +47,8 @@ import numpy as np
 import torch
 import yaml
 
+from feature_usage import compute_feature_usage
+
 
 CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_epoch_29.pth"
 CACHE_ROOT      = "/content/combined_cache"
@@ -270,18 +272,28 @@ def main():
             _, z_p = model.encode(x_pix, source="PixArt", sigma=sigma_pix)
 
             # Per-feature firing for this image (did feature k fire on ANY token?)
-            fired_d = (z_d != 0).any(dim=(0, 1))  # (K,)
-            fired_p = (z_p != 0).any(dim=(0, 1))  # (K,)
+            # Uses feature_usage.compute_feature_usage's "ever_fired" criterion
+            # (REPAIR_PLAN.md V16/Fix 3.2) so this matches, by construction, any
+            # other script that asks the same question the same way -- instead
+            # of three scripts independently reimplementing "used" slightly
+            # differently and producing numbers that were never comparable.
+            fired_d = compute_feature_usage(z_d, criterion="ever_fired")  # (K,)
+            fired_p = compute_feature_usage(z_p, criterion="ever_fired")  # (K,)
 
             fires_dino += fired_d.long()
             fires_pixart += fired_p.long()
             cofire += (fired_d & fired_p).long()
 
-            # Top-K scoring metric (matches cross_model_overlap.py)
+            # Top-K scoring metric, via feature_usage.compute_feature_usage's
+            # "top_k_per_sample" criterion -- the exact function
+            # cross_model_overlap.py's top_feature_set() now also calls
+            # (REPAIR_PLAN.md V16/Fix 3.2), so the two scripts can't drift.
             scores_d = z_d.abs().amax(dim=(0, 1))
             scores_p = z_p.abs().amax(dim=(0, 1))
-            _, top_d_idx = torch.topk(scores_d, k=min(args.top_k, K))
-            _, top_p_idx = torch.topk(scores_p, k=min(args.top_k, K))
+            top_d_mask = compute_feature_usage(scores_d.unsqueeze(0), criterion="top_k_per_sample", top_k=args.top_k)
+            top_p_mask = compute_feature_usage(scores_p.unsqueeze(0), criterion="top_k_per_sample", top_k=args.top_k)
+            top_d_idx = top_d_mask.nonzero(as_tuple=True)[0]
+            top_p_idx = top_p_mask.nonzero(as_tuple=True)[0]
             sa, sb = set(top_d_idx.cpu().tolist()), set(top_p_idx.cpu().tolist())
             u = sa | sb
             jaccard_scores.append(len(sa & sb) / len(u) if u else 0.0)

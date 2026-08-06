@@ -31,6 +31,7 @@ from data import CocoActivationDataset
 from pixart_timestep import resolve_pixart_timestep
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config
+from feature_usage import compute_feature_usage
 
 
 # walk a tree and list every checkpoint file with size + mtime
@@ -154,7 +155,14 @@ def top_feature_set(model, x, source, sigma, top_k, device, aligner=None):
         sigma = sigma.to(device).float().view(1)
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
     scores = z.abs().amax(dim=(0, 1))
-    _, idx = torch.topk(scores, k=min(top_k, scores.numel()))
+    # feature_usage.compute_feature_usage's "top_k_per_sample" criterion
+    # (REPAIR_PLAN.md V16/Fix 3.2), applied to this single image treated as a
+    # one-row batch -- same set of indices torch.topk would give (the caller
+    # immediately converts to a set(), so index order doesn't matter), but
+    # sharing one implementation with dictionary_diagnostic.py instead of two
+    # independently-written top-k selections that could silently drift apart.
+    used_mask = compute_feature_usage(scores.unsqueeze(0), criterion="top_k_per_sample", top_k=top_k)
+    idx = used_mask.nonzero(as_tuple=True)[0]
     return idx.cpu().numpy()
 
 
