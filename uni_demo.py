@@ -353,6 +353,7 @@ if __name__ == "__main__":
             resample_max_per_event=int(SAE_PARAMS.get("resample_max_per_event", 0)),
             resample_start_step=int(SAE_PARAMS.get("resample_start_step", 0)),
             resample_end_step=int(SAE_PARAMS.get("resample_end_step", 0)),
+            grad_clip_norm=float(SAE_PARAMS.get("grad_clip_norm", CONFIG.get("grad_clip_norm", 1.0))),
         )
 
         steps_seen = (epoch + 1) * len(dataloader)

@@ -91,10 +91,18 @@ sae_params:
   resample_dead: true
   resample_interval: 500          # global steps between resampling events
   resample_dead_threshold: 1.0e-3 # usage-EMA below which a feature counts as dead
-  resample_enc_scale: 0.2         # revived encoder-row norm = this * mean alive encoder norm
-  resample_max_per_event: 4096    # cap features revived per event (0 = revive all dead at once)
-  resample_start_step: 200        # don't resample before the encoders/EMAs have settled
+  resample_enc_scale: 0.05        # revived encoder-row norm = this * mean alive encoder norm.
+                                  # Lowered from 0.2 (REPAIR_PLAN.md V2c): revived rows are seeded
+                                  # at cosine 1.0 with their seed token, so 0.2x already fires at
+                                  # legitimate-coefficient magnitude and evicts real features from TopK.
+  resample_max_per_event: 512     # cap features revived per event. Was 4096 (1/3 of the 12288-wide
+                                  # dictionary in a single step, REPAIR_PLAN.md V2) -- now ~4%.
+  resample_start_step: 500        # don't resample before this step. Must be a multiple of
+                                  # resample_interval or it's a no-op (REPAIR_PLAN.md V2); 200 wasn't.
   resample_end_step: 0            # stop resampling at/after this step (0 = no limit)
+  grad_clip_norm: 1.0             # clip total grad norm before optimizer.step(); <=0 disables.
+                                  # Added per REPAIR_PLAN.md V2 -- resample events can otherwise
+                                  # spike gradients with no clipping anywhere in the repo.
 model_zoo:
   # Vision encoders
   DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid

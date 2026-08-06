@@ -390,8 +390,9 @@ def _reset_adam_state_slice(optimizer, param, rows=None, cols=None) -> None:
     dead. `rows` indexes dim 0, `cols` indexes dim 1 — pass whichever axis the
     feature lives on (W_enc.weight: feature = row; W_dec.weight: feature =
     column). The per-tensor `step` count is left alone (it can't be reset per
-    row); with exp_avg/exp_avg_sq zeroed the first revived update is a normal
-    ~lr-scaled step, not an explosion.
+    row); with exp_avg/exp_avg_sq zeroed but `step` intact, bias correction is
+    ~1 while m=0.1*g, v=0.001*g^2 after the first backward, so the first
+    revived update is ~3.2x the nominal lr-scaled step, not ~1x.
     """
     state = optimizer.state.get(param, None)
     if not state:
@@ -418,6 +419,7 @@ def resample_dead_features(
     enc_scale_factor: float = 0.2,
     max_per_event: int = 0,
     eps: float = 1e-8,
+    fixed_timestep_idx: Optional[int] = None,
 ) -> int:
     """
     Dead-feature resampling for the shared TopK dictionary, following
@@ -441,9 +443,14 @@ def resample_dead_features(
       - Adam moment state for those rows/cols is zeroed.
 
     High-loss tokens are sampled with probability proportional to squared
-    self-reconstruction error. Decoder columns are unit-normalized by the
-    training loop's normalize_decoder_dictionaries_() on the next step, which
-    is consistent with the normalized init here.
+    self-reconstruction error, without replacement whenever there are at least
+    as many candidate tokens as features to revive (falls back to sampling
+    with replacement only if n_dead exceeds the token count). Decoder columns
+    are unit-normalized by the training loop's normalize_decoder_dictionaries_()
+    on the next step, which is consistent with the normalized init here.
+    `fixed_timestep_idx` must match the value training pins PixArt to, or
+    revived PixArt features are seeded from a random timestep's residual and
+    are dead on arrival at the next resample event.
 
     Returns the number of features resampled (0 if none were dead, or if the
     usage EMAs haven't been populated for every model yet).
@@ -484,6 +491,7 @@ def resample_dead_features(
             ts_bt = _get_sigmas_bt(meta, model_name, x.shape[0], device)
             x_slice, t_slice, _, _, _, _ = _extract_source_slice(
                 x, is_diffusion=True, timestep_values_bt=ts_bt,
+                fixed_timestep_idx=fixed_timestep_idx,
             )
         else:
             x_slice, t_slice, _, _, _, _ = _extract_source_slice(x, is_diffusion=False)
@@ -499,12 +507,18 @@ def resample_dead_features(
         x_hat_flat = x_hat.reshape(-1, x_hat.shape[-1])   # (T, D)
         recon_err = ((x_hat_flat - x_cmp_flat) ** 2).sum(dim=-1)  # (T,)
 
-        # Sample high-loss tokens with prob proportional to err^2.
-        probs = recon_err.double() ** 2
+        # Sample high-loss tokens with prob proportional to err^2. recon_err is
+        # already a squared L2 norm, so no further power here (the previous
+        # `** 2` made this err^4, which collapsed the revived set onto a
+        # handful of worst tokens under replacement=True).
+        probs = recon_err.double()
         total = probs.sum()
         if not torch.isfinite(total) or total <= 0:
             probs = torch.ones_like(probs)
-        chosen = torch.multinomial(probs, num_samples=n_dead, replacement=True)
+        # Without replacement whenever possible, so revivals don't pile up as
+        # near-duplicate directions seeded from the same one or two tokens.
+        replacement = n_dead > probs.numel()
+        chosen = torch.multinomial(probs, num_samples=n_dead, replacement=replacement)
         chosen_acts = x_cmp_flat[chosen]  # (n_dead, D)
 
         # Decoder dictionary directions: point at what we currently miss.
@@ -523,6 +537,12 @@ def resample_dead_features(
         # Wipe optimizer momentum for just these rows/cols so they actually train.
         _reset_adam_state_slice(optimizer, sae.W_enc.weight, rows=dead_idx)
         _reset_adam_state_slice(optimizer, sae.W_dec.weight, cols=dead_idx)
+
+        # Clear the "dead" reading on the usage EMA for these indices so they
+        # aren't miscounted as used_by_none for the ~40 steps it takes the EMA
+        # to catch up on its own (window ~1/(1-0.95) batches at decay 0.95).
+        ema = ema_attrs[model_name]
+        ema[dead_idx] = dead_threshold + max(dead_threshold, eps)
 
     return n_dead
 
@@ -562,6 +582,7 @@ def train_universal_sae(
     resample_max_per_event: int = 0,    # cap revivals per event (0 = all dead)
     resample_start_step: int = 0,       # don't resample before this global step
     resample_end_step: int = 0,         # stop resampling at/after this step (0 = no limit)
+    grad_clip_norm: float = 1.0,        # clip total grad norm to this before optimizer.step(); <=0 disables
 ):
     """
     One epoch of Universal SAE training.
@@ -671,6 +692,7 @@ def train_universal_sae(
                 dead_threshold=resample_dead_threshold,
                 enc_scale_factor=resample_enc_scale,
                 max_per_event=resample_max_per_event,
+                fixed_timestep_idx=fixed_timestep_idx,
             )
             if n_resampled > 0:
                 resampled_since_log += n_resampled
@@ -869,6 +891,9 @@ def train_universal_sae(
             loss = loss + latent_align_weight * (latent_align_loss / n_align_pairs)
 
         loss.backward()
+        grad_norm = None
+        if grad_clip_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
         if hasattr(model, "normalize_decoder_dictionaries_"):
             model.normalize_decoder_dictionaries_()
@@ -917,6 +942,8 @@ def train_universal_sae(
                 "train/in_curriculum": float(in_curriculum),
                 "train/resampled_features": resampled_since_log,
             }
+            if grad_norm is not None:
+                log_dict["train/grad_norm_preclip"] = float(grad_norm)
             resampled_since_log = 0
             if source_timestep_idx is not None:
                 log_dict["train/source_timestep_idx"] = int(source_timestep_idx)
