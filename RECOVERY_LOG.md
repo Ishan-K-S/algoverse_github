@@ -892,3 +892,249 @@ this diff, and outside Fix 1.2's scope.
   under the "no dataset recaching / no PixArt activation extraction" constraint on this session and
   is a **REQUIRES EXTERNAL EXPERIMENT** item for the next session with Colab/GPU access, not
   something to attempt here.
+
+---
+
+## Fix 2.1 — unify DinoV2/PixArt preprocessing crop + DIFT-style single-timestep PixArt extraction
+
+**Addresses:** V3 (BLOCKER), V4 (BLOCKER), V13 (HIGH, partially — the I/O-amplification fix; the
+mmap/`.copy()` sub-issues in `data.py` are untouched, out of this fix's file list)
+**Commit:** `7b6eded`
+**Files modified:** `models.py`, `DiffusionActivationExtractor.py`, `cache_coco_diffusion_activations.py`,
+`pixart_timestep.py`
+
+### Issue
+
+Three independent, compounding defects in how PixArt activations are produced:
+
+- **V3:** `models.py`'s `DinoV2.__init__` preprocessed images with `transforms.Resize((224, 224))` —
+  a tuple, which anisotropically squashes the whole frame to 224×224 with no cropping. PixArt's
+  preprocessing (`DiffusionActivationExtractor.py`) already used `Resize(512)` [int — short side to
+  512, aspect preserved] + `CenterCrop(512)`. For a typical non-square COCO image, DinoV2's 16×16
+  grid covered the *entire* frame (stretched); PixArt's 32×32 grid covered only the center square.
+  `latent_align_mode: per_token` and cross-reconstruction both assume grid cell (i,j) is the same
+  image location in both models — it wasn't, and the offset varied per image with aspect ratio.
+- **V4:** PixArt extraction noised the clean latent to ~99% noise (the scheduler's *first* step,
+  sigma≈0.006–0.03 signal fraction) and then generated forward under a null/empty prompt with no
+  conditional pass — a DDIM sample only weakly anchored to the real image, very different from (and
+  ~15× more expensive than) the DIFT-style protocol (re-noise the clean latent to a moderate t,
+  single forward pass) the project's t=10 pin was implicitly imitating. Three further defects in the
+  same code path: micro-conditioning (`added_cond_kwargs["resolution"]`) was fed the *latent*
+  tensor's H,W (64×64) instead of pixel resolution (512×512) — out-of-distribution for every AdaLN
+  modulation in the checkpoint; no `encoder_attention_mask` was passed, so cross-attention attended
+  over ~255 T5 pad-embedding positions as real content; the noise (`torch.randn_like`) was
+  completely unseeded, so no two extraction runs, ever, produced the same cached activation for the
+  same image.
+- **V13:** caching all 15 timesteps per image when training only ever reads one (`fixed_timestep_idx:
+  10`) is 14/15 of every disk read and I/O transfer wasted.
+
+### Root cause
+
+V3: two preprocessing pipelines written independently for two different models, never unified. V4:
+the extraction loop was adapted from a standard "generate an image" DDIM sampling loop rather than
+designed for activation *extraction*, so it inherited generation's assumptions (start from near-pure
+noise, use a null prompt only as a placeholder for later CFG that was never added) instead of the
+DIFT protocol's assumption (start from a moderate, informative noise level, take one pass). V13 is a
+direct consequence of caching the full trajectory when only one point on it is ever used.
+
+### Changes
+
+**`models.py`** — `DinoV2.__init__`'s preprocessing changed from `Resize((224, 224))` to
+`Resize(224)` [int] + `CenterCrop(224)`, matching PixArt's existing crop strategy exactly. Scoped
+strictly to `DinoV2` per `REPAIR_PLAN.md`'s file list (`models.py:86-89`) — `SigLIP`, `CLIP`, `ViT`,
+`ResNet`, and `ConvNeXt` in the same file have the identical anisotropic-squash bug but are not part
+of the active DinoV2+PixArt pipeline (`models.py`'s own docstring: "the frozen feature-extractor
+zoo... nothing in `train.py` imports it" beyond the two models actually in `model_zoo`); left
+untouched to avoid scope creep, flagged here for whoever extends to SigLIP/SD per the project's
+stated extrapolation goal.
+
+**`DiffusionActivationExtractor.py`** (all changes confined to `PixArtActivationExtractor`, the only
+extractor actually used — SD3/FLUX are dead code per `REPAIR_PLAN.md` §7):
+- Added `self._pixel_resolution = 512` at `__init__`, next to the `CenterCrop(512)` it must match
+  (single source of truth). `_get_transformer_input`'s `added_cond_kwargs["resolution"]` now uses
+  this instead of the latent tensor's `H, W` (which are 64×64 after 8× VAE downsampling).
+  `aspect_ratio` was left as-is (it's scale-invariant for a uniform downsample, so it was never
+  wrong).
+- `_encode_null_prompt` now captures the tokenizer's real `.attention_mask` (previously discarded,
+  only `.input_ids` was kept) and returns it as `encoder_attention_mask`; `_get_transformer_input`
+  threads it into its returned dict, which reaches the transformer automatically since call sites
+  already spread it with `**transformer_inputs`.
+- Added a `_make_noise(ref, generator=None)` helper: `generator=None` preserves the exact old
+  `torch.randn_like` behavior; a single `torch.Generator` seeds the whole batch; a list of one
+  `Generator` per batch item produces independently-reproducible per-image noise (sampled row-by-row
+  on CPU regardless of `self.device`, so a filename-derived seed reproduces on any machine). Used in
+  both the existing multi-step path and the new single-step path.
+- Added `single_timestep: Optional[int] = None` and `generator=None` parameters to
+  `extract_activations`. When `single_timestep` is given: noise the **clean** latent directly to
+  that raw timestep (`alpha = alphas_cumprod[single_timestep]`, the same DDPM forward-process formula
+  already used for the old path's `timesteps[0]`, just evaluated at the chosen t instead), take
+  **one** forward pass (hook fires once), no `scheduler.step` call, no reverse-diffusion loop. The
+  returned `ActivationOutput` has exactly one entry in `activations`/`timesteps`/`sigmas`. When
+  `single_timestep=None` (the default), behavior is unchanged byte-for-byte from before this fix —
+  this is purely additive.
+
+**`pixart_timestep.py`** — added `resolve_pixart_raw_timestep(scheduler_timesteps, ckpt=None,
+config_global=None, override=None)`, which resolves an index the same way the existing
+`resolve_pixart_timestep` does, then maps it through a scheduler's `.timesteps` array to a raw
+diffusion timestep (0–999) — the input the new single-timestep extraction path needs, while keeping
+the existing `fixed_timestep_idx: 10` config value meaning the same noise level it always has.
+
+**`cache_coco_diffusion_activations.py`** — `cache_diffusion_activations()` gained
+`single_timestep` and `seed_from_filenames` parameters. Whether to actually pass them through to a
+given extractor is decided via `inspect.signature(extractor.extract_activations).parameters`
+introspection, so extractors without these parameters (SD3/FLUX, still on the base class's plain
+`extract_activations(self, image)` signature) get a printed warning and silently keep their old
+behavior instead of raising `TypeError`. Added `_stem_seed(filename)` (via `zlib.crc32`, since
+Python's built-in `hash()` is randomized per-process unless `PYTHONHASHSEED` is fixed) to derive a
+deterministic per-image seed. `__main__` now resolves the raw timestep from `config.yaml`'s
+`fixed_timestep_idx` via `resolve_pixart_raw_timestep` and passes `seed_from_filenames=True` by
+default, behind a `USE_DIFT_SINGLE_TIMESTEP = True` flag documented as switchable back to the old
+full-trajectory extraction for scripts that need a genuine timestep sweep (e.g.
+`pixart_timestep_autopsy.py`, which needs several distinct timesteps in one cache, not one).
+
+**Deliberate deviation from the plan's literal text, flagged explicitly:** `REPAIR_PLAN.md` Fix 2.1
+item 2 says the new cache shape should be `(1024, 1152)` (T fully squeezed out). This implementation
+keeps an explicit `T=1` leading dimension — cache shape `(1, 1024, 1152)` — instead. This achieves
+the same substance (one real forward pass instead of fifteen, ~15× less data and compute, `V13`
+dissolved) while staying **100% compatible** with `train.py`/`data.py`'s existing (B,T,N,D) diffusion
+handling (`_extract_source_slice`, `_pick_diffusion_slice`, `resample_dead_features`'s diffusion
+branch) without an invasive, GPU-unverifiable rewrite of that already-hardened code. With `T=1`,
+`_resolve_fixed_timestep`/`fixed_timestep_idx` clamp any index to `[0, 0]` and trivially always
+resolve to index 0 — degrades gracefully, doesn't crash. This was a deliberate scope/risk judgment
+call for this session (no GPU access to verify a deeper train.py rewrite), not an oversight.
+
+### Why necessary
+
+This is Stage 2 / Fix 2.1 in `REPAIR_PLAN.md` — the plan calls it the step that "actually addresses
+`loss_PixArt_to_DinoV2 ≈ 0.948`" and explicitly the highest-risk step in the whole plan ("invalidates
+the existing cache and every existing checkpoint"). V3 alone makes every existing per-token
+cross-model claim in `PROJECT_STATUS.md` unverifiable (the two grids never covered the same pixels).
+V4 means the cached PixArt "representation of the image" was mostly a hallucination anchored to
+~1-3% real signal. Both must be fixed, together, before any re-cache is worth running, since
+re-caching is expensive and re-doing it twice (once per bug) wastes the exact 9h→40min I/O win V13
+is supposed to deliver.
+
+### Verification performed
+
+**Pixel-correspondence check (REPAIR_PLAN.md's own Fix 2.1 verification step 1), run this session at
+the user's explicit request:** built 4 synthetic checkerboard test images (landscape 640×480,
+portrait 480×640, wide 800×450, square 500×500 — synthetic rather than real photos, since this
+checks the *transform geometry*, not photo content) and computed/rendered both models' crop boxes
+using the REAL `preprocess` objects from `models.py` (`DinoV2`, via `torch.hub.load` monkeypatched to
+a no-op so no network/weight download occurs) and `DiffusionActivationExtractor.py` (`PixArtActivationExtractor`,
+via `_load_pipeline` monkeypatched to a no-op for the same reason — this check only exercises
+torchvision `Resize`/`CenterCrop` geometry, no model forward pass). Result, all 4 images: DinoV2's
+and PixArt's crop boxes are concentric (centers agree to <1px) with identical coverage fraction of
+the short axis. Visually inspected the landscape and portrait overlay PNGs directly (magenta =
+DinoV2 224px box, cyan = PixArt 512px box) — the two boxes are visually indistinguishable, confirming
+grid cell (i,j) now covers the same normalized region in both models. This is a direct consequence
+of the fix (before it, DinoV2's box would have been the *entire* image, not a centered square) — not
+independently re-verified against the pre-fix code in this pass, since the structural argument (V3)
+was already established without needing a rendered comparison.
+
+**Code-level tests** (scratch CPU venv, same as prior fixes, now also with `torchvision`/`pillow`
+installed): three test scripts, all importing and exercising the REAL, unmodified source files:
+- `test_fix21_models.py`: instantiated the real `DinoV2` class (torch.hub.load monkeypatched) and
+  confirmed `preprocess.transforms[0]` is `Resize` with an **int** size 224 (not a tuple),
+  `transforms[1]` is `CenterCrop(224)`; functionally confirmed a 300×500 non-square image comes out
+  224×224 via the resize-then-crop path (short side hits 224 before cropping, not squashed
+  directly to 224×224).
+- `test_fix21_extractor.py`: built a `PixArtActivationExtractor` instance with `__init__` bypassed
+  (no real pipeline load) and every model component (`transformer`, `vae`, `scheduler`, `tokenizer`,
+  `text_encoder`) replaced by a minimal fake matching the real call signature/shapes, then exercised
+  the REAL `extract_activations`/`_make_noise`/`_get_transformer_input`/`_encode_null_prompt`
+  methods against those fakes. Confirmed: `single_timestep=None` reproduces the original 15-activation,
+  15-`scheduler.step`-call trajectory; `single_timestep=<t>` produces exactly 1 activation and 0
+  `scheduler.step` calls; micro-conditioning `resolution` passed to the transformer is `[512, 512]`
+  per batch item, not `[64, 64]`; `encoder_attention_mask` reaches the transformer call and correctly
+  marks only 1/256 positions real for an empty-string T5 encoding; `_make_noise` is deterministic
+  given a matching seed (both single shared Generator and per-image Generator list) and produces
+  different noise for a different seed, with a `ValueError` on a generator-count/batch-size mismatch;
+  full `extract_activations(single_timestep=..., generator=...)` end-to-end reproduces byte-identical
+  activations for the same image+seed and different activations for a different seed.
+- `test_fix21_cache_script.py`: confirmed `_stem_seed` is deterministic and filename-sensitive;
+  built a fake extractor matching PixArt's new signature and confirmed `cache_diffusion_activations`
+  threads `single_timestep`/per-image `generator`s through correctly, writes a cache with `T=1`, and
+  that two independent runs with `seed_from_filenames=True` produce identical per-image generator
+  seeds; built a second fake extractor matching SD3/FLUX's old signature (`extract_activations(self,
+  image)` only) and confirmed the new kwargs are silently and gracefully dropped (a warning printed,
+  no `TypeError`), with its normal 3-step trajectory unaffected.
+
+**Differential checks against the pre-fix code** (`git stash`/`git stash pop`, all three test scripts
+re-run before and after): `test_fix21_models.py` failed exactly as predicted (`Resize` size was the
+tuple `(224, 224)`, not an int); `test_fix21_extractor.py` failed at import (`resolve_pixart_raw_timestep`
+did not exist) — the fix's new API surface is entirely additive, so there is no pre-fix equivalent
+of the single-timestep/seeding behavior to differentially compare beyond "does it exist at all";
+`test_fix21_cache_script.py` similarly failed at import (`_stem_seed` did not exist). All three
+restored and re-confirmed passing after `git stash pop`.
+
+**Independent review:** dispatched a fresh-context subagent (required per the working method for
+this session's highest-risk, multi-file change) to review the diff against `REPAIR_PLAN.md`'s V3,
+V4, V13, and Fix 2.1 sections. It independently traced: the single-timestep branch's noise
+formula and absence of `scheduler.step`; `_make_noise`'s three cases; `_pixel_resolution`'s
+single-source-of-truth wiring; `encoder_attention_mask`'s full path from tokenizer to transformer
+call; byte-for-byte equivalence of the `single_timestep=None` default path to the pre-fix code;
+the `inspect.signature` gating's correctness for both PixArt's and SD3/FLUX's actual signatures
+(and confirmed it can't mask an unrelated `TypeError`, since there's no try/except involved); that
+only `DinoV2` was touched in `models.py` (confirmed via grep that the other 5 model classes still
+have the old anisotropic `Resize`); and that `train.py`'s existing timestep-index clamping degrades
+gracefully to index 0 for a `T=1` cache, supporting the deliberate-deviation reasoning above.
+Reported zero blocker/high findings. Two low-severity notes: `single_timestep`'s type hint should be
+`Optional[int]` rather than a bare `int = None` (fixed in this same commit, re-verified with a
+re-run of `test_fix21_cache_script.py` afterward, still passes); and that the 512×512-into-a-
+1024-trained-checkpoint mismatch V4 also flags is unaddressed by this diff — correctly identified as
+a pre-existing plan-level scope choice (Fix 2.1 item 1 explicitly picks PixArt→512), not a
+regression introduced here.
+
+### Remaining uncertainty — DEFERRED / REQUIRES EXTERNAL EXPERIMENT
+
+- **The 16-image re-cache test (REPAIR_PLAN.md Fix 2.1 verification step 2) was explicitly deferred
+  at the user's direction after a feasibility check.** This sandbox has network access (huggingface.co
+  reachable) and disk space (703GB free), but **no GPU** (`nvidia-smi` not found, no CUDA). Actually
+  running this test means downloading PixArt-alpha's full pipeline (transformer + VAE + T5-XXL text
+  encoder, several GB) and running real transformer forward passes on CPU only, which risks a very
+  long or stalled run. Presented this tradeoff to the user; they chose to skip it and defer to Colab.
+  **REQUIRES EXTERNAL EXPERIMENT:**
+  ```python
+  # In a Colab/GPU environment, from the repo root:
+  import torch
+  from DiffusionActivationExtractor import PixArtActivationExtractor
+  from pixart_timestep import resolve_pixart_raw_timestep
+  from cache_coco_diffusion_activations import cache_diffusion_activations, _stem_seed
+
+  ext = PixArtActivationExtractor(device="cuda", num_inference_steps=15)
+  ext.scheduler.set_timesteps(ext.num_inference_steps, device=ext.device)
+  t = resolve_pixart_raw_timestep(ext.scheduler.timesteps.tolist(), config_global={"fixed_timestep_idx": 10})
+
+  cache_diffusion_activations(
+      extractor=ext, source_name="PixArt",
+      coco_root="/content/coco_data/val2017", cache_root="/content/cache_test16",
+      batch_size=2, num_workers=2, image_list=<any 16 filenames>,
+      single_timestep=t, seed_from_filenames=True,
+  )
+  # Then re-run the identical call into a second cache_root and diff the two
+  # sets of .npz files byte-for-byte to confirm seeded noise reproduces exactly.
+  ```
+  Success criteria: cache shape is `(1, 1024, 1152)` per image (not `(15, 1024, 1152)`), dtype
+  matches the extractor's configured dtype, and the two independent runs produce byte-identical
+  `.npz` activation arrays (proving the per-image seeding actually reproduces on real PixArt
+  weights, not just on the fakes this session's tests used).
+- **The representation-quality check (Fix 2.1 verification step 3 — cosine-similarity matrix between
+  PixArt patch tokens within one image, compared old vs. new extraction) was not run** — same GPU/
+  real-weights gap, and it depends on the step-2 re-cache existing first (both old and new cache
+  needed for the comparison). **REQUIRES EXTERNAL EXPERIMENT**, to be run immediately after the
+  16-image re-cache test above, per `REPAIR_PLAN.md` Fix 2.1's own verification ordering.
+- **The full 2000-image re-cache (Fix 2.1 verification step 4) was, obviously, not attempted** — it
+  is gated on steps 2 and 3 passing first, per the plan's own ordering, and is explicitly out of this
+  session's scope regardless (full-dataset recaching).
+- **The DIFT-single-timestep path's actual numerical behavior against real PixArt-XL weights is
+  entirely unverified** — the fake-model tests in this session prove the *code path* is correct
+  (right formula, right shape, no reverse loop, right conditioning values reach the transformer call),
+  not that the resulting activations are qualitatively better-anchored to the real image than the old
+  protocol. That claim can only be checked once the deferred re-cache + representation-quality check
+  above are run.
+- Per `REPAIR_PLAN.md`'s own instruction for this step: "Do it on a branch. Keep the old cache until
+  Stage 2 verification passes." This work is on `code-fixes`, not `main`, and is purely additive to
+  the existing extraction code — the old cache and old extraction path are untouched and fully
+  available, so no existing cache/checkpoint has been invalidated by this commit itself (only an
+  actual re-cache run, not yet performed, would do that).
