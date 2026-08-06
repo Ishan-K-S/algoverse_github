@@ -748,3 +748,147 @@ do a one-level lookup — stylistic only, not a bug).
   discriminator at this scale and is reported above instead.
 - Fix 1.2 (loss weight normalization / curriculum boundary, V9/V10) explicitly depends on this fix
   landing first per the plan's dependency ordering, and has not yet been started.
+
+---
+
+## Fix 1.2 — make loss weights mean what the config says
+
+**Addresses:** V9 (HIGH), V10 (MEDIUM)
+**Commit:** `c294715`
+**Files modified:** `train.py`, `config.yaml`
+
+### Issue
+
+Two related misunderstandings about how the training loss is assembled:
+
+- **V9:** `sae_loss = reconstruction_loss / reconstruction_weight_total` is a **weighted average**
+  of the self-recon and cross-recon MSE terms, not a weighted sum. `self_weight` and `cross_weight`
+  therefore only ever matter as a *ratio* between them — their absolute magnitudes are normalized
+  away. `config.yaml:75-76`'s comment framed raising `cross_weight` 1.0 → 2.0 as "back to the old
+  2:1 cross/self ratio ... cross-recon is the whole point," which is directionally correct but
+  invites the wrong mental model: it does not add cross-recon gradient on top of an unchanged
+  self-recon signal. It moves the split from (1/2, 1/2) to (1/3, 2/3) and **shrinks the self-recon
+  gradient by a third**. Anyone tuning `cross_weight` expecting "more cross pressure, same self
+  pressure" is only trading self-recon away.
+- **V10:** At the curriculum boundary (`epoch == curriculum_epochs`), three things change in the
+  same step: self-recon's share of the (still-normalized) reconstruction loss drops, cross-recon
+  MSE enters at 2/3 weight from an untrained ≈1.0 starting point, and both alignment cosine terms
+  (post-TopK and pre-TopK) switch on simultaneously — an analytically-predicted ~8x jump in
+  `total_loss`, by construction, not a bug. But `model._train_loss_ema` (the EMA rendered on wandb
+  as `train/total_loss_ema`) was never reset at that boundary, so the smoothing blends the jump
+  across several steps and the chart shows a ramp instead of the step it actually is — making the
+  discontinuity invisible to whoever is reading the training curve.
+
+### Root cause
+
+V9 is a documentation gap, not a code bug: the normalization arithmetic itself is intentional
+(kept the loss scale stable), but the comment explaining it implied absolute-magnitude reasoning
+that the code doesn't support. V10 is a straightforward oversight: the EMA reset logic was written
+before the curriculum-boundary discontinuity was characterized, and nothing was added to handle it
+when the curriculum feature was introduced.
+
+### Changes
+
+Per `REPAIR_PLAN.md` Fix 1.2's explicit recommendation ("keep the normalization and fix the
+comments" over dropping it, since dropping it "changes the effective LR — do not combine with any
+other change"):
+
+1. **No change to the `reconstruction_loss / reconstruction_weight_total` arithmetic.** Added a
+   comment directly at that line in `train.py` explaining the weighted-average semantics and why
+   the normalization was kept (loss-scale stability across the curriculum boundary, which V10
+   depends on). Added a parallel comment in `config.yaml` next to `cross_weight` making the
+   ratio-only relationship and the 1.0:2.0 → (1/3, 2/3) split explicit.
+2. **Curriculum boundary EMA reset.** Added `model._last_in_curriculum` (a plain attribute, same
+   pattern as the pre-existing `_train_loss_ema`/`_usage_ema_*`) tracked across epochs. Right after
+   `in_curriculum = epoch < curriculum_epochs` is computed (before the batch loop), if the model
+   was in curriculum last epoch and isn't this epoch, `ema_loss` is set to `None` so the first
+   logged step of the post-boundary epoch takes the raw, unsmoothed loss value directly instead of
+   blending with the pre-boundary EMA.
+3. **Explicitly did not add the plan's optional LR re-warmup at the boundary** ("consider a short
+   LR re-warmup (~50 steps) at that boundary"). The plan's own V15 documents the existing LR
+   schedule as already fragile — warmup logic lives in `train.py`, cosine decay in `uni_demo.py`,
+   sharing an undeclared `initial_lr` key, and currently only avoids compounding because warmup
+   finishes inside epoch 0. Adding a second warmup trigger at an arbitrary later epoch risks
+   interacting with that fragility and is out of scope for this fix; deferred as a judgment call.
+
+### Why necessary
+
+This is Stage 1 / Fix 1.2 in `REPAIR_PLAN.md`, explicitly dependent on Fix 1.1 landing first (a
+training loop that doesn't self-destruct every 500 steps has to exist before loss-weight semantics
+are worth reasoning about). It matters because both V9 and V10 are the kind of thing that costs a
+wasted experiment cycle: someone raising `cross_weight` expecting more cross-model pressure without
+realizing they're trading away self-recon (V9), or someone looking at a smooth `total_loss_ema`
+ramp at epoch 5 and not realizing a discontinuity is being hidden there, potentially misreading
+post-curriculum instability as a separate problem (V10).
+
+### Verification performed
+
+Same environment/caveat as Fix 1.1 (scratch CPU venv, real `train.py`/`universal_sae.py`, `wandb`
+stubbed). `test_fix12.py`, using a tiny real `UniversalSAE` (`latent_dim=32`, `top_k=4`) and 16
+synthetic images:
+
+- **Check A:** ran 5 epochs with `curriculum_epochs=2`. Confirmed `model._last_in_curriculum`
+  correctly reads `False` after the run. Confirmed the **first logged step of epoch 2** (the
+  boundary epoch) has `train/total_loss_ema == train/total_loss` exactly (i.e., the EMA was reset
+  and recomputed fresh, not blended) — while the first logged step of epoch 1 (still within
+  curriculum, no boundary crossed) has `total_loss_ema != total_loss` (a normal blend), confirming
+  the reset fires only at the actual transition. PASS.
+- **Check B:** confirmed the raw `total_loss` jumps from 0.1094 (last in-curriculum step) to 1.8706
+  (first post-curriculum step) — a ~17x jump on this toy model, consistent in direction and order
+  of magnitude with V10's analytic ~8x prediction (exact multiplier depends on model/data scale;
+  the toy setup isn't expected to reproduce 8x precisely). PASS.
+- **Check C:** ran 2 epochs with `curriculum_epochs=0` (cross-recon/alignment active from epoch 0,
+  so no boundary ever exists) and confirmed epoch 1's first step is a normal EMA blend, not an
+  artificial reset — i.e., the boundary logic doesn't misfire when there's no boundary to cross.
+  PASS.
+
+**Differential check against the pre-fix code** (`git stash`/`git stash pop`): re-ran the identical
+`test_fix12.py` unmodified against the stashed pre-fix `train.py`. It failed immediately at the
+`model._last_in_curriculum` assertion with `AttributeError: 'UniversalSAE' object has no attribute
+'_last_in_curriculum'` — confirming the pre-fix code never tracked curriculum-boundary state at
+all. Restored the fix (`git stash pop`) and re-ran to confirm all checks pass again.
+
+**Independent review:** dispatched a fresh-context subagent to review the diff against
+`REPAIR_PLAN.md`'s V9/V10 write-ups and Fix 1.2's prescription. It traced the boundary-detection
+logic through all cases (first-ever call, mid-curriculum, the exact boundary, post-boundary epochs,
+`curriculum_epochs=0`) and confirmed correct behavior in each; confirmed the EMA reset produces a
+genuinely visible step at the consumption site; confirmed `_last_in_curriculum` follows the
+existing plain-attribute pattern with no new checkpointing risk (the checkpoint pickles the whole
+model object); confirmed the added comments are factually accurate and that the normalization
+arithmetic itself was left untouched (no scope creep into the risk the plan explicitly flagged: "do
+not combine [dropping the normalization] with any other change" — this diff didn't touch it at
+all). Reported one low-severity observation for awareness, not a defect: if training resumes from a
+freshly-constructed model object exactly at the boundary epoch (rather than the pickled checkpoint
+that already carries `_last_in_curriculum`), the `getattr` default silently skips that run's reset
+— a preexisting limitation shared with `_train_loss_ema`'s identical pattern, not introduced by
+this diff, and outside Fix 1.2's scope.
+
+### Remaining uncertainty
+
+- **Not verified against the real epoch-29 checkpoint or a real Colab training run** (same gap as
+  every prior fix). The synthetic run confirms the mechanism (reset fires exactly at the boundary,
+  produces a visible step, doesn't misfire) but the ~17x jump observed is a toy-model artifact, not
+  a measurement of the real run's actual jump size. Per the plan's own Fix 1.2 verification bar,
+  the next session (with Colab/GPU access) should run **N=64, batch 8, `curriculum_epochs=1`, 3
+  epochs**, and confirm the `total_loss` step at the boundary matches the analytic ~8x prediction
+  to within ~20%, and that the EMA now shows a step rather than a ramp on the actual wandb chart.
+  **REQUIRES EXTERNAL EXPERIMENT** (needs the real cache/GPU):
+  ```
+  # In the Colab/GPU environment, from the repo root, with config.yaml's curriculum_epochs
+  # temporarily overridden to 1, N capped to 64 images, 3 epochs total:
+  python uni_demo.py
+  ```
+  Expected result: `train/total_loss` at the epoch-1/epoch-2 boundary step jumps to within ~20% of
+  the analytic 8x prediction from V10; `train/total_loss_ema` shows a matching step rather than a
+  smoothed ramp.
+- **The LR re-warmup at the boundary was deliberately not implemented** (see Changes #3 above) —
+  this is a scope decision, not an oversight, but it means post-curriculum training still proceeds
+  at whatever LR the cosine schedule has decayed to by that epoch, with no re-stabilization step for
+  the sudden loss-landscape shift. If post-curriculum training shows instability in a real run, this
+  is the first lever the plan suggests trying, currently untried.
+- **Stage 1 (Fixes 1.1 + 1.2) is now complete.** Per `REPAIR_PLAN.md`'s dependency ordering, Stage 2
+  (Fix 2.1: unify preprocessing + re-cache PixArt; Fix 2.2: standardization/pooling order; Fix 2.3:
+  train/val split) is next, and explicitly requires re-caching PixArt activations — this falls
+  under the "no dataset recaching / no PixArt activation extraction" constraint on this session and
+  is a **REQUIRES EXTERNAL EXPERIMENT** item for the next session with Colab/GPU access, not
+  something to attempt here.
