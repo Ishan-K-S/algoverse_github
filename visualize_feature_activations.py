@@ -27,6 +27,7 @@ from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config, infer_grid_size
 from data import CocoActivationDataset
 from pixart_timestep import resolve_pixart_timestep
+from feature_usage import concept_selectivity_margin, labelmap_to_token_labels
 
 
 DEFAULT_CONFIG = "/content/algoverse_github/config.yaml"
@@ -219,68 +220,14 @@ def concept_selectivity_scores(
 ) -> Tuple[np.ndarray, List[dict]]:
     """Score each feature by top-concept-mean minus second-concept-mean.
 
-    Gated features (dead on this image, or below the image-wide magnitude
-    floor) keep their entry but get margin=-inf so they drop out of ranking
-    without losing the record of why.
+    Thin wrapper over feature_usage.concept_selectivity_margin so this script
+    and cross_model_overlap.py rank features by the same definition rather
+    than two copies of it.
     """
-    h, w = label_map.shape
-    label_small = np.asarray(
-        Image.fromarray(label_map).resize((grid_size, grid_size), resample=Image.NEAREST)
+    token_labels = labelmap_to_token_labels(label_map, grid_size)
+    return concept_selectivity_margin(
+        z, token_labels, min_percentile=min_percentile, id_to_name=id_to_name
     )
-    labels_flat = label_small.reshape(-1)
-    vals = z[0].abs().numpy()  # (N, K)
-    K = vals.shape[1]
-
-    unique_ids = np.unique(labels_flat)
-    if len(unique_ids) < 2:
-        return np.full(K, -np.inf), [
-            {"gated": True, "gate_reason": "fewer than 2 concepts present in this image"}
-            for _ in range(K)
-        ]
-
-    # Mean |activation| per concept per feature: (num_concepts, K)
-    concept_means = np.stack([vals[labels_flat == cid].mean(axis=0) for cid in unique_ids])
-    order = np.argsort(-concept_means, axis=0)
-    feat_idx = np.arange(K)
-    top1_row, top2_row = order[0], order[1]
-    top1_val = concept_means[top1_row, feat_idx]
-    top2_val = concept_means[top2_row, feat_idx]
-    raw_margins = top1_val - top2_val
-
-    # Threshold is pooled across all features' nonzero per-token activations,
-    # not per-feature -- a per-feature percentile is a no-op since a
-    # feature's top-concept mean is always one of its own higher values.
-    nonzero_pool = vals[vals > 0]
-    if nonzero_pool.size >= 2:
-        magnitude_threshold = float(np.percentile(nonzero_pool, min_percentile))
-    else:
-        magnitude_threshold = float("inf")
-
-    has_signal = (vals > 0).any(axis=0)
-    eligible = has_signal & (top1_val >= magnitude_threshold)
-    margins = np.where(eligible, raw_margins, -np.inf)
-
-    concept_info = []
-    for k in range(K):
-        entry = {
-            "top_concept": id_to_name.get(int(unique_ids[top1_row[k]]), f"class_{unique_ids[top1_row[k]]}"),
-            "top_concept_mean": float(top1_val[k]),
-            "second_concept": id_to_name.get(int(unique_ids[top2_row[k]]), f"class_{unique_ids[top2_row[k]]}"),
-            "second_concept_mean": float(top2_val[k]),
-            "margin": float(raw_margins[k]),
-            "magnitude_threshold": magnitude_threshold,
-            "gated": not bool(eligible[k]),
-        }
-        if not has_signal[k]:
-            entry["gate_reason"] = "feature never fires on this image"
-        elif not eligible[k]:
-            entry["gate_reason"] = (
-                f"top-concept mean {top1_val[k]:.4g} below image-wide p{min_percentile:.0f} "
-                f"activation threshold {magnitude_threshold:.4g}"
-            )
-        concept_info.append(entry)
-
-    return margins, concept_info
 
 
 def make_feature_thumbnail(

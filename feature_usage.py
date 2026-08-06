@@ -177,3 +177,101 @@ def feature_heatmap_iou(
     intersection = (active_a & active_b).sum().item()
     union = (active_a | active_b).sum().item()
     return intersection / union if union > 0 else 0.0
+
+
+def labelmap_to_token_labels(label_map, grid_size: int):
+    """
+    Downsample a dense (H, W) integer label map onto the SAE's token grid,
+    giving one concept id per token. Nearest-neighbour, so ids are never
+    blended into ids that don't exist.
+    """
+    import numpy as np
+    from PIL import Image
+    small = np.asarray(
+        Image.fromarray(label_map).resize((grid_size, grid_size), resample=Image.NEAREST)
+    )
+    return small.reshape(-1)
+
+
+def concept_selectivity_margin(
+    z: torch.Tensor,
+    token_labels,
+    min_percentile: float = 50.0,
+    id_to_name: Optional[dict] = None,
+):
+    """
+    Score each feature by TOP-CONCEPT MEAN minus SECOND-CONCEPT MEAN.
+
+    This is the "is this feature high for ONE concept" question. It is
+    deliberately not mean-or-max over the whole image: a feature that fires
+    strongly everywhere scores a large max and a large mean but a margin near
+    zero, and is correctly ranked last.
+
+    z            : (1, N, K) or (N, K) latent code for ONE image.
+    token_labels : (N,) concept id per token, from labelmap_to_token_labels.
+    min_percentile : features whose top-concept mean falls below this
+        percentile of the image's pooled nonzero activations are gated out
+        (margin = -inf), so a large margin between two tiny numbers can't win.
+    id_to_name   : optional {concept_id: name} for the returned report.
+
+    Returns (margins (K,) float array, per-feature info list). Gated features
+    keep an entry with margin -inf and a gate_reason, so the record of WHY a
+    feature dropped out survives.
+    """
+    import numpy as np
+
+    if z.dim() == 3:
+        z = z[0]
+    vals = z.abs().detach().cpu().numpy()          # (N, K)
+    labels = np.asarray(token_labels).reshape(-1)
+    if labels.shape[0] != vals.shape[0]:
+        raise ValueError(
+            f"token_labels has {labels.shape[0]} entries but z has {vals.shape[0]} tokens"
+        )
+    K = vals.shape[1]
+    id_to_name = id_to_name or {}
+
+    unique_ids = np.unique(labels)
+    if len(unique_ids) < 2:
+        return np.full(K, -np.inf), [
+            {"gated": True, "gate_reason": "fewer than 2 concepts present in this image"}
+            for _ in range(K)
+        ]
+
+    concept_means = np.stack([vals[labels == cid].mean(axis=0) for cid in unique_ids])
+    order = np.argsort(-concept_means, axis=0)
+    feat = np.arange(K)
+    top1_row, top2_row = order[0], order[1]
+    top1, top2 = concept_means[top1_row, feat], concept_means[top2_row, feat]
+    raw = top1 - top2
+
+    # Threshold pooled across all features, not per-feature: a per-feature
+    # percentile is a no-op, since a feature's top-concept mean is always one
+    # of its own higher values.
+    pool = vals[vals > 0]
+    thresh = float(np.percentile(pool, min_percentile)) if pool.size >= 2 else float("inf")
+
+    has_signal = (vals > 0).any(axis=0)
+    eligible = has_signal & (top1 >= thresh)
+    margins = np.where(eligible, raw, -np.inf)
+
+    info = []
+    for k in range(K):
+        e = {
+            "top_concept": id_to_name.get(int(unique_ids[top1_row[k]]),
+                                          f"class_{unique_ids[top1_row[k]]}"),
+            "top_concept_mean": float(top1[k]),
+            "second_concept": id_to_name.get(int(unique_ids[top2_row[k]]),
+                                             f"class_{unique_ids[top2_row[k]]}"),
+            "second_concept_mean": float(top2[k]),
+            "margin": float(raw[k]),
+            "magnitude_threshold": thresh,
+            "gated": not bool(eligible[k]),
+        }
+        if not has_signal[k]:
+            e["gate_reason"] = "feature never fires on this image"
+        elif not eligible[k]:
+            e["gate_reason"] = (f"top-concept mean {top1[k]:.4g} below image-wide "
+                                f"p{min_percentile:.0f} threshold {thresh:.4g}")
+        info.append(e)
+    return margins, info

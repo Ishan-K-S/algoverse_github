@@ -3,6 +3,13 @@
 # ---- edit these ----
 REPO_ROOT       = "/content/algoverse_github"
 CACHE_ROOT      = "/content/combined_cache"
+# Directory of <stem>_labelmap.png dense concept masks. When set, features are
+# ranked by CONCEPT SELECTIVITY (top-concept mean minus second-concept mean)
+# instead of max-activation-over-the-whole-image. Selectivity is the metric that
+# actually answers "is this feature high for ONE concept" -- ranking by max lets
+# a handful of high-magnitude features that fire on everything dominate the
+# top-K of BOTH models, which inflates the overlap score for free.
+SEMANTIC_MASK_DIR = None
 CONFIG_PATH     = "/content/algoverse_github/config.yaml"
 WEIGHTS_DIR     = "/content/algoverse_github/weights"   # searched automatically for the latest checkpoint
 CHECKPOINT_PATH = "/content/usae_epoch_29.pth"  # fallback if auto-search fails
@@ -19,6 +26,7 @@ DRIVE_SAVE_DIR   = "/content/drive/My Drive/algoverse_inference_results"
 
 import os, sys, time, glob, shutil
 import numpy as np
+from PIL import Image
 import torch
 import yaml
 import matplotlib.pyplot as plt
@@ -31,7 +39,8 @@ from data import CocoActivationDataset
 from pixart_timestep import resolve_pixart_timestep
 from universal_sae import UniversalSAE
 from spatial_align import build_spatial_aligner_from_config
-from feature_usage import compute_feature_usage
+from feature_usage import (compute_feature_usage, concept_selectivity_margin,
+                           labelmap_to_token_labels)
 
 
 # walk a tree and list every checkpoint file with size + mtime
@@ -147,13 +156,30 @@ def load_universal_sae(ckpt_path, config_path, device):
 
 # encode one image, score features by mean |z| across tokens, return top-k indices
 @torch.no_grad()
-def top_feature_set(model, x, source, sigma, top_k, device, aligner=None):
+def top_feature_set(model, x, source, sigma, top_k, device, aligner=None,
+                    token_labels=None, min_percentile=50.0):
+    """Top-`top_k` feature indices for one image.
+
+    token_labels: (N,) concept id per token. When given, features are ranked by
+    concept-selectivity margin (top-concept mean - second-concept mean) rather
+    than by max activation over the image -- see SEMANTIC_MASK_DIR above.
+    """
     x = x.to(device).unsqueeze(0).float()
     if aligner is not None:
         x = aligner.align(x, source=source)
     if sigma is not None:
         sigma = sigma.to(device).float().view(1)
     _z_pre, z = model.encode(x, source=source, sigma=sigma)
+
+    if token_labels is not None:
+        margins, _info = concept_selectivity_margin(
+            z, token_labels, min_percentile=min_percentile)
+        finite = int(np.isfinite(margins).sum())
+        if finite == 0:
+            return np.array([], dtype=int)
+        k = min(top_k, finite)
+        return np.argsort(-margins)[:k]
+
     scores = z.abs().amax(dim=(0, 1))
     # feature_usage.compute_feature_usage's "top_k_per_sample" criterion
     #, applied to this single image treated as a
@@ -250,8 +276,24 @@ def run():
             raise KeyError("No PixArt sigma in metadata")
         sigma_pixart = sigmas_pixart.view(-1)[t_idx]
 
-        top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device, aligner=aligner)
-        top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device, aligner=aligner)
+        # Concept labels for this image, if masks were supplied. Same labels for
+        # both models -- they are on a shared grid after alignment, which is the
+        # only reason a per-token comparison means anything.
+        token_labels = None
+        if SEMANTIC_MASK_DIR:
+            mask_path = os.path.join(SEMANTIC_MASK_DIR, f"{ds.stems[i]}_labelmap.png")
+            if os.path.isfile(mask_path):
+                grid = int(round(model.model_tokens["DinoV2"] ** 0.5))
+                token_labels = labelmap_to_token_labels(
+                    np.array(Image.open(mask_path)), grid)
+            elif i == 0:
+                print(f"[overlap] WARNING: no labelmap for {ds.stems[i]} in "
+                      f"{SEMANTIC_MASK_DIR} -- falling back to max-activation ranking.")
+
+        top_dino   = top_feature_set(model, x_dino,         "DinoV2", None,         TOP_K, device,
+                                     aligner=aligner, token_labels=token_labels)
+        top_pixart = top_feature_set(model, x_pixart_slice, "PixArt", sigma_pixart, TOP_K, device,
+                                     aligner=aligner, token_labels=token_labels)
 
         # per-image overlap + running per-feature counts
         jaccard_scores.append(jaccard(top_dino, top_pixart))
