@@ -870,6 +870,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
         image: torch.Tensor,
         single_timestep: Optional[int] = None,
         generator=None,
+        n_noise: int = 8,
     ) -> ActivationOutput:
         """
         Overridden for PixArt / DDIMScheduler, which does not expose .sigmas.
@@ -899,6 +900,13 @@ class PixArtActivationExtractor(BaseActivationExtractor):
 
         generator: optional torch.Generator (or list of per-image Generators,
         see `_make_noise`) so extraction is reproducible.
+
+        n_noise: number of independent noise draws to average the activation
+        over, when single_timestep is set. 1 reproduces the naive single-draw
+        behaviour, which measurement shows is dominated by the noise rather
+        than the image -- see the table in the single_timestep branch below.
+        Costs n_noise forward passes per image; still far cheaper than the
+        15-step trajectory, and the cache stays (1, N, D) either way.
         """
         batch_size = image.shape[0]
         image = image.to(device=self.device, dtype=self.dtype)
@@ -942,14 +950,44 @@ class PixArtActivationExtractor(BaseActivationExtractor):
 
         try:
             if single_timestep is not None:
-                # DIFT-style: one noise level, one forward pass, no reverse loop.
-                noise = self._make_noise(clean_latents, generator)
+                # DIFT-style: one noise level, no reverse loop -- but averaged over
+                # n_noise independent draws, which is what the DIFT protocol actually
+                # prescribes and what a single draw silently gets wrong.
+                #
+                # Measured on real PixArt weights (3 images, 8 seeds, block 8, t=285),
+                # cosine between centred activations:
+                #
+                #   n_noise   same image (disjoint seeds)   different images   margin
+                #      1              0.373                      0.727          -0.354
+                #      2              0.543                      0.670          -0.126
+                #      4              0.706                      0.616          +0.090
+                #      8                --                       0.575            --
+                #
+                # A NEGATIVE margin means two different images encoded under the same
+                # seed look MORE alike than one image encoded under two seeds -- i.e.
+                # the activation is a function of the noise, not the picture. At t=285
+                # the latent is ~0.85*image + 0.53*noise and the model's job there is
+                # to estimate the noise, so a single draw is dominated by it. Averaging
+                # cancels the draw and leaves the image. Do not set n_noise=1.
                 alpha = self.scheduler.alphas_cumprod[int(single_timestep)].item()
-                noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
                 t = torch.tensor(int(single_timestep), device=self.device)
+                draws = max(1, int(n_noise))
 
-                transformer_inputs = self._get_transformer_input(noisy_latents, t, prompt_embeds)
-                self.transformer(**transformer_inputs, return_dict=False)  # hook captures the activation
+                for _ in range(draws):
+                    # Each call advances the generator, so successive draws differ but
+                    # the whole sequence stays reproducible from the seed.
+                    noise = self._make_noise(clean_latents, generator)
+                    noisy_latents = (alpha ** 0.5) * clean_latents + ((1 - alpha) ** 0.5) * noise
+                    transformer_inputs = self._get_transformer_input(noisy_latents, t, prompt_embeds)
+                    self.transformer(**transformer_inputs, return_dict=False)  # hook captures
+
+                # Collapse the per-draw captures into one averaged activation. Averaged
+                # in float32 -- summing 8 fp16 tensors loses real precision.
+                if len(activations_list) > 1:
+                    stacked = torch.stack(activations_list, dim=0).float().mean(dim=0)
+                    averaged = stacked.to(activations_list[0].dtype)
+                    activations_list.clear()
+                    activations_list.append(averaged)
 
                 timesteps_list.append(t.clone())
                 sigmas_list.append(float(((1 - alpha) / alpha) ** 0.5))

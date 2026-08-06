@@ -77,6 +77,7 @@ def cache_diffusion_activations(
     image_list=None,
     single_timestep: Optional[int] = None,
     seed_from_filenames: bool = False,
+    n_noise: int = 8,
 ):
     """
     extractor: SD3ActivationExtractor, FLUXActivationExtractor, or
@@ -87,6 +88,10 @@ def cache_diffusion_activations(
     image_list : list[str] or None
         Pre-selected image filenames (from select_images()). If None, all images
         in coco_root are used.
+    n_noise : int
+        Noise draws to average each activation over (single-timestep mode only).
+        1 is measurably wrong -- the activation encodes the draw, not the image.
+        Default 8; 4 is the minimum that flips the margin positive.
     single_timestep : int or None
         Raw diffusion timestep (0..999) to noise directly to for a single
         forward pass, DIFT-style. Only meaningful for
@@ -128,6 +133,10 @@ def cache_diffusion_activations(
     extract_params = inspect.signature(extractor.extract_activations).parameters
     supports_single_timestep = "single_timestep" in extract_params
     supports_generator = "generator" in extract_params
+    supports_n_noise = "n_noise" in extract_params
+    if single_timestep is not None and supports_n_noise and n_noise < 2:
+        print(f"[diffusion-cache] WARNING: n_noise={n_noise}. A single draw makes the "
+              f"activation a function of the NOISE rather than the image. Use n_noise>=4.")
     if single_timestep is not None and not supports_single_timestep:
         print(f"[diffusion-cache] WARNING: single_timestep was requested but "
               f"{type(extractor).__name__}.extract_activations doesn't accept it -- ignoring, "
@@ -152,6 +161,8 @@ def cache_diffusion_activations(
         extract_kwargs = {}
         if supports_single_timestep and single_timestep is not None:
             extract_kwargs["single_timestep"] = single_timestep
+        if supports_n_noise and single_timestep is not None:
+            extract_kwargs["n_noise"] = n_noise
         if supports_generator and seed_from_filenames:
             extract_kwargs["generator"] = [
                 torch.Generator().manual_seed(_stem_seed(fn)) for fn in y
