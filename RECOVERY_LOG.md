@@ -559,3 +559,192 @@ of 2 images from an 8-image `DataLoader`). Checked every logged dict across all 
   specifically to also exercise the resampler in the same pass; it was not the focus of this fix
   (that's V2, a separate Stage 1 item) and was not independently re-verified here beyond "it ran
   without crashing and revived the expected number of features."
+
+---
+
+## Fix 1.1 — repair dead-feature resampling
+
+**Addresses:** V2 (BLOCKER)
+**Commit:** `01dddaa`
+**Files modified:** `train.py`, `config.yaml`, `uni_demo.py`
+
+### Issue
+
+`resample_dead_features` (the Bricken et al. dead-feature revival routine, run every
+`resample_interval` steps) had five compounding defects that put roughly a third of the shared
+12288-wide dictionary into a permanent churn loop instead of converging:
+
+1. **`fixed_timestep_idx` was never threaded into the resampler.** Training pins PixArt to
+   timestep 10, but the resampler's internal `_extract_source_slice` call never received
+   `fixed_timestep_idx`, so it fell through to `random.randrange(15)`. Revived PixArt features
+   were seeded from whichever of the 15 cached timesteps was randomly drawn that event — almost
+   never the t=10 distribution training actually samples from — so they were dead on arrival at
+   the next resample event, 500 steps later.
+2. **Sampling probability was `recon_err ** 4`, not `** 2`.** `recon_err` was already a squared
+   L2 norm; squaring it again (contradicting the function's own docstring, which claimed
+   "proportional to squared self-reconstruction error") meant a token with 2x the error got 16x
+   the sampling probability instead of 4x. Combined with `replacement=True` and up to 4096 draws
+   from as few as 4096 tokens, this collapsed revivals onto near-duplicate directions seeded from
+   a handful of worst tokens.
+3. **Revived encoder rows fired at legitimate-coefficient magnitude.** `W_enc[k] = 0.2 * ref_norm
+   * d`, where `d` is the *unit direction of the seed token itself* (cosine 1.0). Trained features
+   have small cosine with any given token, so this 0.2x scale did not compensate — revived
+   features immediately evicted real, trained features from the top-128 selection.
+4. **`resample_max_per_event: 4096` revived up to a third of the 12288-wide dictionary in a
+   single step**, compounding (2) and (3).
+5. **`resample_start_step: 200` was a silent no-op** — 200 is not a multiple of
+   `resample_interval: 500`, so the first eligible step was 500 regardless of this setting.
+
+Separately: **no gradient clipping existed anywhere in the repo**, so a resample-induced gradient
+spike had nothing bounding it before `optimizer.step()`.
+
+### Root cause
+
+`resample_dead_features` and its call site in `train_universal_sae` were written once and never
+re-derived against the rest of the training loop as it evolved (the `fixed_timestep_idx` pinning
+config option, in particular, postdates the resampler and was never plumbed through it). Each
+defect is independent but they compound: (1) guarantees revived features start from
+out-of-distribution data; (2)+(4) guarantee revivals cluster on a handful of directions instead of
+spreading out; (3) guarantees each revival is individually disruptive to the current TopK
+selection. Together, a feature revived this way is likely to be re-flagged dead at the *next*
+resample event, closing the loop.
+
+### Changes
+
+All in `resample_dead_features` (train.py) and its call site (`train_universal_sae`), per
+`REPAIR_PLAN.md` Fix 1.1, in order:
+
+1. Added `fixed_timestep_idx: Optional[int] = None` to `resample_dead_features`'s signature;
+   threaded it into the internal `_extract_source_slice(..., fixed_timestep_idx=fixed_timestep_idx)`
+   call; passed it from `train_universal_sae`'s call site using the same `fixed_timestep_idx` the
+   rest of the function already uses for the main forward pass.
+2. `probs = recon_err.double()` (dropped the extra `** 2`); corrected the docstring.
+3. `replacement = n_dead > probs.numel()` — sample without replacement whenever there are at
+   least as many candidate tokens as features to revive; falls back to `replacement=True` only
+   when `n_dead` exceeds the token count.
+4. `resample_max_per_event`: `config.yaml` 4096 → 512 (~4% of the dictionary instead of ~33%).
+5. After writing the revived weights for a model, the usage EMA for that model at the revived
+   indices is set to `dead_threshold + max(dead_threshold, eps)` (strictly above the `> dead_threshold`
+   "used" check, handles `dead_threshold=0`), so revived features aren't miscounted as
+   `used_by_none` for the ~40 steps it takes the EMA to naturally catch up.
+6. `resample_enc_scale`: `config.yaml` 0.2 → 0.05 (the simpler of the plan's two allowed options
+   for compensating for cosine-1.0 seeding).
+7. Added `torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)` between
+   `loss.backward()` and `optimizer.step()`, gated on a new `grad_clip_norm: float = 1.0` parameter
+   (`<=0` disables it); the pre-clip norm is logged as `train/grad_norm_preclip` per the plan's own
+   risk note ("may mask a real instability — log the pre-clip grad norm too"). Wired through
+   `uni_demo.py` (`SAE_PARAMS.get("grad_clip_norm", ...)`) and `config.yaml` (`sae_params.grad_clip_norm: 1.0`).
+8. `resample_start_step`: `config.yaml` 200 → 500 (a multiple of `resample_interval`, so it's no
+   longer a no-op).
+9. Corrected `_reset_adam_state_slice`'s docstring: the first revived Adam update is ~3.2x the
+   nominal lr-scaled step (bias correction ≈1 while `m=0.1g`, `v=0.001g²`), not "~lr-scaled... not
+   an explosion" as previously claimed.
+
+### Why necessary
+
+This is Stage 1 / Fix 1.1 in `REPAIR_PLAN.md` — the plan calls it a BLOCKER that "knocks the model
+off its optimum seven times per run" and keeps "one third of the dictionary... in a churn loop that
+can never converge," directly explaining the wandb loss spikes at every resample event and the
+`used_by_none = 3389/12288` puzzle noted in `PROJECT_STATUS.md`. It blocks any clean read of a
+training curve and must land before Fix 1.2 (loss weight semantics) or Stage 2 (data fixes), both
+of which assume a training loop that doesn't self-destruct every 500 steps.
+
+### Verification performed
+
+Same environment caveat as Fixes 0.1-0.4 (no GPU/Colab access). Built a scratch CPU venv (torch
+2.13.0+cpu via the `download.pytorch.org/whl/cpu` index, plus numpy/pyyaml/einops/tqdm from PyPI)
+since no venv persisted from prior sessions. Two test scripts, both importing and exercising the
+*real* `train.py`/`universal_sae.py`, not reimplementations:
+
+**`test_fix11.py`** — isolated checks against `resample_dead_features` directly, using a tiny real
+`UniversalSAE` (`model_dims={"DinoV2":6,"PixArt":5}`, `latent_dim=32`, `top_k=4`) and synthetic
+activations:
+- **Check A (timestep threading):** built PixArt activations where `x[:, t] == t` (constant per
+  timestep) so the revived direction is a deterministic function of *which* timestep was used.
+  With `fixed_timestep_idx=10` passed, revived `W_dec` columns were byte-identical across three
+  different `torch.manual_seed` values (PASS). Monkeypatched `random.randrange` to prove directly
+  that the pinned path never calls it (0 calls), while omitting `fixed_timestep_idx` (simulating
+  the pre-fix call site) does call it exactly once, and the revived direction matches whichever
+  timestep it returned rather than 10 — reproducing the V2a bug mechanism, not just its symptom.
+- **Check B (probability formula):** monkeypatched `torch.multinomial` to capture the exact `probs`
+  tensor passed in; recomputed `recon_err` independently against a pre-mutation deep copy of the
+  model (since the function mutates weights model-by-model, so PixArt's own recon_err must be
+  captured before the earlier DinoV2 iteration's weight writes are read back) and confirmed
+  `probs == recon_err` exactly (not `recon_err ** 2`). Also confirmed `replacement=False` was
+  passed when `n_dead <= token_count`.
+- **Check C (EMA reset):** confirmed both models' usage EMAs at the revived indices went from
+  `<= dead_threshold` (pre-resample) to `> dead_threshold` (post-resample).
+- **Check D (replacement boundary):** confirmed `replacement=False` still holds at the exact
+  boundary `n_dead == token_count`.
+- All checks: **PASS**.
+
+**`test_fix11_e2e.py`** — end-to-end verification via the real `train_universal_sae` training loop
+(not just the resampler in isolation), with `wandb` stubbed (no network), a tiny real `UniversalSAE`
+(`latent_dim=64`, `top_k=4` — chosen so TopK competition naturally produces dead features, unlike
+a dictionary barely larger than `top_k`), 64 synthetic images, `resample_interval=4`,
+`curriculum_epochs=0`, 8 epochs (64 steps):
+- All logged losses finite throughout (including the new `train/grad_norm_preclip` key, confirming
+  gradient clipping is wired end-to-end).
+- 3 resample events fired (steps 4, 32, 60), each reviving only 2 features — **not every interval**.
+- Post-resample `train/total_loss` ratio at every event: **0.98x-1.00x** (i.e., the loss *improved*
+  or held flat immediately after resampling, not spiked).
+- `partition/used_by_none` returned to 0 between events rather than staying elevated.
+
+**Differential check against the pre-fix code** (`git stash` / `git stash pop`, both scripts
+re-run before and after): the isolated test's Check A confirmed the pre-fix `resample_dead_features`
+signature doesn't even accept a `fixed_timestep_idx` keyword (`TypeError`), directly confirming the
+parameter was entirely absent. For the end-to-end comparison, ran a pre-fix-compatible variant
+(`test_fix11_e2e_prefix.py`, identical setup minus the new `grad_clip_norm` kwarg,
+`resample_enc_scale=0.2`/`resample_max_per_event=0` matching the old defaults) against the stashed
+pre-fix code and observed the exact churn signature V2 describes: **a resample event fired at
+every single interval with no exceptions** (steps 4, 8, 12, ..., 60 — 15/15 possible events, vs.
+3/15 post-fix), reviving exactly 2 features every time, with `partition/used_by_none` **stuck at 2
+for the entire second half of the run** (never returning to 0 between events) — the permanent
+churn loop V2 describes, reproduced directly on this toy model and resolved by the fix. (Loss
+ratios were ~0.98-1.00x in both pre- and post-fix runs on this particular toy scale — this specific
+synthetic model's gradient magnitudes were apparently too small for the 3-5x spike V2 predicts to
+manifest at this size; the churn-loop signature via `used_by_none`/event-frequency is the
+discriminating evidence here, not the loss ratio.)
+
+**Independent review:** dispatched a fresh-context subagent to review the diff against
+`REPAIR_PLAN.md`'s V2 write-up and Fix 1.1's 9-point prescription. It verified all 9 changes are
+present and correctly wired (including tracing that `ema_attrs[model_name]` aliases the real
+`model._usage_ema_<name>` tensor so in-place mutation persists without a `setattr`, and that
+`grad_norm` is assigned unconditionally before the `use_wandb`-gated log block, ruling out a
+`NameError`). Reported zero blocker/high findings; two low-severity style observations (no
+`NameError` risk from `grad_norm`'s placement; `uni_demo.py`'s `grad_clip_norm` lookup does a
+two-level `SAE_PARAMS.get(..., CONFIG.get(..., 1.0))` fallback while sibling `resample_*` keys only
+do a one-level lookup — stylistic only, not a bug).
+
+### Remaining uncertainty
+
+- **Not verified against the real epoch-29 checkpoint / cache or a real Colab training run** (same
+  gap as every prior fix in this log). The synthetic end-to-end run demonstrates the churn loop is
+  broken on a toy model at toy scale (`latent_dim=64`, `top_k=4`, 64 images); it does not by itself
+  prove the effect size on the real 12288/128 dictionary over 2000 images and 30 epochs. Per the
+  plan's own Fix 1.1 verification bar, the next session (with Colab/GPU access) should run **2
+  epochs at N=64 images, batch 8, `resample_interval=8`, `curriculum_epochs=0`, `use_wandb=false`**
+  and confirm: (a) post-resample loss stays within ~1.2x of pre-resample, (b) `used_by_none` is
+  monotonically non-increasing across events, (c) all losses finite, (d) revived-count decreases
+  across successive events. **REQUIRES EXTERNAL EXPERIMENT** (needs the real cache/GPU, which this
+  sandbox does not have) — see command below.
+  ```
+  # In the Colab/GPU environment, from the repo root, with config.yaml's Fix 1.1 values
+  # (resample_interval temporarily overridden to 8, curriculum_epochs to 0, N capped to 64 images):
+  python uni_demo.py   # or the project's existing tiny-scale entry point, with the above overrides
+  ```
+  Expected result: no post-resample loss spikes >1.2x, `used_by_none` trending down, no NaN/Inf.
+  Success criteria as stated in `REPAIR_PLAN.md` Fix 1.1's verification section.
+- **`resample_enc_scale: 0.05`** was chosen as the simpler of the plan's two allowed remediations
+  (lower the scale vs. reformulate it to scale by achieved pre-activation). This is a config value,
+  not re-derived from first principles for the real 12288-wide dictionary/128 top_k — it may need
+  further tuning once real training data is available; the plan flags this as a "risk: slows
+  dead-feature recovery; watch `used_by_none` over the run" tradeoff, not a correctness issue.
+- The toy end-to-end model's post-resample loss ratios (~0.98-1.00x) were similar in both the
+  pre-fix and post-fix runs, unlike the 3-5x spikes V2 predicts for the real run — most likely
+  because this toy model's scale (6/5-dim inputs, 64-wide dictionary) doesn't reproduce the same
+  gradient magnitudes as the real 384/1152-dim, 12288-wide dictionary. The churn-loop signature
+  (event frequency and `used_by_none` failing to resolve between events) was the reliable
+  discriminator at this scale and is reported above instead.
+- Fix 1.2 (loss weight normalization / curriculum boundary, V9/V10) explicitly depends on this fix
+  landing first per the plan's dependency ordering, and has not yet been started.
