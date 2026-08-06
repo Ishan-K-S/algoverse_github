@@ -850,6 +850,46 @@ def train_universal_sae(
             print("=" * 60 + "\n")
             break
 
+        # Same check, but on the actual tensor that reaches model.encode() --
+        # i.e. AFTER _extract_source_slice (timestep pick) and
+        # spatial_aligner.align() (identity for the alignment target, avg-pool
+        # for everything else). The block above measures raw standardized
+        # activations straight from the dataloader; if spatial_align pools
+        # tokens together, std can drift away from 1.0 between there and here
+        # even though standardize=True "worked" upstream.
+        print("\n" + "=" * 60)
+        print("ENCODER INPUT STATISTICS CHECK (post spatial_align, right before encode())")
+        print("=" * 60)
+
+        for (acts, meta), _y in dataloader:
+            for source_name in acts:
+                if source_name in diffusion_models:
+                    x_full = acts[source_name].to(device)
+                    bsz = x_full.shape[0]
+                    t_bt = _get_sigmas_bt(meta, source_name, bsz, x_full.device)
+                    x_check, *_ = _extract_source_slice(
+                        x_full, is_diffusion=True,
+                        timestep_values_bt=t_bt, fixed_timestep_idx=fixed_timestep_idx,
+                    )
+                else:
+                    x_check, *_ = _extract_source_slice(
+                        acts[source_name].to(device), is_diffusion=False,
+                    )
+                if spatial_aligner is not None:
+                    x_check = spatial_aligner.align(x_check, source=source_name)
+
+                flat = x_check.reshape(x_check.shape[0], -1)
+                print(
+                    f"{source_name:12s} - "
+                    f"min: {flat.min():.4f}, "
+                    f"max: {flat.max():.4f}, "
+                    f"mean: {flat.mean():.4f}, "
+                    f"std: {flat.std():.4f}"
+                )
+
+            print("=" * 60 + "\n")
+            break
+
     diffusion_models = set(diffusion_models)
     if self_weight < 0 or cross_weight < 0:
         raise ValueError("self_weight and cross_weight must be non-negative.")
@@ -1193,6 +1233,14 @@ def train_universal_sae(
                 log_dict[f"train/loss_{safe_key}"] = value
 
             with torch.no_grad():
+                # x_src is the exact tensor passed to model.encode() a few lines
+                # above (post _extract_source_slice + spatial_aligner.align) --
+                # confirms standardize=True actually holds ~1.0 std at the real
+                # encoder entry point, for whichever source ran this step, as a
+                # time series across training (not just an epoch-0 snapshot).
+                log_dict[f"train/encoder_input_std_{source}"] = x_src.std().item()
+                log_dict[f"train/encoder_input_mean_{source}"] = x_src.mean().item()
+
                 # train/latent_sparsity used to be logged here. TopK guarantees exactly
                 # top_k nonzeros per token always, so (z == 0).float().mean() is the
                 # constant (latent_dim - top_k) / latent_dim for the entire run --
