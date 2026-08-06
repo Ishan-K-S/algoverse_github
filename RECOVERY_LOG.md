@@ -1410,3 +1410,175 @@ already declares this dependency explicitly).
   Should be encoded in the run tag when the next real training run happens.
 
 ---
+
+## Fix 2.3 — real train/val split + held-out evaluation pass
+
+**Addresses:** V7 (HIGH)
+**Commit:** `d1990c6`
+**Files modified:** `coco_dataset_setup.py`, `data.py`, `train.py`, `uni_demo.py`
+
+### Issue
+
+No train/val split existed anywhere in the repo. `uni_demo.py` built one `CocoActivationDataset`
+over all 2000 cached stems with a single shuffled `DataLoader`; every diagnostic pointed at the same
+`/content/combined_cache`. The `viz: { set: val }` block in `config.yaml` was dead config — nothing
+read it. This meant every number, every heatmap, every top-activating-image, and **the
+`fixed_timestep_idx: 10` selection itself** (decided by evaluating a trained checkpoint against its
+own training data) were all measured on data the model had already seen. Nothing produced by this
+repo was a generalization measurement.
+
+### Root cause
+
+The dataset/training loop was built for a single dataset object from the start; a split was never
+added as the project grew, and no diagnostic script was ever pointed at anything but the full cache.
+
+### Changes
+
+- **`coco_dataset_setup.py`**: new `split_train_val(identifiers, save_dir, val_fraction=0.2,
+  seed=42, ...)`, following the same idempotent-persist pattern as the existing `select_images()` —
+  first call shuffles (fixed seed) and writes `train_stems.txt`/`val_stems.txt` next to
+  `selected_images.txt`; later calls reload rather than re-split, so every run, resume, and (once
+  updated) diagnostic sees an identical split. **Added a validation the initial implementation
+  lacked** (caught by independent review, not by my own first pass): on reload, the persisted
+  train∪val stem set is compared against the *current* identifier list; a mismatch raises a
+  `RuntimeError` naming exactly how many stems are missing/new and instructing how to regenerate,
+  rather than silently training on a stale, skewed split if the cache is ever regenerated with a
+  different image set (e.g. after Fix 2.1's re-cache, if that ever changes which images are cached
+  rather than just how PixArt's activations are extracted for the same images).
+- **`data.py`**: `CocoActivationDataset.__init__` gained an optional `allowed_stems` parameter,
+  applied to `self.stems` immediately after cache discovery and strictly *before* the
+  standardization-stats block — so a train-only dataset's `_compute_standardization_stats()` never
+  sees a val image, and a val-only dataset (see below) never computes its own stats at all.
+- **`train.py`**: new `evaluate_universal_sae()` — a `@torch.no_grad()` pass computing self+cross MSE
+  for every (source, target) pair the model can structurally reconstruct, reusing
+  `train_universal_sae`'s own `_extract_source_slice`/`_extract_target_slice`/`_get_sigmas_bt`/
+  `mse_flat`/`_pool_target_for_loss` helpers, with no backward pass, no optimizer step, no
+  dead-feature resampling, no curriculum gating, and no latent-alignment loss. Unlike training's
+  `_pick_source` (one source per step, to amortize one gradient update), every source present in each
+  batch is evaluated, since there's no update cost to amortize. Enters `model.eval()` and restores
+  `model.train()` only if the model was already training (checked via `was_training = model.training`
+  first). **Also applies the same `model.model_tokens` patch `train_universal_sae` applies for
+  spatial-aligned cross-reconstruction** (added after independent review flagged that without it,
+  the function would silently skip every cross-model pair if ever called standalone before any
+  training epoch had run — idempotent, harmless to apply redundantly, removes the dependency on call
+  order entirely rather than relying on "eval always happens to run after training each epoch").
+  Returns `{"val/loss_<source>_to_<target>": mean, ..., "val/sae_loss": unweighted_mean,
+  "val/n_batches": count}`.
+- **`uni_demo.py`**: discovers the full cached stem list (mirroring `CocoActivationDataset`'s own
+  anchor-suffix discovery), calls `split_train_val`, builds the main training dataset with
+  `allowed_stems=train_stems`, and builds a **separate** `val_dataset`/`val_dataloader` with
+  `allowed_stems=val_stems`, `standardization_stats=getattr(dataset, "standardization_stats", None)`
+  (train's stats, reused verbatim — never recomputed on val) and the same `spatial_aligner`. Runs
+  `evaluate_universal_sae` after every epoch's training call, logging `val/*` to wandb alongside the
+  existing epoch-level metrics and printing a one-line summary.
+
+**Explicitly out of scope for this pass**: "point every diagnostic at the val split by default"
+(`dictionary_diagnostic.py`, `cross_model_overlap.py`, `top_activating_images.py`,
+`input_rank_diagnostic.py`, `pixart_timestep_autopsy.py`, etc.) — `REPAIR_PLAN.md`'s Fix 2.3 file
+list names only `coco_dataset_setup.py`, `uni_demo.py`, `data.py`, and updating ~10 diagnostic
+scripts (each with its own CLI/dataset-construction conventions, several already touched in Fix
+0.2/0.3) is a materially larger, separately-scoped change. The mechanism is now in place and generic
+(`allowed_stems=` on any `CocoActivationDataset`, `val_stems.txt` on disk) — pointing a given
+diagnostic at val is now a small, mechanical follow-up per script rather than something requiring
+new infrastructure.
+
+### Why necessary
+
+This is Stage 2 / Fix 2.3 in `REPAIR_PLAN.md`. It's explicitly the fix the plan flags as making
+"the headline numbers look worse — that is the point": a checkpoint that reconstructs its own
+training images well says nothing about whether the shared dictionary generalizes, and the
+`fixed_timestep_idx: 10` decision itself was never validated against held-out data.
+
+### Verification performed
+
+Same scratch CPU venv as prior fixes. `test_fix23.py` built a synthetic 200-image combined-npz cache
+(DinoV2 (8,6) + PixArt (15,8,5), matching the real schema) and exercised the REAL
+`split_train_val`/`CocoActivationDataset`/`evaluate_universal_sae`:
+- **Split correctness**: 80/20 sizes exactly (160/40 for 200 images), zero stem overlap between
+  splits, confirmed both at the raw split-function level and again after being threaded through two
+  separate `CocoActivationDataset` instances (`set(train_ds.stems) & set(val_ds.stems) == set()`).
+- **No leakage**: `val_dataset` constructed with `standardization_stats=train_ds.standardization_stats`
+  reused those stats **verbatim** (`torch.equal` on both mean and std tensors) rather than
+  recomputing — confirmed by inspecting the log output too (`"[stats] Using standardization
+  statistics persisted in the checkpoint."` printed for val, `"[stats] Computing standardisation
+  stats..."` printed only for train).
+- **`evaluate_universal_sae` correctness**: ran it against a tiny real `UniversalSAE` mid-"training"
+  (`model.train()` called first) and confirmed (a) every model parameter is bit-for-bit unchanged
+  before vs. after the call (`torch.equal` on every parameter), (b) no parameter accumulated a
+  gradient, (c) `model.training` is restored to `True` afterward, (d) by monkeypatching
+  `model.eval`/`model.train` to record calls, confirmed both are actually invoked (not just claimed
+  in a docstring) — `model.eval()` at least once, `model.train()` at least once to restore state, (e)
+  all returned loss values (including cross-model pairs, confirming `can_cross_reconstruct`
+  structurally worked) are finite, and `val/sae_loss` exactly equals the mean of the individual pair
+  losses.
+- **New split/cache mismatch validation**: confirmed a changed identifier set (simulating a re-cache
+  that adds/removes images) correctly raises `RuntimeError` naming the mismatch, while an unchanged
+  identifier set with only a different `seed` argument correctly reloads the persisted split
+  unaffected (seed is irrelevant once a split is persisted — this is intentional idempotency, not a
+  bug: re-running with a "different" seed must NOT silently reshuffle an already-committed split).
+
+**Differential check against the pre-fix code** (`git stash`/`git stash pop`): re-ran the identical
+`test_fix23.py` unmodified against the stashed pre-fix code. Failed immediately at import
+(`ImportError: cannot import name 'split_train_val' from 'coco_dataset_setup'`) — confirms the
+entire mechanism was absent pre-fix. Restored and re-confirmed all checks pass, then re-ran
+`test_fix11.py`/`test_fix12.py`/`test_fix22.py` as a regression check on `train.py`'s other recent
+changes (Fix 1.1/1.2/2.2) — all still pass, confirming `evaluate_universal_sae`'s addition didn't
+disturb `train_universal_sae`.
+
+**Independent review:** dispatched a fresh-context subagent to review the diff against
+`REPAIR_PLAN.md`'s V7 write-up and Fix 2.3's spec. It traced the `__init__` order in `data.py` to
+confirm the `allowed_stems` filter genuinely runs before stats computation; confirmed `val_dataset`'s
+construction always takes `_validate_standardization_stats`'s reuse path, never
+`_compute_standardization_stats`'s fresh-computation path; confirmed `evaluate_universal_sae` touches
+neither `model._train_loss_ema` nor any `model._usage_ema_*` attribute (both are written only inside
+`train_universal_sae`'s own loop); confirmed via `git diff --stat` that no diagnostic script was
+touched; confirmed `val_dataset` does pass `spatial_aligner=spatial_aligner`. It found: (1) **Medium**
+— the split-validation gap described above, fixed in this same commit and re-verified; (2) **Low,
+plausible** — the `model_tokens` patch call-order dependency, fixed in this same commit (the
+redundant patch inside `evaluate_universal_sae` itself) and re-verified via the full test re-run;
+(3) **Low** — `uni_demo.py`'s stem-discovery logic duplicates (rather than shares) the identical
+three-line formula already in `data.py`'s `__init__`; confirmed no actual drift risk under any
+current config (both compute the exact same anchor suffix from the same `combined_npz`/`sources`
+inputs), a maintainability note rather than a defect, left as-is to avoid refactoring
+`CocoActivationDataset`'s discovery logic into a shared helper as an unrelated change.
+
+### Remaining uncertainty — DEFERRED / REQUIRES EXTERNAL EXPERIMENT
+
+- **Not verified against the real cache or a real Colab training run** (same gap as every prior fix).
+  The synthetic test proves the split/filtering/no-leakage/eval-pass mechanism is correct; it doesn't
+  produce the actual `val/loss_PixArt_to_DinoV2` number for the real project. Per the plan's own
+  verification bar for this fix ("assert zero stem overlap between the two splits; assert the
+  persisted stats hash matches a train-only recomputation"), the next session (with Colab/GPU access)
+  should, after running `uni_demo.py` once to generate the real split and checkpoint:
+  ```python
+  # From the repo root, after a real uni_demo.py run has created
+  # <path_to_cache>/train_stems.txt and val_stems.txt:
+  train_stems = open(f"{cache_root}/train_stems.txt").read().split()
+  val_stems = open(f"{cache_root}/val_stems.txt").read().split()
+  assert not (set(train_stems) & set(val_stems))
+  # Recompute stats train-only from scratch and diff against the checkpoint's
+  # persisted standardization_stats to confirm they match exactly (not just
+  # "close" -- this dataset's stats computation is deterministic given stats_seed):
+  from data import CocoActivationDataset
+  recomputed = CocoActivationDataset(
+      cache_root=cache_root, sources=sources, combined_npz=True, standardize=True,
+      allowed_stems=train_stems, stats_seed=<same stats_seed as the real run>,
+  ).standardization_stats
+  ckpt = torch.load(checkpoint_path, weights_only=False)
+  for source in recomputed:
+      assert torch.allclose(recomputed[source]["mean"], ckpt["standardization_stats"][source]["mean"])
+      assert torch.allclose(recomputed[source]["std"], ckpt["standardization_stats"][source]["std"])
+  ```
+  Success criteria: both asserts pass (zero overlap; stats hash-equivalent to a from-scratch
+  train-only recomputation), and `val/loss_*` metrics appear in the real wandb run.
+- **Pointing existing diagnostics at the val split is deliberately unstarted** (see Changes above) —
+  tracked here as follow-up, not forgotten. `dictionary_diagnostic.py`, `cross_model_overlap.py`,
+  `top_activating_images.py`, `input_rank_diagnostic.py`, and `pixart_timestep_autopsy.py` are the
+  concrete candidates; each needs `allowed_stems=<val_stems from disk>` threaded into its own
+  `CocoActivationDataset` construction, following the exact pattern this fix established.
+  Re-deriving `fixed_timestep_idx` itself on held-out data (H1 in `REPAIR_PLAN.md`) depends on this.
+- **`evaluate_universal_sae` runs every epoch unconditionally** — for the real 2000-image dataset (400
+  val images) this is a full extra forward pass per epoch on top of training; not expected to be
+  expensive relative to training itself, but not measured against real data/timing in this session.
+
+---
