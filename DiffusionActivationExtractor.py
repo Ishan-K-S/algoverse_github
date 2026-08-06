@@ -945,7 +945,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
                 activation = output
             activations_list.append(activation.clone())
 
-        last_block = self._get_last_block()
+        last_block = getattr(self._get_last_block(), self.HOOK_ATTN_NAME)
         hook_handle = last_block.register_forward_hook(hook_fn)
 
         try:
