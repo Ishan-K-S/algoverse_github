@@ -88,7 +88,7 @@ sae_params:
                                 # spatial_align_to). bag aligns only the mean — produces
                                 # high bag-of-features cosine but zero per-feature co-fire,
                                 # which is the failure mode the last run showed.
-  pre_topk_align_weight: 1.0  # what it was silently defaulting to before this got made explicit
+  pre_topk_align_weight: 0.0  # what it was silently defaulting to before this got made explicit
 
   # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
   # Periodically revive features that have gone dead (usage EMA below threshold
