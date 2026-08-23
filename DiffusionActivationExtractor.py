@@ -807,12 +807,12 @@ class PixArtActivationExtractor(BaseActivationExtractor):
     #   0.5 -> middle block (Option A: richer, higher-rank semantic residual stream)
     HOOK_DEPTH_FRAC = 8 / 27
 
-    # Extraction always runs with a null/empty prompt (_encode_null_prompt), so
-    # attn2's cross-attention context is the same content-free sequence for every
-    # image and every patch -- its output collapses to near-uniform per-patch
-    # values. attn1 (self-attention among image patch tokens) is where per-patch
-    # spatial identity actually lives, analogous to DinoV2's self-attention.
-    HOOK_ATTN_NAME = "attn1"
+    # PixArt hooks the whole block, not an attention submodule, so it does not
+    # set HOOK_ATTN_NAME -- see extract_activations. A submodule hook fires
+    # before the residual add, which would drop both the incoming residual
+    # stream and the FF output. With the T5 mask in place, attn2 attends to the
+    # one real token of the null prompt, making its contribution a constant
+    # offset rather than the per-image contamination it was pre-mask.
 
     def _get_last_block(self) -> nn.Module:
         blocks = self.transformer.transformer_blocks
@@ -945,7 +945,7 @@ class PixArtActivationExtractor(BaseActivationExtractor):
                 activation = output
             activations_list.append(activation.clone())
 
-        last_block = getattr(self._get_last_block(), self.HOOK_ATTN_NAME)
+        last_block = self._get_last_block()
         hook_handle = last_block.register_forward_hook(hook_fn)
 
         try:
