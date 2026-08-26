@@ -37,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import time
@@ -50,7 +51,8 @@ import yaml
 from feature_usage import compute_feature_usage
 
 
-CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_epoch_29.pth"
+CHECKPOINT_PATH = "/content/algoverse_github/weights/usae_epoch_29.pth"  # fallback if auto-search fails
+WEIGHTS_DIR     = "/content/algoverse_github/weights"  # searched automatically for the latest checkpoint
 CACHE_ROOT      = "/content/combined_cache"
 CONFIG_PATH     = "/content/algoverse_github/config.yaml"
 REPO_ROOT       = "/content/algoverse_github"
@@ -65,12 +67,28 @@ DRIVE_SAVE_DIR  = "/content/drive/MyDrive/DictionaryDiagnosticResults"
 
 
 # -----------------------------------------------------------------------------
+# Checkpoint auto-discovery (same as cross_model_overlap.py)
+# -----------------------------------------------------------------------------
+
+def find_latest_checkpoint(weights_dir):
+    """Return the most recently modified .pth file under weights_dir."""
+    candidates = glob.glob(os.path.join(weights_dir, "**", "*.pth"), recursive=True)
+    if not candidates:
+        raise FileNotFoundError(f"No .pth checkpoints found under {weights_dir}")
+    latest = max(candidates, key=os.path.getmtime)
+    print(f"[ckpt] Auto-selected: {latest}")
+    return latest
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
 def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt",            default=CHECKPOINT_PATH, help="Path to usae_epoch_*.pth")
+    p.add_argument("--weights_dir",     default=WEIGHTS_DIR,
+                   help="Searched for the latest .pth if --ckpt doesn't exist")
     p.add_argument("--cache",           default=CACHE_ROOT,      help="Path to combined activation cache dir")
     p.add_argument("--config",          default=CONFIG_PATH,     help="Path to config.yaml")
     p.add_argument("--repo_root",       default=REPO_ROOT,
@@ -161,8 +179,13 @@ def main():
     device = args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
 
     # ----- Load checkpoint and rebuild the model -----
-    print(f"[diag] loading ckpt: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    ckpt_path = args.ckpt
+    if not os.path.isfile(ckpt_path):
+        print(f"[diag] Checkpoint not found at {ckpt_path!r}, searching {args.weights_dir}...")
+        ckpt_path = find_latest_checkpoint(args.weights_dir)
+
+    print(f"[diag] loading ckpt: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     with open(args.config) as f:
         cfg_file = yaml.safe_load(f)
     g_file = cfg_file.get("global", {})
