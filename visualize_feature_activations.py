@@ -185,6 +185,28 @@ def feature_heatmap(z: torch.Tensor, feature_idx: int, grid_size: int) -> np.nda
     return vals.reshape(grid_size, grid_size)
 
 
+def threshold_heatmap(heat: np.ndarray, percentile: float) -> np.ndarray:
+    """Zero out tokens below the given percentile of this heatmap's own values,
+    then rescale survivors to [0, max]. Off (percentile <= 0) reproduces the
+    old linear-normalize-only behavior exactly. This is a display-only change:
+    it tests whether "diffuse" heatmaps are a rendering artifact (weak-tail
+    tokens still getting a visible tint under plain max-normalization) rather
+    than the underlying feature genuinely firing broadly.
+    """
+    if percentile <= 0:
+        return heat
+    thresh = np.percentile(heat, percentile)
+    out = np.where(heat >= thresh, heat, 0.0)
+    survivors = out[out > 0]
+    if survivors.size == 0:
+        return out
+    # Rescale survivors from [thresh, max] -> [0, max] for extra contrast,
+    # matching how papers' thresholded heatmaps read as "crisp".
+    span = max(out.max() - thresh, 1e-12)
+    out = np.where(out > 0, (out - thresh) / span * out.max(), 0.0)
+    return out
+
+
 def upsample_heatmap(heat: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
     # Nearest-neighbor so each patch fills the exact region it covers,
     # instead of blending across patch borders.
@@ -236,8 +258,10 @@ def make_feature_thumbnail(
     feature_idx: int,
     grid_size: int,
     thumb_size: int = 224,
+    heatmap_percentile: float = 0.0,
 ) -> Image.Image:
     heat = feature_heatmap(z, feature_idx, grid_size)
+    heat = threshold_heatmap(heat, heatmap_percentile)
     if base_image is not None:
         img = base_image.resize((thumb_size, thumb_size), resample=Image.BICUBIC)
         return overlay_heatmap_on_image(img, heat)
@@ -297,6 +321,12 @@ def parse_args():
                    help="Magnitude gate for concept-margin ranking: a feature's top-concept "
                         "mean must clear this percentile of the image's pooled nonzero "
                         "activations to be eligible. Only used when --semantic_mask_dir is set.")
+    p.add_argument("--heatmap_percentile", type=float, default=0.0,
+                   help="Zero out tokens below this percentile of each feature's own "
+                        "heatmap values before rendering (e.g. 90), then rescale survivors "
+                        "for contrast. 0 (default) = old behavior, no thresholding. Tests "
+                        "whether diffuse heatmaps are a display artifact vs. a genuinely "
+                        "broad-firing feature.")
     p.add_argument("--output_dir", default="feature_visualizations")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-feature text output; only print saved file paths.")
@@ -378,7 +408,8 @@ def visualize_stem(args, model, aligner, ds, ckpt_path, stem_query, config_globa
 
     for rank, feat in enumerate(top_features, 1):
         fi = feat["feature_idx"]
-        thumb = make_feature_thumbnail(base_image, z, fi, grid_size)
+        thumb = make_feature_thumbnail(base_image, z, fi, grid_size,
+                                       heatmap_percentile=args.heatmap_percentile)
         thumbnails.append((f"#{rank} feat {fi} ({feat['score']:.3f})", thumb))
 
         entry = {"rank": rank, "feature_idx": fi, "score": feat["score"], "score_type": score_label}
