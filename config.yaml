@@ -88,7 +88,10 @@ sae_params:
                                 # spatial_align_to). bag aligns only the mean — produces
                                 # high bag-of-features cosine but zero per-feature co-fire,
                                 # which is the failure mode the last run showed.
-  pre_topk_align_weight: 0.0  # what it was silently defaulting to before this got made explicit
+  pre_topk_align_weight: 1.0  # was 0.0 (silently defaulting off). Turned on to test whether
+                              # dense pre-TopK gradient lets the encoder reorganize WHICH
+                              # features fire, since a 512->128 top_k cut alone didn't reduce
+                              # heatmap diffuseness -- see train.py:1115-1121 for the mechanism.
 
   # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
   # Periodically revive features that have gone dead (usage EMA below threshold
