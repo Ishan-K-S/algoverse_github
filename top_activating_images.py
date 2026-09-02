@@ -425,10 +425,26 @@ def compute_top_activations(
     spatial_aligner=None,
     standardization_stats=None,
     training_global=None,
+    allowed_stems: Optional[List[str]] = None,
 ):
     is_diffusion = source in diffusion_models
 
     stems = discover_stems(cache_root)
+
+    # Restrict to an explicit stem list (e.g. the held-out val split written by
+    # coco_dataset_setup.split_train_val). Without this, rankings are computed
+    # over train+val mixed, which means every "top activating image" result is
+    # measured on data the SAE was fit to.
+    if allowed_stems is not None:
+        allowed = {os.path.splitext(s)[0] for s in allowed_stems}
+        before = len(stems)
+        stems = [s for s in stems if s in allowed]
+        if not stems:
+            raise RuntimeError(
+                f"allowed_stems filtered out all {before} cached images in {cache_root!r}. "
+                "Check that the stem list matches this cache."
+            )
+        print(f"[top-act] allowed_stems: {len(stems)}/{before} cached images kept")
 
     if max_images is not None:
         stems = stems[:max_images]
@@ -580,6 +596,7 @@ def compute_top_activations(
         "timestep_idx": timestep_idx if is_diffusion else None,
         "use_cls": use_cls,
         "n_images": n_images,
+        "stem_filtered": allowed_stems is not None,
         "n_features": K,
         "top_pct": top_pct,
         "top_n_per_feature": top_n,

@@ -72,6 +72,35 @@ DEAD_EPS = 1e-8
 # Scoring (delegated to top_activating_images.py)
 # --------------------------------------------------------------------------- #
 
+def resolve_split_stems(args) -> Tuple[Optional[List[str]], str]:
+    """Which images to rank over: the held-out val split, the train split, or all.
+
+    uni_demo.py trains on train_stems only (allowed_stems=train_stems) and
+    persists both lists next to the cache via
+    coco_dataset_setup.split_train_val, so val_stems are already cached but
+    were never fit to -- no re-caching needed to get a clean held-out eval.
+    """
+    if args.stems_file:
+        path = args.stems_file
+    elif args.split == "all":
+        return None, "all"
+    else:
+        path = os.path.join(args.cache_root, f"{args.split}_stems.txt")
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Stem list not found: {path}\n"
+            "  It's written by coco_dataset_setup.split_train_val() the first time "
+            "uni_demo.py runs against this cache. If this cache predates that, run "
+            "training once (or call split_train_val on it) to create the split, or "
+            "pass --split all to rank over every cached image (NOT held out)."
+        )
+    with open(path) as f:
+        stems = [line.strip() for line in f if line.strip()]
+    print(f"[atlas] split={args.split}: {len(stems)} images from {path}")
+    return stems, args.split
+
+
 def top_activations_for_source(
     source: str,
     model,
@@ -80,9 +109,13 @@ def top_activations_for_source(
     args,
     coco_labels: Optional[Dict[str, List[str]]],
     n_images: int,
+    allowed_stems: Optional[List[str]],
+    split_tag: str,
 ) -> dict:
     """Run (or reload) top_activating_images.py's ranking for one source."""
-    json_path = os.path.join(args.output_dir, f"top_activations_{source}.json")
+    # Split goes in the filename so a val run can't silently reuse train-split
+    # rankings via --reuse_json.
+    json_path = os.path.join(args.output_dir, f"top_activations_{source}_{split_tag}.json")
 
     if args.reuse_json and os.path.isfile(json_path):
         print(f"[atlas] reusing existing rankings -> {json_path}")
@@ -112,9 +145,11 @@ def top_activations_for_source(
         spatial_aligner=spatial_aligner,
         # Mirror top_activating_images.main(): reuse the checkpoint's own training
         # stats rather than recomputing (and rather than silently standardizing
-        # eval data differently than training did).
+        # eval data differently than training did). This matters doubly on a
+        # held-out split -- stats must come from training, not be refit to val.
         standardization_stats=getattr(model, "_standardization_stats", None),
         training_global=getattr(model, "_training_global", None),
+        allowed_stems=allowed_stems,
     )
 
 
@@ -318,8 +353,17 @@ def parse_args():
                    help="Exactly two sources, rendered as two rows per feature.")
     p.add_argument("--image_dir", default=IMAGE_DIR, help="Raw images named <stem>.jpg")
     p.add_argument("--output_dir", default=OUTPUT_DIR)
-    p.add_argument("--pdf_name", default="feature_atlas.pdf")
+    p.add_argument("--pdf_name", default=None,
+                   help="Default: feature_atlas_<split>.pdf")
     p.add_argument("--top_k", type=int, default=5, help="Images per feature per model")
+
+    p.add_argument("--split", default="val", choices=("val", "train", "all"),
+                   help="Which images to rank over. 'val' (default) = the held-out "
+                        "stems uni_demo.py excluded from training, so the atlas is a "
+                        "generalization result. 'all' ranks over train+val mixed, which "
+                        "is NOT held out.")
+    p.add_argument("--stems_file", default=None,
+                   help="Explicit stem-list file, overriding --split.")
 
     p.add_argument("--features", nargs="+", type=int, default=None,
                    help="Render only these feature ids. Default: all.")
@@ -377,16 +421,26 @@ def main():
         {"global": eval_g, "model_zoo": cfg.get("model_zoo", {})}
     )
 
+    allowed_stems, split_tag = resolve_split_stems(args)
+
     stems = discover_stems(args.cache_root)
+    if allowed_stems is not None:
+        allowed = {os.path.splitext(s)[0] for s in allowed_stems}
+        stems = [s for s in stems if s in allowed]
     if args.max_images is not None:
         stems = stems[: args.max_images]
     n_images = len(stems)
-    print(f"[atlas] {n_images} cached images | top_k={args.top_k} per feature per model")
+    if split_tag == "all":
+        print("[atlas] WARNING: --split all ranks over training images too. "
+              "Results are NOT held out.")
+    print(f"[atlas] {n_images} images (split={split_tag}) | "
+          f"top_k={args.top_k} per feature per model")
 
     # ---- Score both sources ----
     results = {
         s: top_activations_for_source(
-            s, model, cfg, spatial_aligner, args, coco_labels, n_images
+            s, model, cfg, spatial_aligner, args, coco_labels, n_images,
+            allowed_stems, split_tag,
         )
         for s in (src_a, src_b)
     }
@@ -420,12 +474,14 @@ def main():
     if args.max_features is not None:
         rows = rows[: args.max_features]
 
-    overlap_path = os.path.join(args.output_dir, "feature_atlas_overlap.json")
+    overlap_path = os.path.join(args.output_dir, f"feature_atlas_overlap_{split_tag}.json")
     with open(overlap_path, "w") as f:
         json.dump({
             "checkpoint": ckpt,
             "sources": [src_a, src_b],
             "top_k": args.top_k,
+            "split": split_tag,
+            "held_out": split_tag == "val",
             "n_images": n_images,
             "n_features_rendered": len(rows),
             "features": rows,
@@ -473,9 +529,10 @@ def main():
         print(f"[atlas] WARNING: {len(thumbs.missing)} stems had no image under "
               f"{args.image_dir} (e.g. {sorted(thumbs.missing)[:3]}). Rendered as placeholders.")
 
-    pdf_path = os.path.join(args.output_dir, args.pdf_name)
+    pdf_name = args.pdf_name or f"feature_atlas_{split_tag}.pdf"
+    pdf_path = os.path.join(args.output_dir, pdf_name)
     render_pdf(pages, pdf_path)
-    print(f"[atlas] saved -> {pdf_path}  ({len(pages)} pages)")
+    print(f"[atlas] saved -> {pdf_path}  ({len(pages)} pages, split={split_tag})")
 
 
 if __name__ == "__main__":
