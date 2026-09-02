@@ -3,7 +3,14 @@
 The feature atlas scores cached activations, not JPEGs, so "test on new images"
 means running the caching pipeline on images excluded from training:
 
-    val2017 (5000) - selected_images.txt (the 2000 used for training) -> pick N
+    val2017 (5000) - everything already in the training combined cache -> pick N
+
+The exclusion set is derived from the training cache's own *_combined.npz
+stems, not from a selection file: /content/cache/selected_images.txt lives in
+Colab's ephemeral storage and is gone after any runtime reset, whereas the
+combined cache survives (combine_cached_acts.py mirrors it to Drive). The cache
+listing is also the more trustworthy record -- it's what was actually cached,
+rather than what some earlier run intended to cache.
 
 Nothing in the resulting cache was ever trained on, so `feature_atlas.py
 --cache_root <out_cache> --split all` is a genuine held-out result without
@@ -46,7 +53,6 @@ from cache_coco_diffusion_activations import cache_diffusion_activations, login_
 from combine_cached_acts import combine_activations
 
 COCO_ROOT = "/content/coco_data/val2017"
-TRAIN_SELECTION = "/content/cache/selected_images.txt"
 REFERENCE_CACHE = "/content/combined_cache"
 RAW_CACHE = "/content/heldout_cache_raw"
 OUT_CACHE = "/content/heldout_cache"
@@ -91,9 +97,18 @@ def detect_pixart_mode(reference_cache: str) -> Tuple[int, Optional[int]]:
 # --------------------------------------------------------------------------- #
 
 def pick_heldout_images(
-    coco_root: str, train_selection: str, n: int, seed: int, save_path: str
+    coco_root: str,
+    reference_cache: str,
+    n: int,
+    seed: int,
+    save_path: str,
+    extra_exclusions: Optional[str] = None,
 ) -> List[str]:
-    """N images from coco_root that are NOT in the training selection.
+    """N images from coco_root that are NOT in the training cache.
+
+    Excludes every stem already cached in reference_cache -- conservative on
+    purpose: it drops both the train and val portions of that cache, so the
+    result is unseen regardless of how the split was drawn.
 
     Idempotent like coco_dataset_setup.select_images: if save_path exists it's
     reused, so re-runs and resumes operate on the identical set.
@@ -104,22 +119,33 @@ def pick_heldout_images(
         print(f"[heldout] reusing {len(picked)} previously selected images from {save_path}")
         return picked
 
-    if not os.path.isfile(train_selection):
-        raise FileNotFoundError(
-            f"Training selection not found: {train_selection}\n"
-            "  This is the selected_images.txt written by coco_dataset_setup.select_images "
-            "when the training cache was built. Without it we can't guarantee the held-out "
-            "set is disjoint from training -- point --train_selection at the right file."
+    trained_stems = combined_stems(reference_cache)
+    if not trained_stems:
+        raise RuntimeError(
+            f"No *_combined.npz found in {reference_cache!r}, so there's nothing to "
+            "exclude and no way to guarantee the held-out set is unseen. Point "
+            "--reference_cache at the cache the SAE was trained on."
         )
-    with open(train_selection) as f:
-        trained_on = {l.strip() for l in f if l.strip()}
+
+    # Optional belt-and-braces: an old selected_images.txt, if one survived.
+    if extra_exclusions:
+        if os.path.isfile(extra_exclusions):
+            with open(extra_exclusions) as f:
+                extra = {os.path.splitext(l.strip())[0] for l in f if l.strip()}
+            before = len(trained_stems)
+            trained_stems |= extra
+            print(f"[heldout] +{len(trained_stems) - before} extra exclusions from "
+                  f"{extra_exclusions}")
+        else:
+            print(f"[heldout] --exclude_file {extra_exclusions} not found, ignoring "
+                  f"(cache listing is the source of truth anyway)")
 
     all_images = sorted(
         f for f in os.listdir(coco_root) if f.lower().endswith(IMAGE_EXTS)
     )
-    available = [f for f in all_images if f not in trained_on]
+    available = [f for f in all_images if os.path.splitext(f)[0] not in trained_stems]
     print(f"[heldout] {len(all_images)} images in {coco_root}, "
-          f"{len(trained_on)} used for training, {len(available)} available")
+          f"{len(trained_stems)} already cached/trained, {len(available)} available")
 
     if len(available) < n:
         raise RuntimeError(
@@ -135,14 +161,20 @@ def pick_heldout_images(
     return picked
 
 
-def already_combined(out_cache: str) -> set:
-    if not os.path.isdir(out_cache):
+def combined_stems(cache_dir: str) -> set:
+    """Stems of every *_combined.npz in a cache directory."""
+    if not os.path.isdir(cache_dir):
         return set()
     return {
         f[: -len("_combined.npz")]
-        for f in os.listdir(out_cache)
+        for f in os.listdir(cache_dir)
         if f.endswith("_combined.npz")
     }
+
+
+# Kept as a distinct name at the call sites for readability: same operation,
+# different question (what's already done here vs. what was trained on there).
+already_combined = combined_stems
 
 
 def clear_raw(raw_cache: str, sources: List[str]) -> int:
@@ -165,10 +197,13 @@ def parse_args():
     )
     p.add_argument("--n", type=int, default=1000, help="How many held-out images to cache")
     p.add_argument("--coco_root", default=COCO_ROOT)
-    p.add_argument("--train_selection", default=TRAIN_SELECTION,
-                   help="selected_images.txt used to build the TRAINING cache")
     p.add_argument("--reference_cache", default=REFERENCE_CACHE,
-                   help="Training combined cache, inspected to mirror its PixArt mode")
+                   help="The TRAINING combined cache. Serves two purposes: its stems are "
+                        "excluded from selection (guaranteeing the held-out set is unseen), "
+                        "and it's inspected to mirror the PixArt caching mode.")
+    p.add_argument("--exclude_file", default=None,
+                   help="Optional extra exclusions (e.g. an old selected_images.txt). "
+                        "Not required -- the reference cache listing is the source of truth.")
     p.add_argument("--raw_cache", default=RAW_CACHE, help="Scratch dir for per-source npz")
     p.add_argument("--out_cache", default=OUT_CACHE, help="Where combined npz land")
     p.add_argument("--selection_file", default=None,
@@ -245,7 +280,8 @@ def main():
 
     # ---- Select images ----
     picked = pick_heldout_images(
-        args.coco_root, args.train_selection, args.n, args.seed, selection_file
+        args.coco_root, args.reference_cache, args.n, args.seed, selection_file,
+        extra_exclusions=args.exclude_file,
     )
     done = already_combined(args.out_cache)
     todo = [f for f in picked if os.path.splitext(f)[0] not in done]
