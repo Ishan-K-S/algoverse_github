@@ -50,12 +50,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cache_coco_activations import cache_model_activations
 from cache_coco_diffusion_activations import cache_diffusion_activations, login_to_huggingface
-from combine_cached_acts import combine_activations
+from combine_cached_acts import (
+    combine_activations,
+    load_combined_cache_from_drive,
+    save_combined_cache_to_drive,
+)
 
 COCO_ROOT = "/content/coco_data/val2017"
 REFERENCE_CACHE = "/content/combined_cache"
 RAW_CACHE = "/content/heldout_cache_raw"
 OUT_CACHE = "/content/heldout_cache"
+# /content is wiped on every Colab runtime reset. Mirror to Drive like
+# combine_cached_acts.py does for the training cache, or a 1000-image PixArt
+# caching run evaporates the next time the runtime recycles.
+DRIVE_DIR = "/content/drive/MyDrive/algoverse_results/heldout_cache"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 
@@ -226,6 +234,13 @@ def parse_args():
     p.add_argument("--no_seed_from_filenames", action="store_true",
                    help="Disable deterministic per-image noise seeding.")
 
+    p.add_argument("--drive_dir", default=DRIVE_DIR,
+                   help="Mirror the finished combined cache here so it survives runtime resets.")
+    p.add_argument("--no_drive", action="store_true", help="Skip the Drive mirror.")
+    p.add_argument("--restore_from_drive", action="store_true",
+                   help="Copy an existing mirror from --drive_dir into --out_cache and exit. "
+                        "Use this after a runtime reset instead of re-caching.")
+
     p.add_argument("--dino_batch_size", type=int, default=64)
     p.add_argument("--pixart_batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=2)
@@ -233,8 +248,23 @@ def parse_args():
     return p.parse_args()
 
 
+def mirror_to_drive(args) -> None:
+    if args.no_drive:
+        return
+    save_combined_cache_to_drive(args.out_cache, args.drive_dir)
+    print(f"[heldout] after a runtime reset, restore with:\n"
+          f"  python cache_heldout_images.py --restore_from_drive "
+          f"--out_cache {args.out_cache} --drive_dir {args.drive_dir}")
+
+
 def main():
     args = parse_args()
+
+    if args.restore_from_drive:
+        load_combined_cache_from_drive(args.drive_dir, args.out_cache)
+        n = len(combined_stems(args.out_cache))
+        print(f"[heldout] restored: {n} combined npz now in {args.out_cache}")
+        return
 
     # Guard: cleanup deletes from raw_cache, so it must not be a real cache dir.
     for name, path in (("reference_cache", args.reference_cache), ("out_cache", args.out_cache)):
@@ -289,6 +319,7 @@ def main():
         print(f"[heldout] {len(done)} already combined, {len(todo)} remaining")
     if not todo:
         print("[heldout] nothing to do -- cache is complete.")
+        mirror_to_drive(args)
         return
 
     login_to_huggingface()
@@ -343,6 +374,7 @@ def main():
 
     n_final = len(already_combined(args.out_cache))
     print(f"\n[heldout] done: {n_final} combined npz in {args.out_cache}")
+    mirror_to_drive(args)
     print("[heldout] next:")
     print(f"  python feature_atlas.py --cache_root {args.out_cache} \\")
     print(f"      --image_dir {args.coco_root} --output_dir /content/results \\")

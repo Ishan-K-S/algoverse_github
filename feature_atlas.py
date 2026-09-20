@@ -55,7 +55,13 @@ from top_activating_images import (
     labels_for_stem,
     load_universal_sae,
 )
-from visualize_feature_activations import find_raw_image
+from data import CocoActivationDataset
+from visualize_feature_activations import (
+    encode_image_tokens,
+    find_raw_image,
+    overlay_heatmap_on_image,
+    threshold_heatmap,
+)
 
 CACHE_ROOT = "/content/combined_cache"
 CONFIG_PATH = "/content/algoverse_github/config.yaml"
@@ -242,16 +248,106 @@ def _font():
         return None
 
 
+CellKey = Tuple[str, str, int]  # (stem, source, feature_id)
+
+
+def build_heatmap_cells(
+    rows: Sequence[dict],
+    top_by_source: Dict[str, Dict[str, List[dict]]],
+    sources: Sequence[str],
+    top_k: int,
+    model,
+    spatial_aligner,
+    eval_g: dict,
+    args,
+) -> Tuple[Dict[CellKey, np.ndarray], Dict[str, int]]:
+    """Per-token activation for every (image, model, feature) cell the atlas will draw.
+
+    compute_top_activations only keeps the pooled per-image score, so the
+    per-token latents have to be recomputed for the rendered images. Holding a
+    full z per (image, model) would be (N x K) floats each -- ~12MB at K=12288,
+    far too much across hundreds of images -- so this does it in two passes:
+    first work out which feature columns each (image, model) needs, then encode
+    each pair exactly once and keep only those (N,) columns (~1KB apiece).
+
+    Reuses visualize_feature_activations.encode_image_tokens, so the heatmap is
+    produced by the same encode path as the per-image heatmap script.
+    """
+    needed: Dict[Tuple[str, str], Set[int]] = {}
+    for r in rows:
+        fid = r["feature_id"]
+        for source in sources:
+            for entry in top_by_source[source][str(fid)][:top_k]:
+                needed.setdefault((entry["filename"], source), set()).add(fid)
+
+    ds = CocoActivationDataset(
+        cache_root=args.cache_root,
+        sources=list(sources),
+        combined_npz=True,
+        standardize=bool(eval_g.get("standardize", True)),
+        return_metadata=True,
+        diffusion_models=[s for s in sources if s in model.diffusion_models],
+        use_class_tokens=False,
+        # The checkpoint's training stats, never refit to the images being
+        # rendered -- same as visualize_feature_activations.py.
+        standardization_stats=getattr(model, "_standardization_stats", None),
+        stats_seed=eval_g.get("stats_seed", 0),
+        spatial_aligner=spatial_aligner,
+    )
+    stem_to_idx = {s: i for i, s in enumerate(ds.stems)}
+
+    # Group by image so each image's activations are loaded once, used for
+    # every model that needs it, then dropped -- a 15-timestep PixArt entry is
+    # ~68MB, so holding hundreds at once is not an option.
+    by_stem: Dict[str, Dict[str, Set[int]]] = {}
+    for (stem, source), feats in needed.items():
+        by_stem.setdefault(stem, {})[source] = feats
+
+    cells: Dict[CellKey, np.ndarray] = {}
+    grid_by_source: Dict[str, int] = {}
+    n_pairs = len(needed)
+    print(f"[atlas] encoding {n_pairs} (image, model) pairs across {len(by_stem)} images "
+          f"for heatmap overlays")
+    done = 0
+    with torch.no_grad():
+        for stem in sorted(by_stem):
+            if stem not in stem_to_idx:
+                continue  # rendered as "missing" downstream
+            (acts, meta), _ = ds[stem_to_idx[stem]]
+            for source, feats in by_stem[stem].items():
+                _scores, z, grid = encode_image_tokens(
+                    model, acts, meta, source, spatial_aligner, args.device,
+                    config_global=eval_g, pixart_timestep_override=args.timestep_idx,
+                )
+                grid_by_source[source] = grid
+                feat_list = sorted(feats)
+                # Index in two steps: z[0, :, feat_list] would put the list
+                # axis FIRST (int + list separated by a slice triggers the
+                # advanced-indexing reorder rule in both numpy and torch),
+                # silently giving (n_feats, N) instead of (N, n_feats).
+                cols = z[0][:, feat_list].abs().numpy()  # (N, n_feats)
+                for j, fid in enumerate(feat_list):
+                    cells[(stem, source, fid)] = cols[:, j]
+                done += 1
+                if done % 100 == 0:
+                    print(f"  encoded {done}/{n_pairs}")
+    return cells, grid_by_source
+
+
 def compose_feature_block(
     feat_id: int,
     per_source: Dict[str, List[dict]],
     sources: Sequence[str],
     overlap: dict,
-    thumbs: ThumbCache,
+    get_cell,
     thumb_px: int,
     top_k: int,
 ) -> Image.Image:
-    """One feature: a title line, then one captioned row of top-k images per model."""
+    """One feature: a title line, then one captioned row of top-k images per model.
+
+    get_cell(source, entry) -> PIL image or None: plain thumbnail, or the
+    thumbnail with this feature's heatmap blended over it.
+    """
     pad = 6
     caption_h = 14
     row_label_w = 62
@@ -281,7 +377,7 @@ def compose_feature_block(
             draw.text((pad, y + thumb_px // 2), source, fill=(200, 200, 200), font=font)
         for c, entry in enumerate(per_source[source][:top_k]):
             x = row_label_w + c * (thumb_px + pad)
-            thumb = thumbs.get(entry["filename"])
+            thumb = get_cell(source, entry)
             if thumb is None:
                 draw.rectangle(
                     [x, y, x + thumb_px, y + thumb_px], outline=(90, 90, 90)
@@ -381,6 +477,16 @@ def parse_args():
                         "shared-concept evidence on the first pages.")
     p.add_argument("--features_per_page", type=int, default=2)
     p.add_argument("--thumb_px", type=int, default=150)
+
+    p.add_argument("--heatmap", action="store_true",
+                   help="Overlay each feature's per-token activation heatmap on its "
+                        "thumbnails (same rendering as visualize_feature_activations.py). "
+                        "Re-encodes the rendered images to recover per-token latents.")
+    p.add_argument("--heatmap_percentile", type=float, default=0.0,
+                   help="Zero out tokens below this percentile of each heatmap before "
+                        "rendering (e.g. 90). 0 = no thresholding. Only with --heatmap.")
+    p.add_argument("--heatmap_alpha", type=float, default=0.55,
+                   help="Overlay opacity at a feature's peak token. Only with --heatmap.")
 
     p.add_argument("--reuse_json", action="store_true",
                    help="Reuse existing top_activations_<source>.json in --output_dir "
@@ -502,6 +608,27 @@ def main():
               f"(default) so the most convincing features land on the first pages.")
 
     thumbs = ThumbCache(args.image_dir, args.thumb_px)
+
+    if args.heatmap:
+        cells, grid_by_source = build_heatmap_cells(
+            rows, {src_a: top_a, src_b: top_b}, (src_a, src_b), args.top_k,
+            model, spatial_aligner, eval_g, args,
+        )
+
+        def make_get_cell(fid: int):
+            def get_cell(source: str, entry: dict) -> Optional[Image.Image]:
+                thumb = thumbs.get(entry["filename"])
+                col = cells.get((entry["filename"], source, fid))
+                if thumb is None or col is None:
+                    return thumb
+                grid = grid_by_source[source]
+                heat = threshold_heatmap(col.reshape(grid, grid), args.heatmap_percentile)
+                return overlay_heatmap_on_image(thumb, heat, alpha=args.heatmap_alpha)
+            return get_cell
+    else:
+        def make_get_cell(fid: int):
+            return lambda source, entry: thumbs.get(entry["filename"])
+
     pages: List[Image.Image] = []
     block_buf: List[Image.Image] = []
 
@@ -512,7 +639,7 @@ def main():
             {src_a: top_a[fid], src_b: top_b[fid]},
             (src_a, src_b),
             r,
-            thumbs,
+            make_get_cell(r["feature_id"]),
             args.thumb_px,
             args.top_k,
         )
@@ -529,7 +656,8 @@ def main():
         print(f"[atlas] WARNING: {len(thumbs.missing)} stems had no image under "
               f"{args.image_dir} (e.g. {sorted(thumbs.missing)[:3]}). Rendered as placeholders.")
 
-    pdf_name = args.pdf_name or f"feature_atlas_{split_tag}.pdf"
+    default_name = f"feature_atlas_{split_tag}{'_heatmap' if args.heatmap else ''}.pdf"
+    pdf_name = args.pdf_name or default_name
     pdf_path = os.path.join(args.output_dir, pdf_name)
     render_pdf(pages, pdf_path)
     print(f"[atlas] saved -> {pdf_path}  ({len(pages)} pages, split={split_tag})")
