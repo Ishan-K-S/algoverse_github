@@ -1,0 +1,130 @@
+global:
+  path_to_cache: "/content/combined_cache"      # path to your flat cached .npz directory
+  combined_npz: true    # whether activations from all models are stored together per image
+  debug: 1
+  exp_factor: 16  # expansion factor: latent_dim = exp_factor * input_shape
+  input_shape: 768      # default/reference feature dimension (used to compute default latent_dim)
+  batch_size: 16
+  num_workers: 8        # DataLoader worker processes
+  nb_epochs: 30
+  balanced_sources: true
+  curriculum_epochs: 5  # self-recon only for the first N epochs before cross-recon +
+                        # latent-alignment losses turn on. Was 0 (cross/align live from
+                        # step 1), which let the alignment loss reward both encoders for
+                        # collapsing onto the same near-constant feature clique before
+                        # either had learned real per-model structure to align.
+  save_every: 5         # save a checkpoint every N epochs
+  standardize: true     # standardise activations (mean=0, std=1)
+  stats_seed: 0         # deterministic fallback only; checkpoints persist the exact training stats
+  divide_norm: false    # normalise by L2 norm instead of standardising
+  use_class_tokens: false
+  num_tokens: 196
+  latent_dim: 12288
+  timestep_dim: 256           # dimension of timestep/sigma embeddings (only used if use_tide=true)
+  lr: 0.0005                  # bumped from 3e-4 since the simpler architecture has no gradient-starvation
+  final_lr: 1.0e-06
+  weight_decay: 1.0e-05
+  warmup_steps: 50            # shorter warmup for the simpler architecture
+
+  # --- Universal SAE behaviour ---
+  cls_pool_mode: none         # 'none' = per-token (start here, paired with spatial_align_to).
+                              # 'mean' = pool to one vector per image (paper's per-sample setup).
+  use_tide: false            # Keep off until a single PixArt timestep has been selected and validated.
+
+  # PixArt has 15 timesteps cached and training was picking one at random each step, so a
+  # DinoV2 code was being matched against a different noise level every time. You can't
+  # learn that, the best you can do is predict the average, which is probably why
+  # PixArt->DinoV2 has been stuck at ~0.95. Pinning it fixes cross-recon without recaching.
+  # null = old random behaviour, otherwise an index (negatives count from the end).
+  #
+  # Was -1 (the last timestep). pixart_timestep_autopsy.py on the epoch-29 checkpoint says
+  # that was the wrong pick: at t=14 only 288 features are active and peakiness is 1.22,
+  # basically flat, so there was nothing there to reconstruct from. t=10 has 3617 active
+  # and peakiness 6.09 against a DinoV2 reference of ~1.4. t=10 won on all 6 images tested.
+  fixed_timestep_idx: 10
+
+  run_tag: kaveh_noalign             # keeps wandb runs and checkpoints separate when more than one of us runs
+
+  # --- Spatial alignment (Option B1) ---
+  # When set, every model's token grid is average-pooled down to the named
+  # model's native grid before encoding. DinoV2 (16x16=256) is the smallest
+  # grid here, so all models will be pooled to 16x16.
+  # Set to null/empty to disable (per-token DinoV2->DinoV2 self-recon only;
+  # cross-model recon is then automatically skipped for mismatched grids).
+  spatial_align_to: DinoV2
+
+  device: cuda           # "cuda" or "cpu"
+  run_name: ex${exp_factor}_bs${batch_size}_topk${top_k}_LR${lr}_align${spatial_align_to}_${nb_epochs}ep
+  diffusion_models: ["PixArt"]   # only models that actually live in model_zoo
+
+  # --- wandb ---
+  use_wandb: true
+  wandb_project: "universal-sae"
+  wandb_entity:                     # your wandb username or team (leave blank for default)
+  wandb_log_every: 17               # ODD, so step%17 hits both even (DinoV2) and odd (PixArt)
+                                    # source batches under balanced_sources. With log_every=50
+                                    # every logged step was even -> PixArt-source losses hidden.
+viz:
+  batch_size: 100
+  sample_size: 5000
+  set: val
+sae_params:
+  top_k: 128                  # K out of latent_dim=12288 -> 1.04% density per token.
+                              # Start sparse; tune only after checking usage/localization diagnostics.
+  self_weight: 1.0
+  cross_weight: 2.0           # back to the old 2:1 cross/self ratio. cross-recon is the whole point of a
+                              # universal SAE, so it can't stay at 0.
+                              # NOTE: the reconstruction term is a WEIGHTED
+                              # AVERAGE (divided by self_weight+cross_weight), so only the RATIO
+                              # of these two values matters, not their absolute size. Raising
+                              # cross_weight here doesn't add cross-recon pressure on top of a
+                              # fixed self-recon signal -- it reallocates a fixed total loss
+                              # magnitude away from self-recon (1.0:2.0 means self gets 1/3, not
+                              # "self stays put and cross gets 2x on top").
+  latent_align_weight: 0.0    # ABLATION (was 0.5): TopK code-level per-token cosine
+                              # alignment REMOVED. Reviewer Q1: separate learned
+                              # convergence from imposed coupling.
+  latent_align_mode: per_token  # "per_token" (recommended) | "bag" (legacy) | "both"
+                                # per_token aligns z at each spatial position (requires
+                                # spatial_align_to). bag aligns only the mean — produces
+                                # high bag-of-features cosine but zero per-feature co-fire,
+                                # which is the failure mode the last run showed.
+  pre_topk_align_weight: 0.0  # was 0.0 (silently defaulting off). Turned on to test whether
+                              # dense pre-TopK gradient lets the encoder reorganize WHICH
+                              # features fire, since a 512->128 top_k cut alone didn't reduce
+                              # heatmap diffuseness -- see train.py:1115-1121 for the mechanism.
+
+  # --- Dead-feature resampling (Bricken et al. 2023, "Towards Monosemanticity") ---
+  # Periodically revive features that have gone dead (usage EMA below threshold
+  # for BOTH models) by re-pointing them at the activations the SAE currently
+  # reconstructs worst and resetting their optimizer state. Set resample_dead to
+  # false to disable and reproduce the previous behaviour exactly.
+  resample_dead: true
+  resample_interval: 501          # global steps between resampling events. ODD on purpose
+                                  #: _pick_source alternates on
+                                  # global_step % 2, so an EVEN interval made every single
+                                  # resample event land on a DinoV2-source step for the whole
+                                  # run -- a systematic source asymmetry nobody intended. An
+                                  # odd interval alternates the parity across events instead.
+  resample_dead_threshold: 1.0e-3 # usage-EMA below which a feature counts as dead
+  resample_enc_scale: 0.05        # revived encoder-row norm = this * mean alive encoder norm.
+                                  # Lowered from 0.2: revived rows seed at cosine 1.0 with their
+                                  # seed token, so 0.2x already evicts real features from TopK.
+  resample_max_per_event: 512     # cap features revived per event (~4% of the dictionary).
+                                  # Was 4096, i.e. a third of it in a single step.
+  resample_start_step: 501        # don't resample before this step. Must be a multiple of
+                                  # resample_interval or it's a no-op; keep the two equal unless
+                                  # you actually want to skip the first N events.
+  resample_end_step: 0            # stop resampling at/after this step (0 = no limit)
+  grad_clip_norm: 0               # clip total grad norm before optimizer.step().
+                                  # 0 = MEASURE ONLY: train/grad_norm_preclip is still logged,
+                                  # gradients are untouched. Starts here deliberately -- nobody
+                                  # has measured this model's real gradient norm, and a threshold
+                                  # far below it acts as a silent LR cut across the whole run
+                                  # rather than a guard on resample spikes. Read the metric on
+                                  # your first run, then set this to ~2-5x the typical norm.
+model_zoo:
+  # Vision encoders
+  DinoV2: { input_shape: 384,  num_tokens: 256, og_model: DinoV2 }     # 16x16 patch grid
+  # Diffusion/Flow models
+  PixArt: { input_shape: 1152, num_tokens: 1024, og_model: PixArt }    # 32x32 patch grid

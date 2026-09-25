@@ -144,7 +144,9 @@ if __name__ == "__main__":
         print(f"[uni_demo] VRAM          : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # ----- Load config -----
-    config_path = "/content/algoverse_github/config.yaml"
+    # Env override so an ablation can run from its own config file without
+    # editing (or swapping out) the main one: USAE_CONFIG=/path/to/other.yaml
+    config_path = os.environ.get("USAE_CONFIG", "/content/algoverse_github/config.yaml")
     print(f"[uni_demo] config_path   : {config_path}  exists={os.path.isfile(config_path)}")
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"[uni_demo] config.yaml not found: {config_path}")
