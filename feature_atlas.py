@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -471,8 +472,10 @@ def parse_args():
                         "shared-language claim is about.")
     p.add_argument("--keep_dead", action="store_true",
                    help="Include features that are dead in BOTH models (default: skipped).")
+    p.add_argument("--sample_seed", type=int, default=0,
+                   help="Seed for --sort_by random, so the sample is reproducible.")
     p.add_argument("--sort_by", default="label_jaccard",
-                   choices=("feature_id", "label_jaccard", "image_jaccard"),
+                   choices=("feature_id", "label_jaccard", "image_jaccard", "random"),
                    help="Ordering in the PDF. Overlap sorts put the strongest "
                         "shared-concept evidence on the first pages.")
     p.add_argument("--features_per_page", type=int, default=2)
@@ -575,10 +578,18 @@ def main():
             "labels": {src_a: ov["labels"]["a"], src_b: ov["labels"]["b"]},
         })
 
-    if args.sort_by != "feature_id":
-        rows.sort(key=lambda r: (r[args.sort_by] is None, -(r[args.sort_by] or 0.0)))
-    if args.max_features is not None:
-        rows = rows[: args.max_features]
+    if args.sort_by == "random":
+        # Unbiased sample: picked BEFORE looking at overlap, so the reported mean
+        # estimates the dictionary rather than the best corner of it.
+        rng = random.Random(args.sample_seed)
+        if args.max_features is not None and args.max_features < len(rows):
+            rows = rng.sample(rows, args.max_features)
+        rows.sort(key=lambda r: r["feature_id"])   # rank is meaningless for a sample
+    else:
+        if args.sort_by != "feature_id":
+            rows.sort(key=lambda r: (r[args.sort_by] is None, -(r[args.sort_by] or 0.0)))
+        if args.max_features is not None:
+            rows = rows[: args.max_features]
 
     overlap_path = os.path.join(args.output_dir, f"feature_atlas_overlap_{split_tag}.json")
     with open(overlap_path, "w") as f:
@@ -590,6 +601,8 @@ def main():
             "held_out": split_tag == "val",
             "n_images": n_images,
             "n_features_rendered": len(rows),
+            "selection": {"sort_by": args.sort_by, "sample_seed": args.sample_seed,
+                          "max_features": args.max_features, "only_shared": args.only_shared},
             "features": rows,
         }, f, indent=2)
     print(f"[atlas] overlap metrics -> {overlap_path}")
