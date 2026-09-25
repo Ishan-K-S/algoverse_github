@@ -594,10 +594,40 @@ def main():
         }, f, indent=2)
     print(f"[atlas] overlap metrics -> {overlap_path}")
 
-    scored = [r["label_jaccard"] for r in rows if r["label_jaccard"] is not None]
-    if scored:
-        print(f"[atlas] label overlap across {len(scored)} features: "
-              f"mean={np.mean(scored):.3f} median={np.median(scored):.3f}")
+    # Per-feature detail, in --sort_by rank order. Shown for an explicit
+    # --features list or any small result set (e.g. --max_features 20);
+    # suppressed for a full run, where 9000 rows are unreadable and the JSON
+    # carries the same numbers.
+    if args.features is not None or len(rows) <= 50:
+        print(f"\n{'#':>3} {'feature':>8} {'image_ovl':>10} {'label_ovl':>10}  labels")
+        print("-" * 78)
+        for rank, r in enumerate(rows, 1):
+            ij, lj = r["image_jaccard"], r["label_jaccard"]
+            ij_s = f"{ij:.4f}" if ij is not None else "n/a"
+            lj_s = f"{lj:.4f}" if lj is not None else "n/a"
+            shared = sorted(set(r["labels"][src_a]) & set(r["labels"][src_b]))
+            note = ", ".join(shared[:4]) if shared else "(no shared labels)"
+            if r["dead_in"]:
+                note += f"  [dead in {', '.join(r['dead_in'])}]"
+            print(f"{rank:>3} {r['feature_id']:>8} {ij_s:>10} {lj_s:>10}  {note}")
+        print("-" * 78)
+
+        # Requested features that produced no row were dropped as dead in BOTH
+        # models (or filtered by --only_shared) -- absent, not zero-overlap.
+        # Averaging without noticing would conflate the two.
+        rendered = {r["feature_id"] for r in rows}
+        dropped = [f for f in (args.features or []) if f not in rendered]
+        if dropped:
+            print(f"[atlas] WARNING: {len(dropped)}/{len(args.features)} requested features "
+                  f"produced no row and are NOT in the means below: {dropped}\n"
+                  f"  They are dead in both models (or excluded by --only_shared). "
+                  f"Pass --keep_dead to include them.")
+
+    for label, key in (("image", "image_jaccard"), ("label", "label_jaccard")):
+        vals = [r[key] for r in rows if r[key] is not None]
+        if vals:
+            print(f"[atlas] {label} overlap across {len(vals)} features: "
+                  f"mean={np.mean(vals):.4f} median={np.median(vals):.4f}")
 
     # ---- Render ----
     n_pages = (len(rows) + args.features_per_page - 1) // max(args.features_per_page, 1)
