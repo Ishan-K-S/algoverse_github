@@ -321,6 +321,11 @@ def load_universal_sae(
     # Carry the training config so callers can pick the same PixArt timestep
     # this checkpoint was trained on. Checkpoint values win over config.yaml.
     model._training_global = {**g, **gc}
+    # The checkpoint's own sae_params (loss weights, top_k). Without this a
+    # caller asking "what was latent_align_weight for this run?" silently reads
+    # the live config.yaml instead -- which would report the same value for
+    # every checkpoint and quietly invalidate any ablation comparison.
+    model._training_sae_params = {**sp, **spc}
 
     return model.to(device), cfg
 
